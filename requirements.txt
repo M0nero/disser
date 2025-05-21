@@ -1,0 +1,12 @@
+# Использовать официальный индекс PyTorch для GPU-колес под CUDA 12.8
+--extra-index-url https://download.pytorch.org/whl/cu128
+
+# GPU-версия PyTorch и сопутствующих пакетов ( CUDA 12.8 )
+torch==2.7.0+cu128
+# torchvision 0.22.0 соответствует torch 2.7.0
+torchvision==0.22.0+cu128
+# torchaudio той же серии
+torchaudio==2.7.0+cu128
+
+# Для метрик и preprocessing
+scikit-learn>=1.0
