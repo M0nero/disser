@@ -3,7 +3,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 # Загрузка данных
-df = pd.read_csv("data/epoch_metrics.csv")
+df = pd.read_csv("data/Epoch_Metrics_v2.csv")
 
 # График потерь
 plt.figure(figsize=(10, 5))

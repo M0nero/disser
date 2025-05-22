@@ -100,6 +100,8 @@ def parse_args():
     p.add_argument('--compile',  action='store_true', help='Use torch.compile if available')
     p.add_argument('--debug',    action='store_true', help='Use tiny subset for quick debugging')
     p.add_argument('--subset-size', type=int, default=5, help='Number of samples per split when --debug')
+    p.add_argument('--center', action='store_true', help='Center skeletons by wrist')
+    p.add_argument('--normalize', action='store_true', help='Normalize skeleton scale')
     return p.parse_args()
 
 # ----------------------------------------
@@ -112,12 +114,13 @@ def main():
     log.info(mem_report())
 
     # Device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device = torch.device(device_type)
     log.info(f"Using device: {device}")
 
     # Datasets
-    train_ds = GestureDataset(args.json, args.csv, split='train')
-    val_ds   = GestureDataset(args.json, args.csv, split='val')
+    train_ds = GestureDataset(args.json, args.csv, split='train', center=args.center, normalize=args.normalize)
+    val_ds   = GestureDataset(args.json, args.csv, split='val', center=args.center, normalize=args.normalize)
     log.info(f"Full dataset: train={len(train_ds)} val={len(val_ds)} samples")
 
     # Optionally wrap in tiny Subset for debug
@@ -145,15 +148,14 @@ def main():
     val_loader   = DataLoader(val_ds,   shuffle=False, **dl_kwargs)
 
     # Model, loss, optimizer, scaler
-    model = STGCN(num_classes=len(train_ds.dataset.label2idx if isinstance(train_ds, Subset) else train_ds.label2idx)).to(device)
+    num_classes = len(train_ds.dataset.label2idx if isinstance(train_ds, Subset) else train_ds.label2idx)
+    model = STGCN(num_classes=num_classes, temp_k=9, drop=0.5, use_data_bn=True).to(device)
     if args.compile and hasattr(torch, 'compile'):
         try:
             model = torch.compile(model)
             log.info("Model compiled with torch.compile")
         except Exception as e:
             log.warning(f"torch.compile failed: {e}")
-
-    device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
