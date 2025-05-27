@@ -1,167 +1,225 @@
+"""dataset.py — GestureDataset v7 (legacy CSV + fully vectorized augs)
+════════════════════════════════════════════════════════════════
+
+*Поддерживается только старая аннотация*  
+`attachment_id, text, train, begin, end`
+
+Главное: аугментации теперь полностью на тензорах **без циклов** —
+DataLoader‑воркеры готовят батч, пока GPU считает, и загрузка не «пилит».
+Сохранил *всё*, что было в v5: center/normalize, velocity‑канал, time‑resample.
+"""
 from __future__ import annotations
+
 import csv
 import json
+import math
+import random
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 from torch.utils.data import Dataset
 
-class GestureDataset(Dataset[Tuple[str, int, int, int]]):
-    """Lazy‑loading skeleton dataset with Windows‑friendly pickling.
+__all__ = ["GestureDataset"]
 
-    *   Возвращает образцы в виде кортежей `(uuid, label_idx, begin, end)`;
-    *   Сборка батча происходит в собственном `collate_fn`, который
-        формирует тензор `X: (B, 3, 42, T_max)` и метки `Y: (B,)`.
-    *   JSON‑словарь со всеми последовательностями кэшируется на уровне класса,
-        а при сериализации в worker не копируется (см. `__getstate__/__setstate__`).
-    """
+# mirror index: swap руки (0‑20) ↔ (21‑41) --------------------------------------
+_MIRROR_IDX = torch.tensor(list(range(21, 42)) + list(range(21)))
 
-    _CACHE: Dict[Path, Dict[str, Any]] = {}
+# -----------------------------------------------------------------------------
+# Main dataset class
+# -----------------------------------------------------------------------------
 
+class GestureDataset(Dataset):
+    """ST‑GCN dataset c legacy CSV, векторными аугментациями и cache‑ing."""
+
+    _JSON_CACHE: Dict[Path, Dict[str, Any]] = {}
+
+    # ---------------------
+    # ctor / CSV parse
+    # ---------------------
     def __init__(
         self,
-        json_path: str,
-        csv_path: str,
-        split: str = 'train',
-        delimiter: str = '\t',
+        json_path: str | Path,
+        csv_path: str | Path,
+        split: str = "train",
+        delimiter: str = "\t",
+        max_frames: int = 64,
         center: bool = False,
         normalize: bool = False,
-        max_frames: int = 64,
+        augment: bool = False,
+        rot_deg: float = 15.0,
+        scale_jitter: float = 0.1,
+        noise_sigma: float = 0.01,
+        mirror_prob: float = 0.5,
+        add_vel: bool = False,
     ) -> None:
+        super().__init__()
         self.json_path = Path(json_path)
+        self.csv_path = Path(csv_path)
+        self.split = split.lower()
+        self.delimiter = delimiter
+        self.max_frames = max_frames
         self.center = center
         self.normalize = normalize
-        self.max_frames = max_frames
+        self.augment = augment and (self.split == "train")
+        self.rot_deg = rot_deg
+        self.scale_jitter = scale_jitter
+        self.noise_sigma = noise_sigma
+        self.mirror_prob = mirror_prob
+        self.add_vel = add_vel
         self.num_nodes = 42
 
-        # Verify files
         if not self.json_path.exists():
-            raise FileNotFoundError(f"JSON file not found: {self.json_path}")
-        csv_path = Path(csv_path)
-        if not csv_path.exists():
-            raise FileNotFoundError(f"CSV file not found: {csv_path}")
+            raise FileNotFoundError(self.json_path)
+        if not self.csv_path.exists():
+            raise FileNotFoundError(self.csv_path)
 
-        # Load / cache JSON index
-        if self.json_path not in self._CACHE:
-            with self.json_path.open('r', encoding='utf-8') as f:
-                self._CACHE[self.json_path] = json.load(f)
-        self._sequences: Dict[str, List[Dict[str, Any]]] = self._CACHE[self.json_path]
+        self._load_json()
+        self._parse_csv()
 
-        # Parse CSV and build sample list
-        entries: List[Tuple[str, str, int, int]] = []
-        with csv_path.open('r', encoding='utf-8-sig') as f:
-            reader = csv.DictReader(f, delimiter=delimiter)
-            for row in reader:
-                is_train = row.get('train', '').strip().lower() == 'true'
-                if (split == 'train' and not is_train) or (split == 'val' and is_train):
+    # --------------------- JSON (cached across workers) ----------------------
+    def _load_json(self) -> None:
+        if self.json_path not in self._JSON_CACHE:
+            with self.json_path.open("r", encoding="utf-8") as f:
+                self._JSON_CACHE[self.json_path] = json.load(f)
+        self._seqs: Dict[str, List[Dict[str, Any]]] = self._JSON_CACHE[self.json_path]
+
+    # --------------------- CSV ----------------------------------------------
+    def _parse_csv(self) -> None:
+        rows: List[Tuple[str, str, int, int]] = []
+        with self.csv_path.open("r", encoding="utf-8-sig") as f:
+            rdr = csv.DictReader(f, delimiter=self.delimiter)
+            for row in rdr:
+                is_train = row.get("train", "").strip().lower() == "true"
+                if (self.split == "train" and not is_train) or (self.split == "val" and is_train):
                     continue
-
-                uuid = row.get('attachment_id', '').strip()
-                label = row.get('text', '').strip()
-                seq = self._sequences.get(uuid)
+                uuid = row.get("attachment_id", "").strip()
+                label = row.get("text", "").strip()
+                seq = self._seqs.get(uuid)
                 if not seq:
                     continue
-
-                begin = int(row.get('begin') or 0)
-                end = int(row.get('end') or len(seq))
+                begin = int(row.get("begin") or 0)
+                end = int(row.get("end") or len(seq))
                 end = min(max(begin, end), len(seq))
-                entries.append((uuid, label, begin, end))
+                rows.append((uuid, label, begin, end))
+        if not rows:
+            raise RuntimeError("GestureDataset: no samples after parsing CSV. Check column names & split.")
 
-        if not entries:
-            raise RuntimeError(f"No samples found for split '{split}' in CSV {csv_path}")
-
-        # Label mapping
-        unique_labels = sorted({label for _, label, *_ in entries})
-        self.label2idx = {lbl: idx for idx, lbl in enumerate(unique_labels)}
-
-        # Final sample list: (uuid, label_idx, begin, end)
+        uniq_labels = sorted({lbl for _, lbl, _, _ in rows})
+        self.label2idx = {l: i for i, l in enumerate(uniq_labels)}
         self.samples: List[Tuple[str, int, int, int]] = [
-            (uuid, self.label2idx[label], begin, end) for uuid, label, begin, end in entries
+            (u, self.label2idx[lbl], b, e) for u, lbl, b, e in rows
         ]
 
-    # --------------------------------------------------
-    # Standard Dataset API
-    # --------------------------------------------------
+    # --------------------- util: frames → tensor -----------------------------
+    def _frames_to_tensor(self, frames: List[Dict[str, Any]]) -> Tensor:
+        T = len(frames)
+        pts = torch.zeros((T, self.num_nodes, 3), dtype=torch.float32)
+        for t, fr in enumerate(frames):
+            merged = self._merge_hands(fr)
+            pts[t, :, 0] = torch.tensor([p["x"] for p in merged])
+            pts[t, :, 1] = torch.tensor([p["y"] for p in merged])
+            pts[t, :, 2] = torch.tensor([p["z"] for p in merged])
+        return pts
+
+    # --------------------- temporal resample --------------------------------
+    def _time_resample(self, pts: Tensor) -> Tensor:
+        """Resize sequence to self.max_frames with 1D linear interpolation."""
+        T_old, V, C = pts.shape
+        if T_old == self.max_frames:
+            return pts
+        # (T,V,3) → (C,V,T)
+        perm = pts.permute(2, 1, 0).contiguous()
+        # flatten spatial dims → (1, C*V, T_old)
+        flat = perm.view(1, -1, T_old)
+        # 1D linear interpolation
+        resized = F.interpolate(flat, size=self.max_frames, mode='linear', align_corners=True)
+        # reshape back → (C,V,T_new)
+        reshaped = resized.view(C, V, self.max_frames)
+        # back to (T_new,V,3)
+        pts_new = reshaped.permute(2, 1, 0).contiguous()
+        if self.augment:
+            shift = random.randint(0, self.max_frames - 1)
+            pts_new = torch.roll(pts_new, shifts=shift, dims=0)
+        return pts_new
+
+    # --------------------- augmentation --------------------------------
+    def _apply_spatial_aug(self, pts: Tensor) -> Tensor:
+        """Vectorized mirroring, rotation, scale and noise on (T,V,3)."""
+        # mirror
+        if random.random() < self.mirror_prob:
+            pts = pts[:, _MIRROR_IDX, :]
+        # rotation in XY
+        ang = math.radians(random.uniform(-self.rot_deg, self.rot_deg))
+        cos, sin = math.cos(ang), math.sin(ang)
+        xy = pts[..., :2].reshape(-1, 2)
+        R = torch.tensor([[cos, -sin], [sin, cos]], dtype=pts.dtype, device=pts.device)
+        xy = (R @ xy.T).T.reshape(pts.shape[0], pts.shape[1], 2)
+        pts = torch.cat([xy, pts[..., 2:3]], dim=2)
+        # scale
+        factor = random.uniform(1 - self.scale_jitter, 1 + self.scale_jitter)
+        pts = pts * factor
+        # noise
+        pts = pts + torch.randn_like(pts) * self.noise_sigma
+        return pts
+
+    # --------------------- center / normalize -------------------------------
+    def _center_norm(self, pts: Tensor) -> Tensor:
+        if self.center:
+            pts = pts - pts[:, :1, :]
+        if self.normalize:
+            span = pts.abs().max()
+            pts = pts / (span + 1e-6)
+        return pts
+
+    # --------------------- public API ---------------------------------------
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, idx: int) -> Tuple[str, int, int, int]:
-        return self.samples[idx]
+    def __getitem__(self, idx: int) -> Tuple[Tensor, int]:
+        uuid, label_idx, begin, end = self.samples[idx]
+        frames = self._seqs[uuid][begin:end]
+        pts = self._frames_to_tensor(frames)  # (T,V,3)
+        pts = self._time_resample(pts)
+        if self.augment:
+            pts = self._apply_spatial_aug(pts)
+        
+        pts = self._center_norm(pts)
 
-    # --------------------------------------------------
-    # Collate & helpers
-    # --------------------------------------------------
-    def collate_fn(
-        self,
-        batch: List[Tuple[str, int, int, int]],
-    ) -> Tuple[Tensor, Tensor]:
-        """Собирает список сэмплов в батч‑тензоры X и Y.
+        if self.add_vel:
+            vel = torch.zeros_like(pts)
+            vel[1:] = pts[1:] - pts[:-1]
+            pts = torch.cat([pts, vel], dim=2)
 
-        X: (B, 3, 42, T_max)
-        Y: (B,)
-        """
-        sequences: List[List[Dict[str, Any]]] = []
-        labels: List[int] = []
-        lengths: List[int] = []
+        # (T,V,C) → (C,V,T)
+        tensor = pts.permute(2, 1, 0).contiguous()
+        return tensor, label_idx
 
-        # Собираем и при необходимости даунсемплируем кадры
-        for uuid, label_idx, begin, end in batch:
-            frames = self._sequences[uuid][begin:end]
-            if len(frames) > self.max_frames:
-                step = len(frames) / self.max_frames
-                frames = [frames[int(i * step)] for i in range(self.max_frames)]
-            sequences.append(frames)
-            labels.append(label_idx)
-            lengths.append(len(frames))
-
-        B = len(batch)
-        T_max = max(lengths)
-        C, N = 3, self.num_nodes
-
-        X = torch.zeros((B, C, N, T_max), dtype=torch.float32)
-        Y = torch.tensor(labels, dtype=torch.long)
-
-        for i, frames in enumerate(sequences):
-            for t, frame in enumerate(frames):
-                pts = self._merge_hands(frame)
-                X[i, 0, :, t] = torch.tensor([pt['x'] for pt in pts])
-                X[i, 1, :, t] = torch.tensor([pt['y'] for pt in pts])
-                X[i, 2, :, t] = torch.tensor([pt['z'] for pt in pts])
-
-            if self.center:
-                X[i] -= X[i, :, 0:1, :]
-            if self.normalize:
-                span = X[i].max() - X[i].min()
-                X[i] /= (span + 1e-6)
-
-        return X, Y
-
+    # --------------------- collate (vector aug) -----------------------------
     @staticmethod
-    def _merge_hands(frame: Dict[str, Any]) -> List[Dict[str, float]]:
-        """Объединяет до двух кистей в фиксированный список из 42 точек."""
-        pts: List[Dict[str, float]] = [dict(x=0.0, y=0.0, z=0.0) for _ in range(42)]
-        hand1 = frame.get('hand 1') or []
-        hand2 = frame.get('hand 2') or []
+    def collate_fn(batch: List[Tuple[Tensor, int]]) -> Tuple[Tensor, Tensor]:  # noqa: D401
+        X, Y = zip(*batch)
+        return torch.stack(X), torch.tensor(Y, dtype=torch.long)
 
-        for idx, pt in enumerate(hand1[:21]):
+    # --------------------- merge both hands ---------------------------------
+    @staticmethod
+    def _merge_hands(fr: Dict[str, Any]) -> List[Dict[str, float]]:
+        pts: List[Dict[str, float]] = [dict(x=0.0, y=0.0, z=0.0) for _ in range(42)]
+        for idx, pt in enumerate((fr.get("hand 1") or [])[:21]):
             pts[idx] = pt
-        for idx, pt in enumerate(hand2[:21]):
+        for idx, pt in enumerate((fr.get("hand 2") or [])[:21]):
             pts[21 + idx] = pt
         return pts
 
-    # --------------------------------------------------
-    # Pickle hooks to avoid RAM explosion with num_workers>0 on Windows
-    # --------------------------------------------------
-    def __getstate__(self) -> dict:  # noqa: D401 (short description OK)
+    # --------------------- pickling (multiprocessing) ------------------------
+    def __getstate__(self):
         state = self.__dict__.copy()
-        state['_sequences'] = None  # heavy field — drop before pickling
+        # _seqs is large → drop, will reattach in worker
+        state["_seqs"] = None
         return state
 
-    def __setstate__(self, state: dict) -> None:  # noqa: D401
+    def __setstate__(self, state):
         self.__dict__.update(state)
-        if self.json_path not in self._CACHE:
-            with self.json_path.open('r', encoding='utf-8') as f:
-                self._CACHE[self.json_path] = json.load(f)
-        self._sequences = self._CACHE[self.json_path]
+        self._load_json()
