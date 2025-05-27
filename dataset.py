@@ -28,7 +28,7 @@ class GestureDataset(Dataset[Tuple[str, int, int, int]]):
         delimiter: str = '\t',
         center: bool = False,
         normalize: bool = False,
-        max_frames: int = 256,
+        max_frames: int = 64,
     ) -> None:
         self.json_path = Path(json_path)
         self.center = center

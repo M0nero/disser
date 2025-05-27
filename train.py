@@ -149,7 +149,7 @@ def main():
 
     # Model, loss, optimizer, scaler
     num_classes = len(train_ds.dataset.label2idx if isinstance(train_ds, Subset) else train_ds.label2idx)
-    model = STGCN(num_classes=num_classes, temp_k=9, drop=0.5, use_data_bn=True).to(device)
+    model = STGCN(num_classes=num_classes).to(device)
     if args.compile and hasattr(torch, 'compile'):
         try:
             model = torch.compile(model)
