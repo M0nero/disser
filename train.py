@@ -1,4 +1,3 @@
-
 """Train ST-GCN gesture recognizer with optional tiny subset for debug/testing."""
 import argparse
 import logging
@@ -19,7 +18,7 @@ from dataset import GestureDataset
 from model import STGCN
 
 # ----------------------------------------
-# Logger & utils
+# Logger
 # ----------------------------------------
 def setup_logger(logdir: str) -> logging.Logger:
     os.makedirs(logdir, exist_ok=True)
@@ -34,12 +33,6 @@ def setup_logger(logdir: str) -> logging.Logger:
         ]
     )
     return logging.getLogger(__name__)
-
-def mem_report() -> str:
-    import psutil
-    ram = psutil.Process().memory_info().rss / 1024 ** 2
-    gpu = torch.cuda.memory_allocated() / 1024 ** 2 if torch.cuda.is_available() else 0
-    return f"RAM={ram:.1f}MB GPU={gpu:.1f}MB"
 
 # ----------------------------------------
 # Training & evaluation loops
@@ -97,9 +90,6 @@ def parse_args():
     p.add_argument('--workers',  type=int, default=0)
     p.add_argument('--logdir',   default='logs')
     p.add_argument('--checkpoint', default='best_model.pth')
-    p.add_argument('--compile',  action='store_true', help='Use torch.compile if available')
-    p.add_argument('--debug',    action='store_true', help='Use tiny subset for quick debugging')
-    p.add_argument('--subset-size', type=int, default=5, help='Number of samples per split when --debug')
     p.add_argument('--center', action='store_true', help='Center skeletons by wrist')
     p.add_argument('--normalize', action='store_true', help='Normalize skeleton scale')
     return p.parse_args()
@@ -111,7 +101,6 @@ def main():
     args = parse_args()
     log = setup_logger(args.logdir)
     log.info("Starting training")
-    log.info(mem_report())
 
     # Device
     device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -122,19 +111,6 @@ def main():
     train_ds = GestureDataset(args.json, args.csv, split='train', center=args.center, normalize=args.normalize)
     val_ds   = GestureDataset(args.json, args.csv, split='val', center=args.center, normalize=args.normalize)
     log.info(f"Full dataset: train={len(train_ds)} val={len(val_ds)} samples")
-
-    # Optionally wrap in tiny Subset for debug
-    if args.debug:
-        random.seed(42)
-        # берём N случайных индексов из полного train_ds
-        full_idxs = list(range(len(train_ds)))
-        subset_idxs = random.sample(full_idxs, k=args.subset_size)
-
-        # и используем их и для обучения, и для валидации
-        train_ds = Subset(train_ds, subset_idxs)
-        val_ds   = train_ds
-
-        log.info(f"DEBUG: using same {args.subset_size} samples for train & val")
 
     # DataLoaders
     dl_kwargs = dict(
@@ -148,14 +124,8 @@ def main():
     val_loader   = DataLoader(val_ds,   shuffle=False, **dl_kwargs)
 
     # Model, loss, optimizer, scaler
-    num_classes = len(train_ds.dataset.label2idx if isinstance(train_ds, Subset) else train_ds.label2idx)
+    num_classes = len(train_ds.dataset.label2idx if isinstance(train_ds, Subset) else train_ds.label2idx)    
     model = STGCN(num_classes=num_classes).to(device)
-    if args.compile and hasattr(torch, 'compile'):
-        try:
-            model = torch.compile(model)
-            log.info("Model compiled with torch.compile")
-        except Exception as e:
-            log.warning(f"torch.compile failed: {e}")
 
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
@@ -179,7 +149,7 @@ def main():
             f"Ep {epoch:02d}/{args.epochs} | "
             f"TrL={tr_loss:.4f} TrA={tr_acc:.3f} | "
             f"ValL={v_loss:.4f} ValA={v_acc:.3f} ValF1={v_f1:.3f} | "
-            f"{mem_report()} | {time.time()-t0:.1f}s"
+            f"{time.time()-t0:.1f}s"
         )
 
         if v_f1 > best_f1:
@@ -195,7 +165,6 @@ def main():
             break
 
     log.info("Training complete")
-    log.info(mem_report())
 
 if __name__ == '__main__':
     try:
