@@ -127,8 +127,8 @@ class STGCNBlock(nn.Module):
         """Graph convolution on (B,C,V,T) with (V,V) adjacency."""
         # Convert to (B,C,T,V) to let einsum act over V
         x_t_v = x.permute(0, 1, 3, 2)              # (B,C,T,V)
-        x_t_v = torch.einsum('vw,bctw->bctv', A, x_t_v)
-        return x_t_v.permute(0, 1, 3, 2)            # (B,C,V,T)
+        x_t_v = torch.matmul(x_t_v, A.t())         # (B,C,T,V)
+        return x_t_v.permute(0, 1, 3, 2)
 
     # ---------------------------------------------------------------------
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # (B,C,V,T)
@@ -191,14 +191,13 @@ class STGCN(nn.Module):
         )
 
     # ------------------------------------------------------------------
-    def forward(self, x: torch.Tensor) -> torch.Tensor:  # x: (B,3,21|42,T)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # x: (B,C,V,T), V<=42
         B, C, V, T = x.shape
-        if V == 21:                                      # одна рука → допадим вторую
+        if V != 42:
             pad = x.new_zeros(B, C, 42, T)
-            pad[:, :, :21, :] = x
+            pad[:, :, :min(V, 42), :] = x[:, :, :min(V, 42), :]
             x = pad
-        elif V != 42:
-            raise ValueError(f"Unexpected V={V}. Ожидалось 21 или 42 узла.")
+            V = 42
 
         if self.add_vel:
             vel = torch.zeros_like(x)

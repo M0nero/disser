@@ -189,7 +189,7 @@ def parse_args():
 
     p.add_argument("--logdir", default="logs")
     p.add_argument("--checkpoint", default="best_model.pth", help="Path to save best model")
-    p.add_argument("--patience", type=int, default=15, help="Early‑stop patience (epochs)")
+    p.add_argument("--patience", type=int, default=12, help="Early‑stop patience (epochs)")
     return p.parse_args()
 
 # -----------------------------------------------------------------------------
