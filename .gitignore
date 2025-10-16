@@ -52,10 +52,6 @@ venv.bak/
 # Logs
 *.log
 
-# PyTorch model checkpoints
-*.pt
-*.pth
-
 # Data files (if generated or large)
 data/
 
