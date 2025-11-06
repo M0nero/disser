@@ -57,3 +57,6 @@ data/
 
 # SQLite database files
 *.sqlite3
+
+SLOVO/
+skeletons_v2/
