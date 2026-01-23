@@ -50,7 +50,8 @@ python scripts/extract_keypoints.py `
   --pp-max-gap 20 `
   --pp-smoother ema `
   --mp-backend tasks `
-  --jobs 14
+  --jobs 12 `
+  --skip-existing
 ```
 
 Note: export writes both raw and `_pp` JSON files; downstream training (msagcn/bio) prefers `_pp` by default.

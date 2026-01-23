@@ -1,0 +1,18 @@
+{
+  "synth_build": {
+    "prelabel_dir": "outputs/bio_out/prelabels_slovo_val",
+    "extra_noev_prelabel_dir": [
+      "outputs/bio_out/prelabels_slovo_noev_val"
+    ],
+    "out_dir": "outputs/bio_out/synth_val",
+    "num_samples": 20000,
+    "seq_len": 256,
+    "shard_size": 256,
+    "min_signs": 2,
+    "max_signs": 6,
+    "gap_min": 0,
+    "gap_max": 20,
+    "blend_prob": 0.25,
+    "seed": 1337
+  }
+}

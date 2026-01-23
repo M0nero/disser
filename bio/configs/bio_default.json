@@ -1,6 +1,6 @@
 {
   "prelabel": {
-    "skeletons": "datasets/skeletons",
+    "skeletons": "datasets/skeletons/Slovo",
     "csv": "datasets/data/annotations.csv",
     "split": "train",
     "out": "outputs/bio_out/prelabels_slovo_train",
@@ -14,10 +14,10 @@
     "prefer_pp": true
   },
   "synth_build": {
-    "prelabel_dir": "outputs/bio_out/prelabels_slovo_all_train",
+    "prelabel_dir": "outputs/bio_out/prelabels_slovo_train",
     "extra_noev_prelabel_dir": [
-      "outputs/ipnhand/prelabels_train",
-      "outputs/ipnhand/prelabels_val"
+      "outputs/bio_out/prelabels_slovo_noev_train",
+      "outputs/ipnhand/prelabels_no_event"
     ],
     "out_dir": "outputs/bio_out/synth_train",
     "num_samples": 100000,

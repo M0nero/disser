@@ -31,10 +31,12 @@ Run `python -m bio <command> -h` for details.
 Templates live in `bio/configs/`:
 - `bio/configs/bio_default.json`
 - `bio/configs/ipn_default.json`
+- `bio/configs/bio_val.json` (val synth-build only; no IPN)
 
 Each stage writes a `config.json` into its output directory for reproducibility.
 
 Prelabel prefers `*_pp.json` when both raw and post-processed files exist. Override with `--no_prefer_pp` or set `"prefer_pp": false` in config.
+Default SLOVO skeletons path is `datasets/skeletons/Slovo` (flat directory of per-video JSONs).
 
 ## Typical SLOVO Run (updated paths)
 
@@ -51,26 +53,29 @@ python -m bio prelabel \
 
 python -m bio prelabel \
   --config bio/configs/bio_default.json \
-  --skeletons datasets/skeletons/no_event_old \
+  --skeletons datasets/skeletons/Slovo \
   --csv datasets/data/annotations_no_event.csv \
   --split train \
   --out outputs/bio_out/prelabels_slovo_noev_train
 
 python -m bio prelabel \
   --config bio/configs/bio_default.json \
-  --skeletons datasets/skeletons/no_event_old \
+  --skeletons datasets/skeletons/Slovo \
   --csv datasets/data/annotations_no_event.csv \
   --split val \
   --out outputs/bio_out/prelabels_slovo_noev_val
 
 python -m bio synth-build \
   --config bio/configs/bio_default.json \
-  --prelabel_dir outputs/bio_out/prelabels_slovo_all_train \
+  --prelabel_dir outputs/bio_out/prelabels_slovo_train \
   --out_dir outputs/bio_out/synth_train
 
-Note: `bio/configs/bio_default.json` includes the IPN no_event pool from:
-`outputs/ipnhand/prelabels_train` and `outputs/ipnhand/prelabels_val`.
-Remove or override `extra_noev_prelabel_dir` if you don't want it.
+python -m bio synth-build \
+  --config bio/configs/bio_val.json
+
+Note: `bio/configs/bio_default.json` includes the no_event pool from:
+`outputs/bio_out/prelabels_slovo_noev_train` and `outputs/ipnhand/prelabels_no_event`.
+Use only SLOVO no_event for validation to avoid IPN split leakage.
 
 python -m bio train \
   --config bio/configs/bio_default.json \
@@ -93,8 +98,6 @@ datasets/ipnhand/
 outputs/ipnhand/
   manifests/
   prelabels_no_event/     # output of ipn-prelabel (all splits in one dir)
-  prelabels_train/        # legacy split outputs (optional)
-  prelabels_val/
   quality_report/
   step1/
 ```

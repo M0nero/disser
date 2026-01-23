@@ -2,10 +2,10 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-SKELETONS_SIGN=${1:-"$ROOT/datasets/skeletons"}
+SKELETONS_SIGN=${1:-"$ROOT/datasets/skeletons/Slovo"}
 CSV=${2:-"$ROOT/datasets/data/annotations.csv"}
 WORKDIR=${3:-"$ROOT/outputs/out_smoke"}
-SKELETONS_NOEV=${SKELETONS_NOEV:-"$ROOT/datasets/skeletons/no_event_old"}
+SKELETONS_NOEV=${SKELETONS_NOEV:-"$ROOT/datasets/skeletons/Slovo"}
 PYTHON=${PYTHON:-python}
 
 PYTHONPATH="$ROOT" "$PYTHON" -m bio smoke-test \
