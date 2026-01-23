@@ -1,0 +1,1107 @@
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import sys
+from collections import OrderedDict
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from bio.core.config_utils import load_config_section, write_run_config
+
+NUM_HAND_JOINTS = 21
+NUM_HAND_NODES = 42
+POSE_KEEP_DEFAULT = [0, 9, 10, 11, 12, 13, 14, 15, 16, 23, 24]
+
+
+try:
+    import orjson as _fastjson
+
+    def _loads_bytes(b: bytes):
+        return _fastjson.loads(b)
+except Exception:
+
+    def _loads_bytes(b: bytes):
+        return json.loads(b.decode("utf-8"))
+
+
+def _read_video_file_nocache(path_str: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    p = Path(path_str)
+    with p.open("rb") as f:
+        blob = _loads_bytes(f.read())
+    if isinstance(blob, dict) and "frames" in blob:
+        return blob["frames"], blob.get("meta", {})
+    return blob, {}
+
+
+def _frames_from_combined(skel: Dict[str, Any], vid: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    if "videos" in skel:
+        v = skel["videos"].get(vid, {})
+        return v.get("frames", []), v.get("meta", {})
+    return skel.get(vid, []), {}
+
+
+@dataclass
+class PrelabelConfig:
+    include_pose: bool = False
+    pose_keep: Tuple[int, ...] = tuple(POSE_KEEP_DEFAULT)
+    pose_vis_thr: float = 0.5
+    hand_score_thr: float = 0.45
+    hand_score_thr_fallback: float = 0.35
+    thr_tune_steps: int = 6
+    thr_tune_step: float = 0.05
+    center: bool = True
+    center_mode: str = "masked_mean"
+    normalize: bool = True
+    norm_method: str = "p95"
+    norm_scale: float = 1.0
+    smooth_win: int = 7
+    motion_percentile: float = 70.0
+    hysteresis: float = 0.6
+    pad: int = 4
+    min_len: int = 8
+    fallback_len: int = 64
+    min_motion: float = 1e-4
+    min_valid_frames: int = 8
+    file_cache_size: int = 0
+    prefer_pp: bool = True
+
+
+class VideoStore:
+    def __init__(self, skeletons_path: str | Path, cache_size: int = 0, prefer_pp: bool = True) -> None:
+        self.path = Path(skeletons_path)
+        self.is_dir = self.path.is_dir()
+        self.cache_size = max(0, int(cache_size))
+        self.prefer_pp = bool(prefer_pp)
+        self._cache: "OrderedDict[str, Tuple[List[Dict[str, Any]], Dict[str, Any]]]" = OrderedDict()
+        self._skel: Optional[Dict[str, Any]] = None
+        self._path_cache: Dict[str, str] = {}
+        if not self.is_dir:
+            with self.path.open("rb") as f:
+                blob = _loads_bytes(f.read())
+            if not isinstance(blob, dict):
+                raise ValueError("Combined skeletons JSON must be a dict.")
+            self._skel = blob
+
+    def _resolve_path(self, vid: str) -> str:
+        cached = self._path_cache.get(vid)
+        if cached is not None:
+            return cached
+        base = self.path / f"{vid}.json"
+        pp = self.path / f"{vid}_pp.json"
+        if self.prefer_pp and pp.exists():
+            chosen = pp
+        elif base.exists():
+            chosen = base
+        elif pp.exists():
+            chosen = pp
+        else:
+            chosen = base
+        path = str(chosen)
+        self._path_cache[vid] = path
+        return path
+
+    def get_frames(self, vid: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        if self.is_dir:
+            path = self._resolve_path(vid)
+            if self.cache_size > 0:
+                hit = self._cache.get(path)
+                if hit is not None:
+                    self._cache.move_to_end(path)
+                    return hit
+            if not Path(path).exists():
+                return [], {}
+            frames, meta = _read_video_file_nocache(path)
+            if self.cache_size > 0:
+                self._cache[path] = (frames, meta)
+                if len(self._cache) > self.cache_size:
+                    self._cache.popitem(last=False)
+            return frames, meta
+        if self._skel is None:
+            return [], {}
+        return _frames_from_combined(self._skel, vid)
+
+
+def _as_bool(s: str) -> Optional[bool]:
+    if s is None:
+        return None
+    v = s.strip().lower()
+    if v in ("true", "1", "yes", "y"):
+        return True
+    if v in ("false", "0", "no", "n"):
+        return False
+    return None
+
+
+def _bool_or_default(raw: Any, default: bool) -> bool:
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, (int, float)):
+        return bool(raw)
+    if isinstance(raw, str):
+        parsed = _as_bool(raw)
+        if parsed is not None:
+            return parsed
+    return default
+
+
+def _csv_or_default(raw: Any, default: str) -> str:
+    if raw is None:
+        return default
+    if isinstance(raw, (list, tuple)):
+        return ",".join(str(x) for x in raw)
+    return str(raw)
+
+
+def _is_missing(raw: Any) -> bool:
+    if raw is None:
+        return True
+    if isinstance(raw, str) and not raw.strip():
+        return True
+    return False
+
+
+def parse_csv(csv_path: Path, split: str) -> List[Tuple[str, str, int, int]]:
+    rows: List[Tuple[str, str, int, int]] = []
+    with csv_path.open("r", encoding="utf-8-sig", newline="") as f:
+        sample = f.read(4096)
+        f.seek(0)
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=",\t;|")
+        except csv.Error:
+            class _D(csv.Dialect):
+                delimiter = "\t" if ("\t" in sample and "," not in sample) else ","
+                quotechar = '"'
+                doublequote = True
+                skipinitialspace = False
+                lineterminator = "\n"
+                quoting = csv.QUOTE_MINIMAL
+            dialect = _D()
+
+        rdr = csv.DictReader(f, dialect=dialect)
+        for row in rdr:
+            use = True
+            raw_split = (row.get("split") or "").strip()
+            raw_train = row.get("train") or row.get("is_train")
+
+            if raw_split:
+                use = (raw_split.strip().lower() == split)
+            elif raw_train is not None:
+                bt = _as_bool(str(raw_train))
+                if bt is None:
+                    use = (str(raw_train).strip().lower() == split)
+                else:
+                    use = (bt if split == "train" else (not bt))
+
+            if not use:
+                continue
+
+            vid_raw = (row.get("attachment_id") or "").strip()
+            if not vid_raw:
+                continue
+            vid = Path(vid_raw).stem
+            if not vid:
+                continue
+
+            label = (row.get("text") or "").strip()
+            if not label:
+                continue
+
+            try:
+                begin = int(float(row.get("begin") or 0))
+            except Exception:
+                begin = 0
+            try:
+                end = int(float(row.get("end") or 0))
+            except Exception:
+                end = 0
+            if end <= begin:
+                end = 0
+
+            rows.append((vid, label, begin, end))
+
+    if not rows:
+        raise RuntimeError(
+            "No samples for split after CSV filtering. "
+            "Check delimiter, column names, and split/train flags."
+        )
+    return rows
+
+
+def build_mirror_idx(include_pose: bool, pose_keep: Sequence[int]) -> np.ndarray:
+    idx = list(range(21, 42)) + list(range(0, 21))
+    if include_pose and pose_keep:
+        pairs = {(9, 10), (11, 12), (13, 14), (15, 16), (23, 24)}
+        pos_map = {abs_i: i for i, abs_i in enumerate(pose_keep)}
+        for abs_i in pose_keep:
+            if abs_i == 0:
+                idx.append(NUM_HAND_NODES + pos_map[0])
+                continue
+            pair_abs = None
+            for a, b in pairs:
+                if abs_i == a:
+                    pair_abs = b
+                elif abs_i == b:
+                    pair_abs = a
+            if pair_abs is None or pair_abs not in pos_map:
+                idx.append(NUM_HAND_NODES + pos_map[abs_i])
+            else:
+                idx.append(NUM_HAND_NODES + pos_map[pair_abs])
+    return np.array(idx, dtype=np.int64)
+
+
+def compute_pose_reorder(meta: Dict[str, Any], pose_keep: Sequence[int]) -> Optional[List[int]]:
+    if not pose_keep:
+        return None
+    order = meta.get("pose_indices", None)
+    if order == "all":
+        return list(pose_keep)
+    if isinstance(order, list):
+        order_list: List[Any] = []
+        for v in order:
+            try:
+                order_list.append(int(v))
+            except Exception:
+                order_list.append(v)
+        idxs: List[int] = []
+        for want in pose_keep:
+            try:
+                idxs.append(order_list.index(want))
+            except ValueError:
+                idxs.append(-1)
+        return idxs
+    return list(range(len(pose_keep)))
+
+
+def _build_mask_for_frame(fr: Dict[str, Any], thr: float) -> Tuple[List[int], List[int]]:
+    mL = [0] * NUM_HAND_JOINTS
+    mR = [0] * NUM_HAND_JOINTS
+    L = fr.get("hand 1")
+    R = fr.get("hand 2")
+    Ls = fr.get("hand 1_score")
+    Rs = fr.get("hand 2_score")
+    try:
+        Ls = float(Ls) if Ls is not None else 0.0
+    except Exception:
+        Ls = 0.0
+    try:
+        Rs = float(Rs) if Rs is not None else 0.0
+    except Exception:
+        Rs = 0.0
+    if L is not None and Ls >= thr:
+        mL = [1] * NUM_HAND_JOINTS
+    if R is not None and Rs >= thr:
+        mR = [1] * NUM_HAND_JOINTS
+    return mL, mR
+
+
+def choose_thr_for_video(frames: Sequence[Dict[str, Any]], cfg: PrelabelConfig) -> Tuple[float, float]:
+    thresholds: List[float] = []
+    for s in range(max(0, int(cfg.thr_tune_steps)) + 1):
+        thresholds.append(max(0.0, float(cfg.hand_score_thr) - s * float(cfg.thr_tune_step)))
+    thresholds.append(float(cfg.hand_score_thr_fallback))
+    seen = []
+    for t in thresholds:
+        if t not in seen:
+            seen.append(t)
+    best_thr = seen[0] if seen else float(cfg.hand_score_thr)
+    best_cov = -1.0
+    total = len(frames)
+    for thr in seen:
+        valid = 0
+        for fr in frames:
+            L = fr.get("hand 1")
+            R = fr.get("hand 2")
+            Ls = fr.get("hand 1_score") or 0.0
+            Rs = fr.get("hand 2_score") or 0.0
+            try:
+                Ls = float(Ls)
+            except Exception:
+                Ls = 0.0
+            try:
+                Rs = float(Rs)
+            except Exception:
+                Rs = 0.0
+            vL = (L is not None) and (Ls >= thr)
+            vR = (R is not None) and (Rs >= thr)
+            if vL or vR:
+                valid += 1
+        cov = valid / float(total) if total > 0 else 0.0
+        if (cov > best_cov) or (abs(cov - best_cov) < 1e-9 and thr > best_thr):
+            best_cov = cov
+            best_thr = thr
+    return best_thr, best_cov
+
+
+def frames_to_arrays(
+    frames: Sequence[Dict[str, Any]],
+    cfg: PrelabelConfig,
+    thr: float,
+    meta: Dict[str, Any],
+    mirror_idx: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    T = len(frames)
+    P = len(cfg.pose_keep) if cfg.include_pose else 0
+    V = NUM_HAND_NODES + P
+    pts = np.zeros((T, V, 3), dtype=np.float32)
+    mask = np.zeros((T, V, 1), dtype=np.float32)
+    ts = np.zeros((T,), dtype=np.float32)
+
+    reorder = compute_pose_reorder(meta, cfg.pose_keep) if cfg.include_pose else None
+    wrist_left_out = cfg.pose_keep.index(15) if cfg.include_pose and 15 in cfg.pose_keep else -1
+    wrist_right_out = cfg.pose_keep.index(16) if cfg.include_pose and 16 in cfg.pose_keep else -1
+    coords_tag = str(meta.get("coords", "image")).lower()
+    allow_pose_wrist = (
+        cfg.include_pose
+        and P > 0
+        and (wrist_left_out >= 0 or wrist_right_out >= 0)
+        and coords_tag != "world"
+    )
+
+    for t, fr in enumerate(frames):
+        try:
+            ts[t] = float(fr.get("ts", 0.0))
+        except Exception:
+            ts[t] = 0.0
+        mL, mR = _build_mask_for_frame(fr, thr)
+        L = fr.get("hand 1") if (mL[0] == 1) else None
+        R = fr.get("hand 2") if (mR[0] == 1) else None
+        if L is not None:
+            for j in range(min(NUM_HAND_JOINTS, len(L))):
+                p = L[j]
+                pts[t, j, 0] = float(p.get("x", 0.0))
+                pts[t, j, 1] = float(p.get("y", 0.0))
+                pts[t, j, 2] = float(p.get("z", 0.0))
+                mask[t, j, 0] = 1.0
+        if R is not None:
+            for j in range(min(NUM_HAND_JOINTS, len(R))):
+                p = R[j]
+                pts[t, 21 + j, 0] = float(p.get("x", 0.0))
+                pts[t, 21 + j, 1] = float(p.get("y", 0.0))
+                pts[t, 21 + j, 2] = float(p.get("z", 0.0))
+                mask[t, 21 + j, 0] = 1.0
+
+        pose_wrist_left = None
+        pose_wrist_right = None
+        pose_wrist_left_ok = False
+        pose_wrist_right_ok = False
+        if cfg.include_pose and P > 0:
+            pose = fr.get("pose")
+            pose_vis = fr.get("pose_vis")
+            if isinstance(pose, list) and reorder is not None:
+                for k_out, k_in in enumerate(reorder):
+                    v_idx = NUM_HAND_NODES + k_out
+                    if k_in < 0 or k_in >= len(pose):
+                        continue
+                    pk = pose[k_in]
+                    pts[t, v_idx, 0] = float(pk.get("x", 0.0))
+                    pts[t, v_idx, 1] = float(pk.get("y", 0.0))
+                    pts[t, v_idx, 2] = float(pk.get("z", 0.0))
+                    if isinstance(pose_vis, list) and k_in < len(pose_vis):
+                        if float(pose_vis[k_in]) >= cfg.pose_vis_thr:
+                            mask[t, v_idx, 0] = 1.0
+                            if allow_pose_wrist and k_out == wrist_left_out:
+                                pose_wrist_left_ok = True
+                            if allow_pose_wrist and k_out == wrist_right_out:
+                                pose_wrist_right_ok = True
+                    else:
+                        mask[t, v_idx, 0] = 1.0
+                        if allow_pose_wrist and k_out == wrist_left_out:
+                            pose_wrist_left_ok = True
+                        if allow_pose_wrist and k_out == wrist_right_out:
+                            pose_wrist_right_ok = True
+                    if allow_pose_wrist and k_out == wrist_left_out:
+                        pose_wrist_left = pk
+                    if allow_pose_wrist and k_out == wrist_right_out:
+                        pose_wrist_right = pk
+
+        if allow_pose_wrist:
+            if pose_wrist_left is not None and mask[t, 0, 0] == 0.0 and pose_wrist_left_ok:
+                pts[t, 0, 0] = float(pose_wrist_left.get("x", 0.0))
+                pts[t, 0, 1] = float(pose_wrist_left.get("y", 0.0))
+                pts[t, 0, 2] = float(pose_wrist_left.get("z", 0.0))
+                mask[t, 0, 0] = 1.0
+            if pose_wrist_right is not None and mask[t, 21, 0] == 0.0 and pose_wrist_right_ok:
+                pts[t, 21, 0] = float(pose_wrist_right.get("x", 0.0))
+                pts[t, 21, 1] = float(pose_wrist_right.get("y", 0.0))
+                pts[t, 21, 2] = float(pose_wrist_right.get("z", 0.0))
+                mask[t, 21, 0] = 1.0
+
+    if T > 0:
+        m = torch.from_numpy(mask).permute(1, 2, 0)
+        m = F.avg_pool1d(m, kernel_size=3, stride=1, padding=1)
+        m = (m >= 0.5).float()
+        mask = m.permute(2, 0, 1).contiguous().numpy()
+
+        left_cnt = float(mask[:, 0:21, :].sum())
+        right_cnt = float(mask[:, 21:42, :].sum())
+        if left_cnt < 0.1 * T * 21 and right_cnt >= 0.6 * T * 21:
+            pts = pts[:, mirror_idx, :]
+            mask = mask[:, mirror_idx, :]
+
+    pts_t = torch.from_numpy(pts)
+    mask_t = torch.from_numpy(mask)
+    pts_t = torch.nan_to_num(pts_t, nan=0.0, posinf=0.0, neginf=0.0)
+    pts_t = center_norm(pts_t, mask_t, cfg)
+    pts = pts_t.numpy()
+    return pts, mask, ts
+
+
+def center_norm(pts: torch.Tensor, mask: torch.Tensor, cfg: PrelabelConfig) -> torch.Tensor:
+    if cfg.center:
+        if cfg.center_mode == "wrists":
+            wr = []
+            if float(mask[:, 0, :].sum()) > 0:
+                wr.append(pts[:, 0:1, :])
+            if mask.shape[1] > 21 and float(mask[:, 21, :].sum()) > 0:
+                wr.append(pts[:, 21:22, :])
+            if wr:
+                c = torch.cat(wr, dim=1).mean(dim=1, keepdim=True)
+                pts = pts - c
+            else:
+                denom = torch.clamp(mask.sum(dim=1, keepdim=True), min=1.0)
+                mean = (pts * mask).sum(dim=1, keepdim=True) / denom
+                pts = pts - mean
+        else:
+            denom = torch.clamp(mask.sum(dim=1, keepdim=True), min=1.0)
+            mean = (pts * mask).sum(dim=1, keepdim=True) / denom
+            pts = pts - mean
+    if cfg.normalize:
+        if cfg.norm_method == "p95":
+            flat = pts.abs().reshape(-1)
+            k = max(1, int(flat.numel() * 0.95))
+            span = flat.kthvalue(k)[0]
+        elif cfg.norm_method == "mad":
+            med = pts.median().values
+            mad = (pts - med).abs().median().values * 1.4826
+            span = torch.clamp(mad, min=1e-6)
+        else:
+            span = pts.abs().amax()
+        if float(span) > 1e-6:
+            scale = span / max(1e-6, float(cfg.norm_scale))
+            pts = pts / (scale + 1e-6)
+    return pts
+
+
+def compute_motion(
+    pts: np.ndarray,
+    mask: np.ndarray,
+    ts: Optional[np.ndarray],
+) -> Tuple[np.ndarray, np.ndarray, bool]:
+    T = pts.shape[0]
+    if T == 0:
+        return np.zeros((0,), dtype=np.float32), np.zeros((0,), dtype=np.int32), False
+    vel = pts[1:] - pts[:-1]
+    used_dt = False
+    if ts is not None and ts.size == T:
+        dt = np.diff(ts.astype(np.float32))
+        if dt.size > 0 and np.all(dt > 0):
+            dt = np.clip(dt, 1e-6, None)
+            vel = vel / dt[:, None, None]
+            used_dt = True
+    valid = (mask[1:, :NUM_HAND_NODES, 0] > 0.0) & (mask[:-1, :NUM_HAND_NODES, 0] > 0.0)
+    speed = np.linalg.norm(vel[:, :NUM_HAND_NODES, :], axis=2)
+    speed[~valid] = 0.0
+    valid_counts = valid.sum(axis=1)
+    motion = np.zeros((T,), dtype=np.float32)
+    if speed.shape[0] > 0:
+        denom = np.clip(valid_counts, 1, None).astype(np.float32)
+        motion[1:] = speed.sum(axis=1) / denom
+        motion[1:][valid_counts == 0] = 0.0
+    valid_counts_full = np.zeros((T,), dtype=np.int32)
+    valid_counts_full[1:] = valid_counts
+    return motion, valid_counts_full, used_dt
+
+
+def smooth_motion(motion: np.ndarray, win: int) -> np.ndarray:
+    if motion.size == 0 or win <= 1 or win > motion.size:
+        return motion.copy()
+    kernel = np.ones((win,), dtype=np.float32) / float(win)
+    return np.convolve(motion, kernel, mode="same").astype(np.float32)
+
+
+def best_motion_window(motion: np.ndarray, window: int) -> int:
+    if motion.size == 0:
+        return 0
+    if window <= 0 or motion.size <= window:
+        return 0
+    kernel = np.ones((window,), dtype=np.float32)
+    scores = np.convolve(motion, kernel, mode="valid")
+    return int(np.argmax(scores))
+
+
+def find_active_segment(
+    motion: np.ndarray,
+    valid_mask: Optional[np.ndarray],
+    cfg: PrelabelConfig,
+) -> Tuple[Optional[Tuple[int, int]], Dict[str, Any]]:
+    if motion.size == 0:
+        return None, {"thr_on": 0.0, "thr_off": 0.0, "peak": 0}
+    if valid_mask is not None and valid_mask.size == motion.size:
+        base = motion[valid_mask]
+    else:
+        base = motion
+    if base.size == 0:
+        base = motion[motion > 0]
+    if base.size == 0:
+        thr_on = 0.0
+    else:
+        thr_on = float(np.percentile(base, cfg.motion_percentile))
+    thr_on = max(thr_on, float(cfg.min_motion), 1e-6)
+    thr_off = float(cfg.hysteresis) * thr_on
+    active = motion >= thr_on
+    if not active.any():
+        return None, {"thr_on": thr_on, "thr_off": thr_off, "peak": 0}
+    peak = int(np.argmax(motion))
+    left = peak
+    right = peak
+    while left > 0 and active[left - 1]:
+        left -= 1
+    while right < motion.size - 1 and active[right + 1]:
+        right += 1
+    while left > 0 and motion[left - 1] >= thr_off:
+        left -= 1
+    while right < motion.size - 1 and motion[right + 1] >= thr_off:
+        right += 1
+    start = max(0, left - int(cfg.pad))
+    end = min(motion.size - 1, right + int(cfg.pad))
+    return (start, end), {"thr_on": thr_on, "thr_off": thr_off, "peak": peak}
+
+
+def make_bio_labels(
+    label_str: str,
+    motion: np.ndarray,
+    valid_frames: int,
+    valid_mask: Optional[np.ndarray],
+    cfg: PrelabelConfig,
+) -> Tuple[np.ndarray, int, int, Dict[str, Any]]:
+    T = motion.size
+    bio = np.zeros((T,), dtype=np.uint8)
+    is_no_event = label_str.strip().lower() == "no_event"
+    if is_no_event or T == 0:
+        return bio, -1, -1, {"used_fallback": False}
+
+    segment, seg_stats = find_active_segment(motion, valid_mask, cfg)
+    motion_max = float(motion.max()) if T > 0 else 0.0
+    min_valid_frames = cfg.min_valid_frames if cfg.min_valid_frames > 0 else cfg.min_len
+
+    used_fallback = False
+    start_idx = -1
+    end_idx = -1
+
+    if (
+        valid_frames < min_valid_frames
+        or motion_max < float(cfg.min_motion)
+        or segment is None
+    ):
+        used_fallback = True
+    else:
+        start_idx, end_idx = segment
+        if (end_idx - start_idx + 1) < cfg.min_len:
+            used_fallback = True
+
+    if used_fallback:
+        if T <= int(cfg.fallback_len):
+            peak = int(np.argmax(motion)) if T > 0 else 0
+            start_idx = max(0, peak - int(cfg.fallback_len // 2))
+        else:
+            start_idx = int(best_motion_window(motion, cfg.fallback_len))
+        end_idx = min(int(start_idx + cfg.fallback_len - 1), T - 1)
+
+    if start_idx >= 0 and end_idx >= start_idx:
+        bio[start_idx] = 1
+        if end_idx > start_idx:
+            bio[start_idx + 1 : end_idx + 1] = 2
+
+    stats = {"used_fallback": used_fallback}
+    stats.update(seg_stats)
+    return bio, start_idx, end_idx, stats
+
+
+def save_npz(
+    out_path: Path,
+    pts: np.ndarray,
+    mask: np.ndarray,
+    ts: np.ndarray,
+    bio: np.ndarray,
+    label_str: str,
+    is_no_event: bool,
+    start_idx: int,
+    end_idx: int,
+    meta: Dict[str, Any],
+) -> None:
+    meta_json = json.dumps(meta, ensure_ascii=True)
+    np.savez(
+        out_path,
+        pts=pts.astype(np.float32, copy=False),
+        mask=mask.astype(np.float32, copy=False),
+        ts=ts.astype(np.float32, copy=False),
+        bio=bio.astype(np.uint8, copy=False),
+        label_str=np.array(label_str, dtype=np.unicode_),
+        is_no_event=np.array(bool(is_no_event)),
+        start_idx=np.array(int(start_idx), dtype=np.int64),
+        end_idx=np.array(int(end_idx), dtype=np.int64),
+        meta=np.array(meta_json, dtype=np.unicode_),
+    )
+
+
+def save_debug_log(out_dir: Path, sample_id: str, payload: Dict[str, Any]) -> None:
+    path = out_dir / f"debug_{sample_id}.json"
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=True, indent=2)
+
+
+def save_debug_plot(
+    out_dir: Path,
+    sample_id: str,
+    motion: np.ndarray,
+    start_idx: int,
+    end_idx: int,
+) -> bool:
+    try:
+        import matplotlib.pyplot as plt
+    except Exception:
+        return False
+    path = out_dir / f"debug_{sample_id}.png"
+    x = np.arange(motion.size)
+    plt.figure(figsize=(10, 4))
+    plt.plot(x, motion, label="motion")
+    if start_idx >= 0:
+        plt.axvline(start_idx, color="g", linestyle="--", label="start")
+    if end_idx >= 0:
+        plt.axvline(end_idx, color="r", linestyle="--", label="end")
+    if start_idx >= 0 and end_idx >= start_idx:
+        plt.axvspan(start_idx, end_idx, color="g", alpha=0.1)
+    plt.xlabel("frame")
+    plt.ylabel("motion")
+    plt.tight_layout()
+    plt.savefig(path)
+    plt.close()
+    return True
+
+
+def process_sample(
+    task: Dict[str, Any],
+    cfg: PrelabelConfig,
+    store: VideoStore,
+    mirror_idx: np.ndarray,
+    out_dir: Path,
+) -> Dict[str, Any]:
+    vid = task["vid"]
+    sample_id = task["sample_id"]
+    label_str = task["label_str"]
+    begin_hint = int(task["begin"])
+    end_hint = int(task["end"])
+    out_path = Path(task["out_path"])
+
+    frames, meta = store.get_frames(vid)
+    if not frames:
+        P = len(cfg.pose_keep) if cfg.include_pose else 0
+        V = NUM_HAND_NODES + P
+        pts = np.zeros((0, V, 3), dtype=np.float32)
+        mask = np.zeros((0, V, 1), dtype=np.float32)
+        ts = np.zeros((0,), dtype=np.float32)
+        bio = np.zeros((0,), dtype=np.uint8)
+        meta_out = {
+            "error": "no_frames",
+            "vid": vid,
+            "sample_id": sample_id,
+            "begin_hint": begin_hint,
+            "end_hint": end_hint,
+        }
+        save_npz(out_path, pts, mask, ts, bio, label_str, label_str.lower() == "no_event", -1, -1, meta_out)
+        return {
+            "index": {
+                "vid": sample_id,
+                "label_str": label_str,
+                "path_to_npz": str(out_path.name),
+                "T_total": 0,
+                "start_idx": -1,
+                "end_idx": -1,
+                "is_no_event": bool(label_str.strip().lower() == "no_event"),
+            },
+            "stats": {
+                "segment_len": 0,
+                "used_fallback": False,
+                "is_no_event": bool(label_str.strip().lower() == "no_event"),
+                "valid_frames": 0,
+                "T_total": 0,
+            },
+        }
+
+    total_frames = len(frames)
+    begin = max(0, begin_hint)
+    end = end_hint if end_hint > begin else total_frames
+    end = min(end, total_frames)
+    seg = frames[begin:end] if end > begin else frames
+    T_total = len(seg)
+
+    thr_used, coverage_pre = choose_thr_for_video(seg, cfg)
+    pts, mask, ts = frames_to_arrays(seg, cfg, thr_used, meta, mirror_idx)
+
+    valid_frames = int(np.any(mask[:, :NUM_HAND_NODES, 0] > 0.0, axis=1).sum()) if T_total > 0 else 0
+    coverage_post = valid_frames / float(T_total) if T_total > 0 else 0.0
+
+    motion_raw, valid_counts, motion_dt_used = compute_motion(pts, mask, ts)
+    motion = smooth_motion(motion_raw, cfg.smooth_win)
+    valid_mask = (valid_counts > 0) if valid_counts.size == motion.size else None
+
+    bio, start_idx, end_idx, debug_stats = make_bio_labels(
+        label_str, motion, valid_frames, valid_mask, cfg
+    )
+
+    is_no_event = label_str.strip().lower() == "no_event"
+    seg_len = int(end_idx - start_idx + 1) if start_idx >= 0 else 0
+    motion_max = float(motion.max()) if motion.size > 0 else 0.0
+    motion_mean = float(motion.mean()) if motion.size > 0 else 0.0
+    motion_p95 = float(np.percentile(motion, 95)) if motion.size > 0 else 0.0
+    motion_p99 = float(np.percentile(motion, 99)) if motion.size > 0 else 0.0
+
+    meta_out = {
+        "vid": vid,
+        "sample_id": sample_id,
+        "thr_used": float(thr_used),
+        "coverage": float(coverage_pre),
+        "coverage_post": float(coverage_post),
+        "valid_frames": int(valid_frames),
+        "motion_max": motion_max,
+        "motion_mean": motion_mean,
+        "motion_p95": motion_p95,
+        "motion_p99": motion_p99,
+        "thr_on": float(debug_stats.get("thr_on", 0.0)),
+        "thr_off": float(debug_stats.get("thr_off", 0.0)),
+        "motion_peak": int(debug_stats.get("peak", 0)),
+        "motion_dt_used": bool(motion_dt_used),
+        "motion_valid_frames": int(valid_mask.sum()) if valid_mask is not None else 0,
+        "segment_len": int(seg_len),
+        "used_fallback": bool(debug_stats.get("used_fallback", False)),
+        "begin_hint": int(begin_hint),
+        "end_hint": int(end_hint),
+        "clip_begin": int(begin),
+        "clip_end": int(end),
+        "coords": meta.get("coords", ""),
+        "include_pose": bool(cfg.include_pose),
+        "pose_keep": list(cfg.pose_keep),
+    }
+    if sample_id != vid:
+        meta_out["orig_vid"] = vid
+
+    save_npz(out_path, pts, mask, ts, bio, label_str, is_no_event, start_idx, end_idx, meta_out)
+
+    if task.get("debug"):
+        debug_payload = {
+            "vid": vid,
+            "sample_id": sample_id,
+            "label_str": label_str,
+            "T_total": int(T_total),
+            "start_idx": int(start_idx),
+            "end_idx": int(end_idx),
+            "thr_used": float(thr_used),
+            "coverage": float(coverage_pre),
+            "coverage_post": float(coverage_post),
+            "valid_frames": int(valid_frames),
+            "motion_valid_frames": int(valid_mask.sum()) if valid_mask is not None else 0,
+            "used_fallback": bool(debug_stats.get("used_fallback", False)),
+            "motion_stats": {
+                "max": motion_max,
+                "mean": motion_mean,
+                "p95": motion_p95,
+                "p99": motion_p99,
+                "thr_on": float(debug_stats.get("thr_on", 0.0)),
+                "thr_off": float(debug_stats.get("thr_off", 0.0)),
+                "peak": int(debug_stats.get("peak", 0)),
+                "dt_used": bool(motion_dt_used),
+            },
+            "motion": motion.tolist(),
+        }
+        save_debug_log(out_dir, sample_id, debug_payload)
+        save_debug_plot(out_dir, sample_id, motion, start_idx, end_idx)
+
+    return {
+        "index": {
+            "vid": sample_id,
+            "label_str": label_str,
+            "path_to_npz": str(out_path.name),
+            "T_total": int(T_total),
+            "start_idx": int(start_idx),
+            "end_idx": int(end_idx),
+            "is_no_event": bool(is_no_event),
+        },
+        "stats": {
+            "segment_len": seg_len,
+            "used_fallback": bool(debug_stats.get("used_fallback", False)),
+            "is_no_event": bool(is_no_event),
+            "valid_frames": int(valid_frames),
+            "T_total": int(T_total),
+        },
+    }
+
+
+_WORKER_CFG: Optional[PrelabelConfig] = None
+_WORKER_STORE: Optional[VideoStore] = None
+_WORKER_MIRROR_IDX: Optional[np.ndarray] = None
+_WORKER_OUT_DIR: Optional[Path] = None
+
+
+def _init_worker(cfg: PrelabelConfig, skeletons_path: str, out_dir: str) -> None:
+    global _WORKER_CFG, _WORKER_STORE, _WORKER_MIRROR_IDX, _WORKER_OUT_DIR
+    _WORKER_CFG = cfg
+    _WORKER_STORE = VideoStore(skeletons_path, cache_size=cfg.file_cache_size, prefer_pp=cfg.prefer_pp)
+    _WORKER_MIRROR_IDX = build_mirror_idx(cfg.include_pose, cfg.pose_keep)
+    _WORKER_OUT_DIR = Path(out_dir)
+
+
+def _process_task(task: Dict[str, Any]) -> Dict[str, Any]:
+    if _WORKER_CFG is None or _WORKER_STORE is None or _WORKER_MIRROR_IDX is None or _WORKER_OUT_DIR is None:
+        raise RuntimeError("Worker not initialized.")
+    return process_sample(task, _WORKER_CFG, _WORKER_STORE, _WORKER_MIRROR_IDX, _WORKER_OUT_DIR)
+
+
+def write_index_files(out_dir: Path, rows: List[Dict[str, Any]]) -> None:
+    index_json = out_dir / "index.json"
+    with index_json.open("w", encoding="utf-8") as f:
+        json.dump(rows, f, ensure_ascii=True, indent=2)
+
+    index_csv = out_dir / "index.csv"
+    if rows:
+        fields = ["vid", "label_str", "path_to_npz", "T_total", "start_idx", "end_idx", "is_no_event"]
+        with index_csv.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({k: row.get(k) for k in fields})
+
+
+def build_len_hist(lengths: List[int]) -> Dict[str, int]:
+    bins = [1, 8, 16, 32, 64, 128, 256, 512, 1024]
+    hist: Dict[str, int] = {}
+    for i in range(len(bins) - 1):
+        lo = bins[i]
+        hi = bins[i + 1] - 1
+        key = f"{lo}-{hi}"
+        hist[key] = sum(1 for x in lengths if lo <= x <= hi)
+    hist[f"{bins[-1]}+"] = sum(1 for x in lengths if x >= bins[-1])
+    return hist
+
+
+def write_summary(out_dir: Path, stats: List[Dict[str, Any]]) -> Dict[str, Any]:
+    total = len(stats)
+    no_event = sum(1 for s in stats if s["is_no_event"])
+    fallback = sum(1 for s in stats if s["used_fallback"])
+    no_valid = sum(1 for s in stats if s["valid_frames"] == 0)
+    lengths = [s["segment_len"] for s in stats if s["segment_len"] > 0]
+    summary: Dict[str, Any] = {
+        "total": total,
+        "no_event": {"count": no_event, "frac": no_event / total if total else 0.0},
+        "fallback": {"count": fallback, "frac": fallback / total if total else 0.0},
+        "no_valid_hands": {"count": no_valid, "frac": no_valid / total if total else 0.0},
+        "segment_len": {
+            "count": len(lengths),
+            "mean": float(np.mean(lengths)) if lengths else 0.0,
+            "median": float(np.median(lengths)) if lengths else 0.0,
+            "min": int(np.min(lengths)) if lengths else 0,
+            "max": int(np.max(lengths)) if lengths else 0,
+            "p25": float(np.percentile(lengths, 25)) if lengths else 0.0,
+            "p75": float(np.percentile(lengths, 75)) if lengths else 0.0,
+            "hist": build_len_hist(lengths),
+        },
+    }
+    path = out_dir / "summary.json"
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=True, indent=2)
+    return summary
+
+
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", type=str, default="")
+    pre_args, _ = pre.parse_known_args(argv)
+    defaults = load_config_section(pre_args.config, "prelabel")
+
+    p = argparse.ArgumentParser(description="BIO prelabeling from MediaPipe keypoints.")
+    p.add_argument("--config", type=str, default=pre_args.config, help="Path to config JSON (section: prelabel).")
+    p.add_argument(
+        "--skeletons",
+        default=defaults.get("skeletons"),
+        required=_is_missing(defaults.get("skeletons")),
+        help="Path to combined JSON or directory with per-video JSON.",
+    )
+    p.add_argument(
+        "--csv",
+        default=defaults.get("csv"),
+        required=_is_missing(defaults.get("csv")),
+        help="CSV with attachment_id/text/begin/end/split.",
+    )
+    p.add_argument("--split", default=defaults.get("split", "train"))
+    p.add_argument(
+        "--out",
+        default=defaults.get("out"),
+        required=_is_missing(defaults.get("out")),
+        help="Output directory.",
+    )
+    p.add_argument("--include_pose", action="store_true", default=_bool_or_default(defaults.get("include_pose"), False))
+    p.add_argument("--pose_keep", type=str, default=_csv_or_default(defaults.get("pose_keep"), "0,9,10,11,12,13,14,15,16,23,24"))
+    p.add_argument("--pose_vis_thr", type=float, default=float(defaults.get("pose_vis_thr", 0.5)))
+    p.add_argument("--hand_thr", type=float, default=float(defaults.get("hand_thr", 0.45)))
+    p.add_argument("--hand_thr_fallback", type=float, default=float(defaults.get("hand_thr_fallback", 0.35)))
+    p.add_argument("--thr_tune_steps", type=int, default=int(defaults.get("thr_tune_steps", 6)))
+    p.add_argument("--thr_tune_step", type=float, default=float(defaults.get("thr_tune_step", 0.05)))
+    p.add_argument("--percentile", type=float, default=float(defaults.get("percentile", 70.0)))
+    p.add_argument("--pad", type=int, default=int(defaults.get("pad", 4)))
+    p.add_argument("--min_len", type=int, default=int(defaults.get("min_len", 8)))
+    p.add_argument("--fallback_len", type=int, default=int(defaults.get("fallback_len", 64)))
+    p.add_argument("--num_workers", type=int, default=int(defaults.get("num_workers", 0)))
+    p.add_argument("--debug_vid", type=str, default=defaults.get("debug_vid"))
+    p.add_argument("--smooth_win", type=int, default=int(defaults.get("smooth_win", 7)))
+    p.add_argument("--hysteresis", type=float, default=float(defaults.get("hysteresis", 0.6)))
+    p.add_argument("--min_motion", type=float, default=float(defaults.get("min_motion", 1e-4)))
+    p.add_argument("--min_valid_frames", type=int, default=int(defaults.get("min_valid_frames", 0)))
+    p.add_argument("--file_cache", type=int, default=int(defaults.get("file_cache", 0)))
+    prefer_pp_default = _bool_or_default(defaults.get("prefer_pp"), True)
+    p.add_argument(
+        "--prefer_pp",
+        dest="prefer_pp",
+        action="store_true",
+        default=prefer_pp_default,
+        help="Prefer *_pp.json when using per-video skeletons (fallback to raw .json).",
+    )
+    p.add_argument("--no_prefer_pp", dest="prefer_pp", action="store_false")
+    center_default = _bool_or_default(defaults.get("center"), True)
+    p.add_argument("--center", dest="center", action="store_true", default=center_default)
+    p.add_argument("--no_center", dest="center", action="store_false")
+    p.add_argument("--center_mode", type=str, default=defaults.get("center_mode", "masked_mean"), choices=["masked_mean", "wrists"])
+    normalize_default = _bool_or_default(defaults.get("normalize"), True)
+    p.add_argument("--normalize", dest="normalize", action="store_true", default=normalize_default)
+    p.add_argument("--no_normalize", dest="normalize", action="store_false")
+    p.add_argument("--norm_method", type=str, default=defaults.get("norm_method", "p95"), choices=["p95", "mad", "max"])
+    p.add_argument("--norm_scale", type=float, default=float(defaults.get("norm_scale", 1.0)))
+    p.add_argument("--log_every", type=int, default=int(defaults.get("log_every", 50)))
+    return p.parse_args(argv)
+
+
+def main(argv: Optional[List[str]] = None) -> None:
+    args = parse_args(argv)
+    split = args.split.strip().lower()
+    skeletons_path = Path(args.skeletons)
+    csv_path = Path(args.csv)
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    write_run_config(out_dir, args, config_path=args.config, section="prelabel")
+
+    if not skeletons_path.exists():
+        raise FileNotFoundError(skeletons_path)
+    if not csv_path.exists():
+        raise FileNotFoundError(csv_path)
+
+    pose_keep = tuple(int(x) for x in args.pose_keep.split(",") if x.strip())
+    min_len = max(1, int(args.min_len))
+    fallback_len = max(1, int(args.fallback_len))
+    cfg = PrelabelConfig(
+        include_pose=args.include_pose,
+        pose_keep=pose_keep,
+        pose_vis_thr=args.pose_vis_thr,
+        hand_score_thr=args.hand_thr,
+        hand_score_thr_fallback=args.hand_thr_fallback,
+        thr_tune_steps=args.thr_tune_steps,
+        thr_tune_step=args.thr_tune_step,
+        center=args.center,
+        center_mode=args.center_mode,
+        normalize=args.normalize,
+        norm_method=args.norm_method,
+        norm_scale=args.norm_scale,
+        smooth_win=args.smooth_win,
+        motion_percentile=args.percentile,
+        hysteresis=args.hysteresis,
+        pad=args.pad,
+        min_len=min_len,
+        fallback_len=fallback_len,
+        min_motion=args.min_motion,
+        min_valid_frames=args.min_valid_frames if args.min_valid_frames > 0 else min_len,
+        file_cache_size=args.file_cache,
+        prefer_pp=args.prefer_pp,
+    )
+
+    samples = parse_csv(csv_path, split)
+    if args.debug_vid:
+        samples = [s for s in samples if s[0] == args.debug_vid]
+        if not samples:
+            raise RuntimeError(f"No samples found for debug_vid={args.debug_vid}")
+
+    store = VideoStore(skeletons_path, cache_size=cfg.file_cache_size, prefer_pp=cfg.prefer_pp)
+    mirror_idx = build_mirror_idx(cfg.include_pose, cfg.pose_keep)
+
+    is_dir = skeletons_path.is_dir()
+    if args.num_workers > 0 and not is_dir:
+        print("Combined JSON detected; forcing num_workers=0 to avoid RAM blowups.")
+        args.num_workers = 0
+    if args.debug_vid and args.num_workers > 0:
+        print("Debug mode enabled; forcing num_workers=0 for deterministic logging.")
+        args.num_workers = 0
+
+    tasks: List[Dict[str, Any]] = []
+    seen: Dict[str, int] = {}
+    for idx, (vid, label_str, begin, end) in enumerate(samples):
+        count = seen.get(vid, 0)
+        if count == 0:
+            sample_id = vid
+        else:
+            sample_id = f"{vid}__{count}"
+        seen[vid] = count + 1
+        out_path = out_dir / f"{sample_id}.npz"
+        tasks.append(
+            {
+                "vid": vid,
+                "sample_id": sample_id,
+                "label_str": label_str,
+                "begin": begin,
+                "end": end,
+                "out_path": str(out_path),
+                "debug": bool(args.debug_vid),
+            }
+        )
+
+    index_rows: List[Dict[str, Any]] = []
+    stats_rows: List[Dict[str, Any]] = []
+
+    if args.num_workers > 0:
+        import multiprocessing as mp
+
+        with mp.Pool(
+            processes=args.num_workers,
+            initializer=_init_worker,
+            initargs=(cfg, str(skeletons_path), str(out_dir)),
+        ) as pool:
+            for i, result in enumerate(pool.imap_unordered(_process_task, tasks), 1):
+                index_rows.append(result["index"])
+                stats_rows.append(result["stats"])
+                if args.log_every and (i % args.log_every == 0):
+                    print(f"Processed {i}/{len(tasks)}")
+    else:
+        for i, task in enumerate(tasks, 1):
+            result = process_sample(task, cfg, store, mirror_idx, out_dir)
+            index_rows.append(result["index"])
+            stats_rows.append(result["stats"])
+            if args.log_every and (i % args.log_every == 0):
+                print(f"Processed {i}/{len(tasks)}")
+
+    write_index_files(out_dir, index_rows)
+    summary = write_summary(out_dir, stats_rows)
+
+    with (out_dir / "prelabel_config.json").open("w", encoding="utf-8") as f:
+        json.dump(asdict(cfg), f, ensure_ascii=True, indent=2)
+
+    print("Done.")
+    print(json.dumps(summary, ensure_ascii=True, indent=2))
+
+
+if __name__ == "__main__":
+    main()

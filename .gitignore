@@ -52,11 +52,11 @@ venv.bak/
 # Logs
 *.log
 
-# Data files (if generated or large)
-data/
+# Datasets / large assets
+datasets/
 
 # SQLite database files
 *.sqlite3
 
-SLOVO/
-skeletons_v2/
+# Local artifacts / outputs
+outputs/

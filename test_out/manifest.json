@@ -1,0 +1,24 @@
+[
+  {
+    "id": "f8043fa4-c27d-4613-86b3-00f6c31beb42",
+    "file": "test1\\f8043fa4-c27d-4613-86b3-00f6c31beb42.json",
+    "num_frames": 129,
+    "fps": 30.0,
+    "hands_frames": 129,
+    "hands_coverage": 1.0,
+    "left_score_mean": 0.8158,
+    "right_score_mean": 0.9173,
+    "left_coverage": 1.0,
+    "right_coverage": 1.0,
+    "both_coverage": 1.0,
+    "pose_coverage": 1.0,
+    "pose_interpolated_frac": 0.0,
+    "dt_median_ms": 33.0,
+    "fps_est": 30.303,
+    "left_score_median": 0.8689,
+    "right_score_median": 0.9886,
+    "quality_score": 0.9858,
+    "sp_recovered_left_frac": 0.5736,
+    "sp_recovered_right_frac": 0.3721
+  }
+]

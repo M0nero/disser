@@ -1,0 +1,48 @@
+{
+  "prelabel": {
+    "skeletons": "datasets/skeletons",
+    "csv": "datasets/data/annotations.csv",
+    "split": "train",
+    "out": "outputs/bio_out/prelabels_slovo_train",
+    "num_workers": 8,
+    "include_pose": false,
+    "pose_keep": "0,9,10,11,12,13,14,15,16,23,24",
+    "hand_thr": 0.45,
+    "hand_thr_fallback": 0.35,
+    "center": true,
+    "normalize": true,
+    "prefer_pp": true
+  },
+  "synth_build": {
+    "prelabel_dir": "outputs/bio_out/prelabels_slovo_all_train",
+    "extra_noev_prelabel_dir": [
+      "outputs/ipnhand/prelabels_train",
+      "outputs/ipnhand/prelabels_val"
+    ],
+    "out_dir": "outputs/bio_out/synth_train",
+    "num_samples": 100000,
+    "seq_len": 256,
+    "shard_size": 256,
+    "min_signs": 2,
+    "max_signs": 6,
+    "gap_min": 0,
+    "gap_max": 20,
+    "blend_prob": 0.25,
+    "seed": 1337
+  },
+  "train": {
+    "train_dir": "outputs/bio_out/synth_train",
+    "val_dir": "outputs/bio_out/synth_val",
+    "out_dir": "outputs/runs/bio_gru_v1",
+    "epochs": 15,
+    "batch_size": 64,
+    "lr": 0.002,
+    "weight_decay": 0.0001,
+    "grad_clip": 1.0,
+    "p_with_b": 0.7,
+    "wO": 1.0,
+    "wB": 25.0,
+    "wI": 4.0,
+    "num_workers": 24
+  }
+}

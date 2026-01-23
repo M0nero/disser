@@ -1,0 +1,18 @@
+{
+  "ipn_make_manifest": {
+    "train_list": "datasets/ipnhand/annotations/Annot_TrainList.txt",
+    "test_list": "datasets/ipnhand/annotations/Annot_TestList.txt",
+    "out": "outputs/ipnhand/manifests/ipn_d0x_manifest",
+    "labels": "D0X",
+    "min_frames": 48,
+    "chunk_frames": 96,
+    "chunk_stride": 48,
+    "include_tail": true
+  },
+  "ipn_prelabel": {
+    "manifest": "outputs/ipnhand/manifests/ipn_d0x_manifest.jsonl",
+    "skeleton_npz_dir": "datasets/ipnhand/segments_npz",
+    "out_dir": "outputs/ipnhand/prelabels_no_event",
+    "expect_V": 42
+  }
+}
