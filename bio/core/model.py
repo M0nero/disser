@@ -99,7 +99,7 @@ class BioTagger(nn.Module):
     Conv1D front-end (causal) + GRU + BIO head.
     Designed for:
       - Training on fixed windows (B, T, V, 3)
-      - Streaming inference (stateful GRU step-by-step), if you call `forward_step`.
+      - Streaming inference with a short temporal buffer via `stream_step`.
     """
     def __init__(self, cfg: BioModelConfig):
         super().__init__()
@@ -399,30 +399,6 @@ class BioTagger(nn.Module):
         y, hN = self.gru(y, h0)  # (B,T,H)
         logits = self.head(y)  # (B,T,3)
         return logits, hN
-
-    @torch.no_grad()
-    def forward_step(self, pt: torch.Tensor, mask: Optional[torch.Tensor], h: Optional[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Streaming step: one frame.
-        pt:   (B, V, 3) or (V,3)
-        mask: (B, V, 1) or (V,1)
-        h:    (num_layers, B, H) or None
-
-        Returns:
-          logits: (B, 3)
-          hN:     (num_layers, B, H)
-        """
-        if pt.dim() == 2:
-            pt = pt.unsqueeze(0)  # (1,V,3)
-        if mask is not None and mask.dim() == 2:
-            mask = mask.unsqueeze(0)  # (1,V,1)
-
-        # Build a fake time dimension of 1.
-        pts = pt.unsqueeze(1)  # (B,1,V,3)
-        m = mask.unsqueeze(1) if mask is not None else None
-
-        logits, hN = self.forward(pts, m, h)
-        return logits[:, 0], hN
 
 
 if __name__ == "__main__":

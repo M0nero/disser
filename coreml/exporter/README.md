@@ -1,6 +1,11 @@
 # CoreML Exporter
 
-CLI to export an ST-GCN checkpoint to CoreML.
+CLI to export an ST-GCN checkpoint to CoreML (.mlmodel).
+
+## Requirements
+
+- `coremltools` installed (already in `requirements.txt`)
+- A trained checkpoint (e.g. `outputs/runs/.../best.ckpt` or `.pth`)
 
 ## Run (module)
 
@@ -42,3 +47,8 @@ python -m coreml.exporter \
   --out outputs/coreml/STGCN.mlmodel \
   --via-onnx --opset 13
 ```
+
+## Notes
+
+- If your training uses `label2idx.json`, export labels in the same order for correct class mapping.
+- For smaller models, `--prefer-script` is usually faster to export.

@@ -1,8 +1,10 @@
 # Scripts
 
-## Last Best Export Run
+Utility scripts for dataset preparation and keypoint extraction.
 
-Run from the repo root:
+## Extract Keypoints (PowerShell)
+
+Run from repo root:
 
 ```
 python scripts/extract_keypoints.py `
@@ -54,4 +56,13 @@ python scripts/extract_keypoints.py `
   --skip-existing
 ```
 
-Note: export writes both raw and `_pp` JSON files; downstream training (msagcn/bio) prefers `_pp` by default.
+## Outputs
+
+- Per-video JSON files in `--out-dir`
+- Optional `_pp.json` (post-processed)
+- Eval report JSON (if `--eval-report` is set)
+
+## Notes
+
+- Export writes both raw and `_pp` JSON files; downstream training (msagcn/bio) prefers `_pp` by default.
+- For Windows, use PowerShell backticks or convert to a single-line command.

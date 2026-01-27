@@ -1,14 +1,23 @@
 # MSAGCN
 
-## Last Best Run
+Multi-stream Attention-GCN for isolated sign classification on hand keypoints (with optional pose).
 
-PowerShell (Windows) example:
+## Quickstart
+
+1) Prepare skeletons (see `scripts/README.md` for extraction).
+2) Train:
+
+```
+python -m msagcn.train --json datasets/skeletons --csv datasets/data/annotations.csv --out outputs/runs/agcn_run
+```
+
+## Training Example (PowerShell)
 
 ```
 python -m msagcn.train `
   --json datasets/skeletons `
   --csv datasets/data/annotations.csv `
-  --out datasets/skeletons_new_crop `
+  --out outputs/runs/agcn_run `
   --max_frames 64 `
   --temporal_crop resample `
   --streams joints,bones,velocity `
@@ -44,7 +53,51 @@ python -m msagcn.train `
   --cosine_scale 30 `
   --ema_decay 0.999 `
   --warmup_frac 0.1 `
+  --tensorboard `
+  --logdir runs `
+  --run_name agcn_run `
+  --log_every_steps 10 `
+  --flush_secs 30 `
+  --tb_support_topk 50 `
+  --tb_worstk_f1 50 `
+  --tb_confusion_topk 50 `
+  --tb_log_confusion `
+  --tb_log_examples `
+  --tb_examples_k 5 `
+  --tb_examples_every 5 `
   --workers 24
 ```
 
-Note: when `--json` points to a per-video directory, training prefers `*_pp.json` if present. Use `--no_prefer_pp` to force raw `*.json`.
+## TensorBoard
+
+Enable event logs:
+
+```
+python -m msagcn.train ... --tensorboard --logdir runs --run_name agcn_run --log_every_steps 1 \
+  --tb_log_examples --tb_examples_k 5 --tb_examples_every 5
+```
+
+Logs are written to `runs/<run_name>`. Start TensorBoard with:
+
+```
+tensorboard --logdir runs
+```
+
+## Outputs
+
+Training writes into `--out`:
+- `best.ckpt` (best by macro-F1)
+- `history.json` (epoch metrics)
+- `report_epXXX.json` (per-class report, every 5 epochs)
+- `label2idx.json`, `ds_config.json`
+
+## Notes
+
+- When `--json` points to a per-video directory, training prefers `*_pp.json` if present.
+  Use `--no_prefer_pp` to force raw `*.json`.
+- Validation is deterministic even if `--temporal_crop=random`.
+- If `--include_pose` is set, pose↔hand cross edges are enabled by default.
+  Use `--no_cross_edges` to disable.
+- Use `--no_amp` to disable autocast/AMP (useful for reproducibility or CPU runs).
+- For 1000 classes with tiny val support, rely on `val/f1_micro`, `val/f1_weighted`,
+  top-K metrics, and worst-K examples in TensorBoard.

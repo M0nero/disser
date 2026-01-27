@@ -1,11 +1,11 @@
-from msagcn.dataset import GestureDataset
+from msagcn.dataset_multistream import DSConfig, MultiStreamGestureDataset
 from pathlib import Path
 
 # подставь пути
 JSON = "datasets/data/skeletons.json"
 CSV  = "datasets/data/annotations.csv"
 
-ds = GestureDataset(JSON, CSV, split="train")  # тот же split, что в обучении
+ds = MultiStreamGestureDataset(JSON, CSV, split="train", cfg=DSConfig())  # тот же split, что в обучении
 # idx -> label в правильном порядке
 idx2label = {i: lbl for lbl, i in ds.label2idx.items()}
 labels = [idx2label[i] for i in range(len(idx2label))]

@@ -8,6 +8,14 @@ This module contains a 3-step pipeline for BIO segmentation:
 
 All outputs now live under `outputs/`, and datasets under `datasets/`.
 
+## Quickstart
+
+```
+python -m bio prelabel --config bio/configs/bio_default.json --split train --out outputs/bio_out/prelabels_train
+python -m bio synth-build --config bio/configs/bio_default.json --prelabel_dir outputs/bio_out/prelabels_train --out_dir outputs/bio_out/synth_train
+python -m bio train --config bio/configs/bio_default.json --train_dir outputs/bio_out/synth_train --out_dir outputs/runs/bio_gru
+```
+
 ## CLI
 
 Entry point:
@@ -81,8 +89,61 @@ python -m bio train \
   --config bio/configs/bio_default.json \
   --train_dir outputs/bio_out/synth_train \
   --val_dir outputs/bio_out/synth_val \
-  --out_dir outputs/runs/bio_gru_v1
+  --out_dir outputs/runs/bio_gru_v1 \
+  --tensorboard \
+  --logdir runs \
+  --run_name bio_gru_v1 \
+  --log_every_steps 10 \
+  --flush_secs 30 \
+  --tb_log_examples \
+  --tb_examples_k 5 \
+  --tb_examples_every 5
 ```
+
+## TensorBoard
+
+Enable event logs for training:
+
+```
+python -m bio train ... --tensorboard --logdir runs --run_name bio_gru_v1 --log_every_steps 1 \
+  --tb_log_examples --tb_examples_k 5 --tb_examples_every 5
+```
+
+Logs are written to `runs/<run_name>`. Start TensorBoard with:
+
+```
+tensorboard --logdir runs
+```
+
+## Streaming inference (camera / iOS)
+
+Use `BioTagger.stream_step(...)` with a short temporal buffer. Recommended window:
+
+- **W = 9–16 frames** (covers the causal conv receptive field; good balance for latency/quality).
+
+Example (Python-side logic; same flow for iOS):
+
+```python
+from bio.core.model import BioTagger, BioModelConfig
+
+cfg = BioModelConfig(num_joints=42)
+model = BioTagger(cfg).eval()
+
+W = 12  # recommended: 9–16
+state = model.init_stream_state(batch_size=1, window=W, device="cpu")
+
+for pt, mask in stream_frames():  # pt: (V,3), mask: (V,1)
+    logits, state = model.stream_step(pt, mask, state)
+    pred = int(logits.argmax(dim=-1).item())  # 0=O,1=B,2=I
+    # use pred for the current frame
+```
+
+## Outputs
+
+Training writes into `--out_dir`:
+- `last.pt` and `best.pt` (checkpoint)
+- `train_log.jsonl` (JSONL logs)
+- `config.json` (resolved config + model params)
 
 ## IPN Hand (suggested layout)
 

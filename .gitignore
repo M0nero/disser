@@ -60,3 +60,5 @@ datasets/
 
 # Local artifacts / outputs
 outputs/
+runs/
+*.tfevents*

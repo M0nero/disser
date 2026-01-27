@@ -5,6 +5,8 @@
 torch==2.7.0+cu128
 torchvision==0.22.0+cu128
 torchaudio==2.7.0+cu128
+tensorboard==2.16.2
+torch-tb-profiler==0.4.3
 
 # Other dependencies (from venv)
 absl-py==2.3.1
