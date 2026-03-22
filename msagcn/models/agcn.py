@@ -64,11 +64,6 @@ class MultiStreamAGCN(nn.Module):
                 A,
                 drop=drop * 0.5,
                 droppath=droppath * 0.5,
-                use_ctr_hand_refine=use_ctr_hand_refine,
-                ctr_groups=ctr_groups,
-                ctr_hand_nodes=ctr_hand_nodes,
-                ctr_rel_channels=ctr_rel_channels,
-                ctr_alpha_init=ctr_alpha_init,
             )
             if len(self.streams) > 1
             else None
