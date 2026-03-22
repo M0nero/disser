@@ -170,6 +170,8 @@ def run_training(args) -> None:
         file_cache_size=args.file_cache,
         prefer_pp=args.prefer_pp,
     )
+    # Keep the checkpoint-compatible dataset config separate from runtime loader tweaks.
+    ds_cfg_dict = asdict(ds_cfg)
 
     # Datasets
     train_ds = MultiStreamGestureDataset(args.json, args.csv, split="train", cfg=ds_cfg)
@@ -210,8 +212,6 @@ def run_training(args) -> None:
             )
             train_ds.cfg.file_cache_size = safe_file_cache
             val_ds.cfg.file_cache_size = safe_file_cache
-
-    ds_cfg_dict = asdict(ds_cfg)
 
     # Save label map & ds cfg
     with (out_dir / "label2idx.json").open("w", encoding="utf-8") as f:
