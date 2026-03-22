@@ -70,7 +70,20 @@ def build_confusion_image(
     fig.tight_layout()
     fig.canvas.draw()
     w, h = fig.canvas.get_width_height()
-    img = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8).reshape(h, w, 3)
+
+    # Matplotlib backends differ here: TkAgg may not expose tostring_rgb(),
+    # while Agg-like canvases expose buffer_rgba(). Use the most portable path.
+    if hasattr(fig.canvas, "buffer_rgba"):
+        rgba = np.asarray(fig.canvas.buffer_rgba(), dtype=np.uint8)
+        img = np.ascontiguousarray(rgba[..., :3])
+    elif hasattr(fig.canvas, "tostring_rgb"):
+        img = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8).reshape(h, w, 3)
+    elif hasattr(fig.canvas, "tostring_argb"):
+        argb = np.frombuffer(fig.canvas.tostring_argb(), dtype=np.uint8).reshape(h, w, 4)
+        img = np.ascontiguousarray(argb[..., 1:])
+    else:
+        raise RuntimeError(f"Unsupported matplotlib canvas for confusion image: {type(fig.canvas).__name__}")
+
     plt.close(fig)
     return img, topk_idx.tolist()
 

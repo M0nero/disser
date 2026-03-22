@@ -134,6 +134,16 @@ def parse_args():
     p.add_argument("--drop", type=float, default=0.10)
     p.add_argument("--stream_drop_p", type=float, default=0.10)
     p.add_argument("--use_groupnorm_stem", action="store_true")
+    p.add_argument("--use_ctr_hand_refine", action="store_true", help="Enable hand-only CTR-style topology refinement")
+    p.add_argument("--ctr_groups", type=int, default=4, help="Channel groups for hand-only adaptive topology")
+    p.add_argument("--ctr_hand_nodes", type=int, default=42, help="Number of leading nodes treated as hands")
+    p.add_argument(
+        "--ctr_rel_channels",
+        type=int,
+        default=None,
+        help="Optional relation channels per group for CTR refinement (default: auto)",
+    )
+    p.add_argument("--ctr_alpha_init", type=float, default=0.0, help="Initial scale for adaptive hand correction")
     # cosine head flags
     p.add_argument("--use_cosine_head", action="store_true")
     p.add_argument("--cosine_margin", type=float, default=0.2)

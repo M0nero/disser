@@ -63,6 +63,103 @@ class SE(nn.Module):
         return x * w
 
 
+class CTRHandRefine(nn.Module):
+    """Group-wise hand-only topology correction on top of the static graph prior."""
+
+    def __init__(
+        self,
+        ch: int,
+        *,
+        groups: int = 4,
+        hand_nodes: int = 42,
+        rel_channels: Optional[int] = None,
+        alpha_init: float = 0.0,
+    ):
+        super().__init__()
+        if groups <= 0:
+            raise ValueError(f"ctr_groups must be positive, got {groups}")
+        if hand_nodes <= 0:
+            raise ValueError(f"ctr_hand_nodes must be positive, got {hand_nodes}")
+        if ch % groups != 0:
+            raise ValueError(
+                f"CTR hand refine requires theta(x) channels divisible by ctr_groups; got {ch} and {groups}"
+            )
+
+        self.groups = int(groups)
+        self.hand_nodes = int(hand_nodes)
+        self.ch_per_group = ch // self.groups
+        auto_rel = max(4, min(16, self.ch_per_group))
+        self.rel_channels = int(rel_channels) if (rel_channels is not None and rel_channels > 0) else auto_rel
+
+        self.q_proj = nn.Conv1d(ch, self.groups * self.rel_channels, 1, groups=self.groups, bias=False)
+        self.k_proj = nn.Conv1d(ch, self.groups * self.rel_channels, 1, groups=self.groups, bias=False)
+        self.rel_proj = nn.Conv2d(
+            self.groups * self.rel_channels,
+            self.groups,
+            1,
+            groups=self.groups,
+            bias=False,
+        )
+        self.alpha = nn.Parameter(torch.tensor(float(alpha_init), dtype=torch.float32))
+
+    def forward(self, y: torch.Tensor, A_hand_prior: torch.Tensor) -> torch.Tensor:
+        B, C, V, T = y.shape
+        H = min(V, self.hand_nodes, A_hand_prior.size(-1))
+        if H <= 0:
+            return y.new_zeros(B, C, 0, T)
+
+        yh = y[:, :, :H, :]
+        pooled = yh.mean(dim=-1)  # (B,C,H)
+
+        q = self.q_proj(pooled).reshape(B, self.groups, self.rel_channels, H)
+        k = self.k_proj(pooled).reshape(B, self.groups, self.rel_channels, H)
+
+        # Pairwise group-wise relation features over hand nodes only.
+        diff = torch.tanh(q.unsqueeze(-1) - k.unsqueeze(-2))  # (B,G,R,H,H)
+        q_rel = self.rel_proj(diff.reshape(B, self.groups * self.rel_channels, H, H))
+        q_rel = torch.tanh(q_rel)
+        q_rel = 0.5 * (q_rel + q_rel.transpose(-1, -2))
+        q_rel = torch.nan_to_num(q_rel, nan=0.0, posinf=0.0, neginf=0.0)
+
+        hand_prior = A_hand_prior[:H, :H].to(dtype=y.dtype).unsqueeze(0).unsqueeze(0)
+        alpha = self.alpha.to(dtype=y.dtype)
+        refined = hand_prior + alpha * q_rel
+        delta = refined - hand_prior  # residual correction relative to the static hand prior
+
+        yh_group = yh.reshape(B, self.groups, self.ch_per_group, H, T).permute(0, 1, 2, 4, 3).contiguous()
+        hand_delta = torch.einsum("bgctu,bgvu->bgctv", yh_group, delta)
+        hand_delta = hand_delta.permute(0, 1, 2, 4, 3).reshape(B, C, H, T).contiguous()
+        return torch.nan_to_num(hand_delta, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _build_ctr_hand_refine_preserve_rng(
+    ch: int,
+    *,
+    groups: int,
+    hand_nodes: int,
+    rel_channels: Optional[int],
+    alpha_init: float,
+) -> CTRHandRefine:
+    """
+    Instantiate the optional CTR module without perturbing the RNG stream used by
+    the legacy backbone initialization. This keeps the base model initialization
+    aligned with runs where CTR was disabled, making alpha=0 a cleaner ablation.
+    """
+    cpu_state = torch.get_rng_state()
+    cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    module = CTRHandRefine(
+        ch,
+        groups=groups,
+        hand_nodes=hand_nodes,
+        rel_channels=rel_channels,
+        alpha_init=alpha_init,
+    )
+    torch.set_rng_state(cpu_state)
+    if cuda_states is not None:
+        torch.cuda.set_rng_state_all(cuda_states)
+    return module
+
+
 class GCNBlock(nn.Module):
     """Graph + temporal block with learnable edge-importance and DropPath."""
 
@@ -78,6 +175,11 @@ class GCNBlock(nn.Module):
         droppath: float = 0.0,
         use_mstcn: bool = True,
         use_se: bool = True,
+        use_ctr_hand_refine: bool = False,
+        ctr_groups: int = 4,
+        ctr_hand_nodes: int = 42,
+        ctr_rel_channels: Optional[int] = None,
+        ctr_alpha_init: float = 0.0,
     ):
         super().__init__()
         inter = out_ch // 2
@@ -90,6 +192,17 @@ class GCNBlock(nn.Module):
         self.theta = nn.Conv2d(in_ch, inter, 1)
         self.conv = nn.Conv2d(inter, out_ch, 1)
         self.bn = nn.BatchNorm2d(out_ch)
+        self.ctr_hand_refine = (
+            _build_ctr_hand_refine_preserve_rng(
+                inter,
+                groups=ctr_groups,
+                hand_nodes=ctr_hand_nodes,
+                rel_channels=ctr_rel_channels,
+                alpha_init=ctr_alpha_init,
+            )
+            if use_ctr_hand_refine
+            else None
+        )
 
         # Temporal
         if use_mstcn and stride_t == 1:
@@ -116,6 +229,12 @@ class GCNBlock(nn.Module):
         # no in-place after Sigmoid
         self.act = nn.ReLU(inplace=False)
 
+    @staticmethod
+    def _apply_adjacency(y: torch.Tensor, A_eff: torch.Tensor) -> torch.Tensor:
+        y = y.permute(0, 1, 3, 2).contiguous()  # (B,C,T,V)
+        y = torch.matmul(y, A_eff.t())  # (B,C,T,V)
+        return y.permute(0, 1, 3, 2).contiguous()  # (B,C,V,T)
+
     def forward(
         self,
         x: torch.Tensor,  # (B,C,V,T)
@@ -140,9 +259,14 @@ class GCNBlock(nn.Module):
         if mask is not None:
             y = y * (mask > 0).to(y.dtype)  # zero-out invalid nodes
 
-        y = y.permute(0, 1, 3, 2).contiguous()  # (B,C',T,V)
-        y = torch.matmul(y, A_eff.t())  # (B,C',T,V)
-        y = y.permute(0, 1, 3, 2).contiguous()  # (B,C',V,T)
+        y_proj = y
+        y = self._apply_adjacency(y_proj, A_eff)
+        if self.ctr_hand_refine is not None:
+            H = min(y.size(2), self.ctr_hand_refine.hand_nodes, A_eff.size(-1))
+            if H > 0:
+                hand_delta = self.ctr_hand_refine(y_proj, A_eff[:H, :H])
+                y = y.clone()
+                y[:, :, :H, :] = y[:, :, :H, :] + hand_delta
 
         # 3) BN->ReLU->TCN->SE->Dropout2d->DropPath + Residual
         y = self.bn(self.conv(y))

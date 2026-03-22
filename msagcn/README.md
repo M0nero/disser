@@ -91,6 +91,18 @@ Training writes into `--out`:
 - `report_epXXX.json` (per-class report, every 5 epochs)
 - `label2idx.json`, `ds_config.json`
 
+## Experimental Graph Refinement
+
+An optional hand-first CTR-style refinement branch can be enabled on top of the existing static graph prior.
+It only adapts the leading hand subgraph (default: the first 42 nodes) and leaves pose / cross-edge context on the static path.
+
+Example:
+
+```
+python -m msagcn.train --json datasets/skeletons --csv datasets/data/annotations.csv --out outputs/runs/agcn_ctr \
+  --use_ctr_hand_refine --ctr_groups 4 --ctr_hand_nodes 42 --ctr_alpha_init 0.0
+```
+
 ## Notes
 
 - When `--json` points to a per-video directory, training prefers `*_pp.json` if present.
@@ -98,6 +110,8 @@ Training writes into `--out`:
 - Validation is deterministic even if `--temporal_crop=random`.
 - If `--include_pose` is set, pose↔hand cross edges are enabled by default.
   Use `--no_cross_edges` to disable.
+- `--use_ctr_hand_refine` keeps the full static graph path and adds a residual adaptive correction only on hand↔hand relations.
+- `--ctr_rel_channels` is optional; when omitted the model uses a small auto-sized relation width per group.
 - Use `--no_amp` to disable autocast/AMP (useful for reproducibility or CPU runs).
 - For 1000 classes with tiny val support, rely on `val/f1_micro`, `val/f1_weighted`,
   top-K metrics, and worst-K examples in TensorBoard.

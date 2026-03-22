@@ -42,8 +42,11 @@ def run_training(args) -> None:
         flush_secs=int(args.flush_secs),
     )
     if tb_logger.enabled:
-        print(f"TensorBoard logs: {tb_logger.log_dir}")
-        print(f"Run: tensorboard --logdir {args.logdir}")
+        tb_path = tb_logger.log_dir.resolve()
+        print(f"TensorBoard logs: {tb_path}")
+        print(f"Run: tensorboard --logdir \"{tb_path}\"")
+        with (out_dir / "tensorboard_logdir.txt").open("w", encoding="utf-8") as f:
+            f.write(str(tb_path))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Device:", device, "| cudnn.benchmark =", (device.type == "cuda"))
@@ -202,6 +205,11 @@ def run_training(args) -> None:
         temp_ks=temp_ks,
         use_groupnorm_stem=args.use_groupnorm_stem,
         stream_drop_p=model_stream_drop,
+        use_ctr_hand_refine=args.use_ctr_hand_refine,
+        ctr_groups=args.ctr_groups,
+        ctr_hand_nodes=args.ctr_hand_nodes,
+        ctr_rel_channels=args.ctr_rel_channels,
+        ctr_alpha_init=args.ctr_alpha_init,
         # cosine head flags
         use_cosine_head=args.use_cosine_head,
         cosine_margin=args.cosine_margin,
@@ -366,10 +374,13 @@ def run_training(args) -> None:
                             tb_logger.scalar(f"val/p_worst/{label_name}", float(p_all[idx]), global_step)
                             tb_logger.scalar(f"val/r_worst/{label_name}", float(r_all[idx]), global_step)
             if args.tb_log_confusion and val_labels:
-                img, _ = build_confusion_image(
-                    val_labels, val_preds, idx2label, topk=int(args.tb_confusion_topk), normalize=True
-                )
-                tb_logger.image("val/confusion_topk", img, global_step, dataformats="HWC")
+                try:
+                    img, _ = build_confusion_image(
+                        val_labels, val_preds, idx2label, topk=int(args.tb_confusion_topk), normalize=True
+                    )
+                    tb_logger.image("val/confusion_topk", img, global_step, dataformats="HWC")
+                except Exception as exc:
+                    print(f"Warning: failed to log confusion image to TensorBoard: {exc}")
             if collect_examples and examples:
                 wrong = [ex for ex in examples if int(ex["pred"]) != int(ex["true"])]
                 wrong.sort(key=lambda x: x.get("conf", 1.0))

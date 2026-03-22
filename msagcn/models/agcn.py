@@ -31,12 +31,18 @@ class MultiStreamAGCN(nn.Module):
         use_cosine_head: bool = False,
         cosine_margin: float = 0.20,
         cosine_scale: float = 30.0,
+        use_ctr_hand_refine: bool = False,
+        ctr_groups: int = 4,
+        ctr_hand_nodes: int = 42,
+        ctr_rel_channels: Optional[int] = None,
+        ctr_alpha_init: float = 0.0,
     ):
         super().__init__()
         assert len(depths) == len(temp_ks) == 4
         self.streams = list(streams)
         self.stream_drop_p = float(stream_drop_p)
         self.V = int(V)
+        ctr_rel_channels = None if (ctr_rel_channels is not None and ctr_rel_channels <= 0) else ctr_rel_channels
 
         # adjacency
         A = _hand_adjacency_42() if A is None else _normalize_adjacency(A)
@@ -52,7 +58,18 @@ class MultiStreamAGCN(nn.Module):
         self.fuse = StreamAttention(stem_out, self.streams)
         self.node_attn = NodeAttention(stem_out)
         self.stream_encoder = (
-            StreamFeatureEncoder(self.streams, stem_out, A, drop=drop * 0.5, droppath=droppath * 0.5)
+            StreamFeatureEncoder(
+                self.streams,
+                stem_out,
+                A,
+                drop=drop * 0.5,
+                droppath=droppath * 0.5,
+                use_ctr_hand_refine=use_ctr_hand_refine,
+                ctr_groups=ctr_groups,
+                ctr_hand_nodes=ctr_hand_nodes,
+                ctr_rel_channels=ctr_rel_channels,
+                ctr_alpha_init=ctr_alpha_init,
+            )
             if len(self.streams) > 1
             else None
         )
@@ -74,6 +91,11 @@ class MultiStreamAGCN(nn.Module):
                     droppath=droppath * (i + 1) / 4.0,
                     use_mstcn=(i > 0),
                     use_se=True,
+                    use_ctr_hand_refine=use_ctr_hand_refine,
+                    ctr_groups=ctr_groups,
+                    ctr_hand_nodes=ctr_hand_nodes,
+                    ctr_rel_channels=ctr_rel_channels,
+                    ctr_alpha_init=ctr_alpha_init,
                 )
             )
         self.blocks = nn.ModuleList(blocks)

@@ -18,6 +18,12 @@ class StreamFeatureEncoder(nn.Module):
         A: torch.Tensor,
         drop: float,
         droppath: float,
+        *,
+        use_ctr_hand_refine: bool = False,
+        ctr_groups: int = 4,
+        ctr_hand_nodes: int = 42,
+        ctr_rel_channels: Optional[int] = None,
+        ctr_alpha_init: float = 0.0,
     ):
         super().__init__()
         self.streams = list(streams)
@@ -33,6 +39,11 @@ class StreamFeatureEncoder(nn.Module):
                     droppath=droppath,
                     use_mstcn=False,
                     use_se=True,
+                    use_ctr_hand_refine=use_ctr_hand_refine,
+                    ctr_groups=ctr_groups,
+                    ctr_hand_nodes=ctr_hand_nodes,
+                    ctr_rel_channels=ctr_rel_channels,
+                    ctr_alpha_init=ctr_alpha_init,
                 )
                 for s in self.streams
             }
@@ -54,4 +65,3 @@ class StreamFeatureEncoder(nn.Module):
             if name not in encoded:
                 encoded[name] = feat
         return encoded
-
