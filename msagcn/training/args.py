@@ -141,6 +141,11 @@ def parse_args():
     p.add_argument("--stream_drop_p", type=float, default=0.10)
     p.add_argument("--use_groupnorm_stem", action="store_true")
     p.add_argument("--use_ctr_hand_refine", action="store_true", help="Enable hand-only CTR-style topology refinement")
+    p.add_argument(
+        "--ctr_in_stream_encoder",
+        action="store_true",
+        help="Also enable the hand-only CTR refinement inside the pre-fusion per-stream encoder.",
+    )
     p.add_argument("--ctr_groups", type=int, default=4, help="Channel groups for hand-only adaptive topology")
     p.add_argument("--ctr_hand_nodes", type=int, default=42, help="Number of leading nodes treated as hands")
     p.add_argument(

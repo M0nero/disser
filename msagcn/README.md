@@ -114,6 +114,13 @@ python -m msagcn.train --json datasets/skeletons --csv datasets/data/annotations
   --use_ctr_hand_refine --ctr_groups 4 --ctr_hand_nodes 42 --ctr_alpha_init 0.0
 ```
 
+To ablate a stronger variant that also applies the same hand-only refinement inside the
+pre-fusion stream encoder, add:
+
+```
+  --ctr_in_stream_encoder
+```
+
 ## Notes
 
 - When `--json` points to a per-video directory, training prefers `*_pp.json` if present.
@@ -122,6 +129,8 @@ python -m msagcn.train --json datasets/skeletons --csv datasets/data/annotations
 - If `--include_pose` is set, pose↔hand cross edges are enabled by default.
   Use `--no_cross_edges` to disable.
 - `--use_ctr_hand_refine` keeps the full static graph path and adds a residual adaptive correction only on hand↔hand relations.
+- `--ctr_in_stream_encoder` extends the same CTR hand refinement into the per-stream encoder before fusion; keep it off for the cleaner backbone-only ablation.
+  If you enable it on top of an older checkpoint, prefer `--resume_model_only` or start a new `--out` directory.
 - `--ctr_rel_channels` is optional; when omitted the model uses a small auto-sized relation width per group.
 - Use `--no_amp` to disable autocast/AMP (useful for reproducibility or CPU runs).
 - For 1000 classes with tiny val support, rely on `val/f1_micro`, `val/f1_weighted`,

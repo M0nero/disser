@@ -32,6 +32,7 @@ class MultiStreamAGCN(nn.Module):
         cosine_margin: float = 0.20,
         cosine_scale: float = 30.0,
         use_ctr_hand_refine: bool = False,
+        ctr_in_stream_encoder: bool = False,
         ctr_groups: int = 4,
         ctr_hand_nodes: int = 42,
         ctr_rel_channels: Optional[int] = None,
@@ -64,6 +65,11 @@ class MultiStreamAGCN(nn.Module):
                 A,
                 drop=drop * 0.5,
                 droppath=droppath * 0.5,
+                use_ctr_hand_refine=(use_ctr_hand_refine and ctr_in_stream_encoder),
+                ctr_groups=ctr_groups,
+                ctr_hand_nodes=ctr_hand_nodes,
+                ctr_rel_channels=ctr_rel_channels,
+                ctr_alpha_init=ctr_alpha_init,
             )
             if len(self.streams) > 1
             else None

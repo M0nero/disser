@@ -52,6 +52,14 @@ def _diff_dict_keys(a: dict, b: dict) -> list[str]:
     return mismatched
 
 
+def _preview_keys(keys: list[str] | tuple[str, ...], limit: int = 8) -> str:
+    items = list(keys)
+    if not items:
+        return ""
+    preview = ", ".join(items[:limit])
+    return preview + (" ..." if len(items) > limit else "")
+
+
 def _build_checkpoint(
     *,
     epoch: int,
@@ -287,6 +295,7 @@ def run_training(args) -> None:
         use_groupnorm_stem=args.use_groupnorm_stem,
         stream_drop_p=model_stream_drop,
         use_ctr_hand_refine=args.use_ctr_hand_refine,
+        ctr_in_stream_encoder=args.ctr_in_stream_encoder,
         ctr_groups=args.ctr_groups,
         ctr_hand_nodes=args.ctr_hand_nodes,
         ctr_rel_channels=args.ctr_rel_channels,
@@ -379,18 +388,34 @@ def run_training(args) -> None:
                 "Use identical data flags or pass --resume_model_only."
             )
 
-        model.load_state_dict(ckpt["model_state"], strict=True)
-        if ema is not None:
-            if ckpt.get("ema_state") is not None:
-                ema.load_state_dict(ckpt["ema_state"])
-            else:
-                ema.module.load_state_dict(model.state_dict())
-        elif ckpt.get("ema_state") is not None:
-            print("Warning: checkpoint contains EMA weights, but current run has ema disabled; ignoring ema_state.")
-
         if args.resume_model_only:
+            missing, unexpected = model.load_state_dict(ckpt["model_state"], strict=False)
+            if missing or unexpected:
+                print(
+                    "Model-only resume loaded with non-strict state_dict matching. "
+                    f"missing=[{_preview_keys(missing)}] unexpected=[{_preview_keys(unexpected)}]"
+                )
+            if ema is not None:
+                ema_state = ckpt.get("ema_state")
+                if ema_state is not None:
+                    ema_missing, ema_unexpected = ema.module.load_state_dict(ema_state, strict=False)
+                    if ema_missing or ema_unexpected:
+                        print(
+                            "EMA model-only resume loaded with non-strict state_dict matching. "
+                            f"missing=[{_preview_keys(ema_missing)}] unexpected=[{_preview_keys(ema_unexpected)}]"
+                        )
+                else:
+                    ema.module.load_state_dict(model.state_dict())
             print(f"Loaded model weights from {resume_path} (model-only resume).")
         else:
+            model.load_state_dict(ckpt["model_state"], strict=True)
+            if ema is not None:
+                if ckpt.get("ema_state") is not None:
+                    ema.load_state_dict(ckpt["ema_state"])
+                else:
+                    ema.module.load_state_dict(model.state_dict())
+            elif ckpt.get("ema_state") is not None:
+                print("Warning: checkpoint contains EMA weights, but current run has ema disabled; ignoring ema_state.")
             if "optimizer_state" in ckpt:
                 optimizer.load_state_dict(ckpt["optimizer_state"])
                 _optimizer_to_device(optimizer, device)
@@ -614,6 +639,8 @@ def run_training(args) -> None:
                 "streams": str(args.streams),
                 "use_logit_adjustment": bool(args.use_logit_adjustment),
                 "use_cosine_head": bool(args.use_cosine_head),
+                "use_ctr_hand_refine": bool(args.use_ctr_hand_refine),
+                "ctr_in_stream_encoder": bool(args.ctr_in_stream_encoder),
             },
             {"best_val_f1": float(best_f1)},
         )
