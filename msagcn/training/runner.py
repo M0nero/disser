@@ -26,6 +26,65 @@ from .prefetch import PrefetchLoader
 from .utils import build_mirror_idx, select_hist_params, set_seed
 
 
+def _load_history_file(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"Warning: failed to read history file {path}: {exc}")
+        return []
+    return data if isinstance(data, list) else []
+
+
+def _optimizer_to_device(optimizer: optim.Optimizer, device: torch.device) -> None:
+    for state in optimizer.state.values():
+        for key, value in list(state.items()):
+            if isinstance(value, torch.Tensor):
+                state[key] = value.to(device)
+
+
+def _diff_dict_keys(a: dict, b: dict) -> list[str]:
+    mismatched = []
+    for key in sorted(set(a.keys()) | set(b.keys())):
+        if a.get(key) != b.get(key):
+            mismatched.append(key)
+    return mismatched
+
+
+def _build_checkpoint(
+    *,
+    epoch: int,
+    model: nn.Module,
+    optimizer: optim.Optimizer,
+    sched,
+    scaler,
+    ema: ModelEma | None,
+    label2idx: dict[str, int],
+    ds_cfg_dict: dict,
+    best_f1: float,
+    epochs_no_improve: int,
+    global_step: int,
+    history: list[dict],
+    args,
+) -> dict:
+    return {
+        "epoch": int(epoch),
+        "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "sched_state": sched.state_dict(),
+        "scaler_state": scaler.state_dict(),
+        "ema_state": (ema.state_dict() if ema is not None else None),
+        "label2idx": label2idx,
+        "ds_cfg": ds_cfg_dict,
+        "best_f1": float(best_f1),
+        "epochs_no_improve": int(epochs_no_improve),
+        "global_step": int(global_step),
+        "history": history,
+        "args": vars(args),
+    }
+
+
 def run_training(args) -> None:
     set_seed(args.seed)
 
@@ -152,11 +211,13 @@ def run_training(args) -> None:
             train_ds.cfg.file_cache_size = safe_file_cache
             val_ds.cfg.file_cache_size = safe_file_cache
 
+    ds_cfg_dict = asdict(ds_cfg)
+
     # Save label map & ds cfg
     with (out_dir / "label2idx.json").open("w", encoding="utf-8") as f:
         json.dump(label2idx, f, ensure_ascii=False, indent=2)
     with (out_dir / "ds_config.json").open("w", encoding="utf-8") as f:
-        json.dump(asdict(ds_cfg), f, ensure_ascii=False, indent=2)
+        json.dump(ds_cfg_dict, f, ensure_ascii=False, indent=2)
 
     # Sampler weights
     weights = build_sample_weights(
@@ -294,10 +355,94 @@ def run_training(args) -> None:
     epochs_no_improve = 0
     history = []
     global_step = 0
+    start_epoch = 1
+
+    if args.resume:
+        resume_path = Path(args.resume).expanduser()
+        if not resume_path.exists():
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
+        ckpt = torch.load(resume_path, map_location="cpu", weights_only=False)
+        ckpt_label2idx = ckpt.get("label2idx")
+        if ckpt_label2idx is not None and ckpt_label2idx != label2idx:
+            raise ValueError(
+                "Checkpoint label2idx does not match the current train split. "
+                "Use the same dataset/split or start a fresh run."
+            )
+        ckpt_ds_cfg = ckpt.get("ds_cfg")
+        if (not args.resume_model_only) and isinstance(ckpt_ds_cfg, dict) and ckpt_ds_cfg != ds_cfg_dict:
+            diff_keys = _diff_dict_keys(ckpt_ds_cfg, ds_cfg_dict)
+            preview = ", ".join(diff_keys[:8])
+            suffix = " ..." if len(diff_keys) > 8 else ""
+            raise ValueError(
+                "Checkpoint dataset config does not match the current run. "
+                f"Mismatched keys: {preview}{suffix}. "
+                "Use identical data flags or pass --resume_model_only."
+            )
+
+        model.load_state_dict(ckpt["model_state"], strict=True)
+        if ema is not None:
+            if ckpt.get("ema_state") is not None:
+                ema.load_state_dict(ckpt["ema_state"])
+            else:
+                ema.module.load_state_dict(model.state_dict())
+        elif ckpt.get("ema_state") is not None:
+            print("Warning: checkpoint contains EMA weights, but current run has ema disabled; ignoring ema_state.")
+
+        if args.resume_model_only:
+            print(f"Loaded model weights from {resume_path} (model-only resume).")
+        else:
+            if "optimizer_state" in ckpt:
+                optimizer.load_state_dict(ckpt["optimizer_state"])
+                _optimizer_to_device(optimizer, device)
+            else:
+                print("Warning: optimizer_state missing in checkpoint; optimizer will start fresh.")
+            if "sched_state" in ckpt:
+                sched.load_state_dict(ckpt["sched_state"])
+            else:
+                print("Warning: sched_state missing in checkpoint; scheduler will start fresh.")
+            if "scaler_state" in ckpt:
+                try:
+                    scaler.load_state_dict(ckpt["scaler_state"])
+                except Exception as exc:
+                    print(f"Warning: failed to restore GradScaler state: {exc}")
+
+            history = ckpt.get("history")
+            if not isinstance(history, list):
+                history = _load_history_file(resume_path.parent / "history.json")
+            best_f1 = float(
+                ckpt.get(
+                    "best_f1",
+                    max((row.get("val_f1", -1.0) for row in history), default=-1.0),
+                )
+            )
+            epochs_no_improve = int(ckpt.get("epochs_no_improve", 0))
+            global_step = int(ckpt.get("global_step", 0))
+            if global_step <= 0 and history:
+                steps_per_epoch = int(train_limit) if train_limit is not None else len(train_loader)
+                global_step = len(history) * max(1, steps_per_epoch)
+            start_epoch = int(ckpt.get("epoch", 0)) + 1
+
+            saved_args = ckpt.get("args")
+            if isinstance(saved_args, dict):
+                saved_total_epochs = saved_args.get("epochs")
+                if saved_total_epochs is not None and int(saved_total_epochs) != int(args.epochs):
+                    print(
+                        "Warning: --epochs differs from the checkpoint's original training plan. "
+                        "Scheduler state will continue from the saved schedule."
+                    )
+            if start_epoch > int(args.epochs):
+                raise ValueError(
+                    f"Checkpoint is already at epoch {start_epoch - 1}, but --epochs={args.epochs}. "
+                    "Pass a larger total epoch count to continue training."
+                )
+            print(
+                f"Resuming full training state from {resume_path} | "
+                f"next_epoch={start_epoch} | best_f1={best_f1:.4f} | global_step={global_step}"
+            )
 
     hist_params = select_hist_params(model, ("stems.", "head."))
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         t0 = time.time()
         tr_loss, global_step = train_one_epoch(
             model,
@@ -420,23 +565,28 @@ def run_training(args) -> None:
         if improved:
             best_f1 = val_f1
             epochs_no_improve = 0
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model_state": model.state_dict(),
-                    "optimizer_state": optimizer.state_dict(),
-                    "sched_state": sched.state_dict(),
-                    "scaler_state": scaler.state_dict(),
-                    "ema_state": (ema.state_dict() if ema is not None else None),
-                    "label2idx": label2idx,
-                    "ds_cfg": asdict(ds_cfg),
-                    "best_f1": best_f1,
-                },
-                out_dir / "best.ckpt",
-            )
-            print(f"  -> new best macro-F1 = {best_f1:.4f} (checkpoint saved)")
         else:
             epochs_no_improve += 1
+
+        ckpt_payload = _build_checkpoint(
+            epoch=epoch,
+            model=model,
+            optimizer=optimizer,
+            sched=sched,
+            scaler=scaler,
+            ema=ema,
+            label2idx=label2idx,
+            ds_cfg_dict=ds_cfg_dict,
+            best_f1=best_f1,
+            epochs_no_improve=epochs_no_improve,
+            global_step=global_step,
+            history=history,
+            args=args,
+        )
+        torch.save(ckpt_payload, out_dir / "last.ckpt")
+        if improved:
+            torch.save(ckpt_payload, out_dir / "best.ckpt")
+            print(f"  -> new best macro-F1 = {best_f1:.4f} (checkpoint saved)")
 
         # Per-class F1 (every 5 epochs)
         if epoch % 5 == 0:

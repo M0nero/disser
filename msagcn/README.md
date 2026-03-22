@@ -87,9 +87,20 @@ tensorboard --logdir runs
 
 Training writes into `--out`:
 - `best.ckpt` (best by macro-F1)
+- `last.ckpt` (latest epoch, for crash-safe resume)
 - `history.json` (epoch metrics)
 - `report_epXXX.json` (per-class report, every 5 epochs)
 - `label2idx.json`, `ds_config.json`
+
+Resume training from the latest checkpoint:
+
+```
+python -m msagcn.train ... --out outputs/runs/agcn_run --resume outputs/runs/agcn_run/last.ckpt --epochs 120
+```
+
+Notes:
+- `--epochs` is the total target epoch count, not "extra epochs after resume".
+- `--resume_model_only` loads model / EMA weights from a checkpoint but resets optimizer, scheduler, scaler, best score, and history.
 
 ## Experimental Graph Refinement
 

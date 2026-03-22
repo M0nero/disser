@@ -73,7 +73,7 @@ def parse_args():
     p.add_argument("--speed_perturb_kmax", type=int, default=68)
 
     # Train config
-    p.add_argument("--epochs", type=int, default=80)
+    p.add_argument("--epochs", type=int, default=80, help="Total target epochs. When resuming, training continues until this epoch number.")
     p.add_argument("--batch", type=int, default=64)
     p.add_argument("--accum", type=int, default=1)
     p.add_argument("--lr", type=float, default=5e-4)
@@ -107,6 +107,12 @@ def parse_args():
     p.add_argument("--prefetch", type=int, default=6)
     p.add_argument("--no_prefetch", action="store_true")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--resume", type=str, default="", help="Resume training from a checkpoint (.ckpt)")
+    p.add_argument(
+        "--resume_model_only",
+        action="store_true",
+        help="Load model/EMA weights from --resume, but reset optimizer, scheduler, scaler, best score, and history.",
+    )
 
     # Sampling & Loss options
     p.add_argument("--weighted_sampler", action="store_true", help="Use WeightedRandomSampler for train")
