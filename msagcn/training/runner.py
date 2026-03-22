@@ -132,6 +132,26 @@ def run_training(args) -> None:
         args.workers = 0
     print(f"Dataset mode: {'dir' if is_dir_mode else 'combined'} | workers={args.workers}")
 
+    persistent_workers = args.workers > 0
+    prefetch_factor = max(2, int(args.prefetch))
+    if (os.name == "nt") and is_dir_mode and args.workers > 0:
+        # On Windows each spawned worker keeps its own file cache. With high worker
+        # counts plus aggressive prefetch this can grow RAM over epochs and kill a worker.
+        if persistent_workers:
+            print("Note: Windows + per-video JSON -> disabling persistent_workers for loader stability.")
+            persistent_workers = False
+        if prefetch_factor > 2:
+            print(f"Note: Windows + per-video JSON -> capping prefetch_factor {prefetch_factor} -> 2.")
+            prefetch_factor = 2
+        safe_file_cache = min(int(train_ds.cfg.file_cache_size), 8)
+        if safe_file_cache != int(train_ds.cfg.file_cache_size):
+            print(
+                f"Note: Windows + per-video JSON -> capping per-worker file_cache "
+                f"{train_ds.cfg.file_cache_size} -> {safe_file_cache}."
+            )
+            train_ds.cfg.file_cache_size = safe_file_cache
+            val_ds.cfg.file_cache_size = safe_file_cache
+
     # Save label map & ds cfg
     with (out_dir / "label2idx.json").open("w", encoding="utf-8") as f:
         json.dump(label2idx, f, ensure_ascii=False, indent=2)
@@ -158,7 +178,7 @@ def run_training(args) -> None:
     dl_kwargs = dict(
         batch_size=args.batch,
         num_workers=args.workers,
-        persistent_workers=args.workers > 0,
+        persistent_workers=persistent_workers,
         collate_fn=MultiStreamGestureDataset.collate_fn,
     )
     if device.type == "cuda":
@@ -168,7 +188,7 @@ def run_training(args) -> None:
         dl_kwargs["pin_memory"] = False
 
     if args.workers > 0:
-        dl_kwargs["prefetch_factor"] = max(2, int(args.prefetch))
+        dl_kwargs["prefetch_factor"] = prefetch_factor
 
     train_loader = DataLoader(
         train_ds,
