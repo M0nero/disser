@@ -138,6 +138,32 @@ python -m msagcn.train --json datasets/skeletons --csv datasets/data/annotations
   --use_ctr_hand_refine --ctr_groups 4 --ctr_hand_nodes 42 --ctr_alpha_init 0.0
 ```
 
+For Windows runs with many workers on a per-video JSON directory, you can enable a sidecar packed
+memory-mapped cache to reduce tiny-file overhead and let the OS page cache use RAM more effectively:
+
+```
+python -m msagcn.train --json datasets/skeletons --csv datasets/data/annotations.csv --out outputs/runs/agcn_ctr \
+  --workers 24 --use_packed_skeleton_cache
+```
+
+Optional flags:
+- `--packed_skeleton_cache_dir <path>` to choose a custom cache location
+- `--packed_skeleton_cache_rebuild` to rebuild the packed cache
+
+If the bottleneck is no longer tiny-file I/O but JSON parsing / Python frame traversal, use the
+stronger decoded cache instead. It stores already-decoded hand / pose arrays in a single mmap-backed
+sidecar and removes JSON parsing from `Dataset.__getitem__`:
+
+```
+python -m msagcn.train --json datasets/skeletons --csv datasets/data/annotations.csv --out outputs/runs/agcn_ctr \
+  --workers 24 --use_decoded_skeleton_cache
+```
+
+Optional flags:
+- `--decoded_skeleton_cache_dir <path>` to choose a custom cache location
+- `--decoded_skeleton_cache_rebuild` to rebuild the decoded cache
+- if both decoded and packed cache flags are passed, the decoded cache path wins
+
 To ablate a stronger variant that also applies the same hand-only refinement inside the
 pre-fusion stream encoder, add:
 

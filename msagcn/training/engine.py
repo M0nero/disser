@@ -156,8 +156,9 @@ def train_one_epoch(
                     margin = top2_vals[:, 0] - top2_vals[:, 1]
                 else:
                     margin = top2_vals[:, 0]
-                margin_mean = float(margin.mean())
-                margin_p10 = float(torch.quantile(margin, q=0.10)) if margin.numel() > 1 else margin_mean
+                margin_f = margin.float()
+                margin_mean = float(margin_f.mean())
+                margin_p10 = float(torch.quantile(margin_f, q=0.10)) if margin_f.numel() > 1 else margin_mean
             print(
                 f"   step {step:04d} | loss={float(loss.item() * accum_steps):.4f} | "
                 f"entropy={entropy:.3f} | conf={conf:.3f}"

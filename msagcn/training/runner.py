@@ -395,7 +395,22 @@ def run_training(args) -> None:
     ds_cfg_dict = asdict(ds_cfg)
 
     # Datasets
-    train_ds = MultiStreamGestureDataset(args.json, args.csv, split="train", cfg=ds_cfg)
+    if args.use_decoded_skeleton_cache and args.use_packed_skeleton_cache:
+        print("Note: --use_decoded_skeleton_cache supersedes --use_packed_skeleton_cache for dataset loading.")
+    packed_cache_dir = args.packed_skeleton_cache_dir.strip() or None
+    decoded_cache_dir = args.decoded_skeleton_cache_dir.strip() or None
+    train_ds = MultiStreamGestureDataset(
+        args.json,
+        args.csv,
+        split="train",
+        cfg=ds_cfg,
+        use_packed_cache=bool(args.use_packed_skeleton_cache and not args.use_decoded_skeleton_cache),
+        packed_cache_dir=packed_cache_dir,
+        packed_cache_rebuild=bool(args.packed_skeleton_cache_rebuild),
+        use_decoded_cache=bool(args.use_decoded_skeleton_cache),
+        decoded_cache_dir=decoded_cache_dir,
+        decoded_cache_rebuild=bool(args.decoded_skeleton_cache_rebuild),
+    )
     label2idx = train_ds.label2idx  # single label map from train
     idx2label = {v: k for k, v in label2idx.items()}
     val_ds = MultiStreamGestureDataset(
@@ -404,6 +419,12 @@ def run_training(args) -> None:
         split="val",
         cfg=DSConfig(**{**asdict(ds_cfg), "augment": False}),
         label2idx=label2idx,
+        use_packed_cache=bool(args.use_packed_skeleton_cache and not args.use_decoded_skeleton_cache),
+        packed_cache_dir=packed_cache_dir,
+        packed_cache_rebuild=False,
+        use_decoded_cache=bool(args.use_decoded_skeleton_cache),
+        decoded_cache_dir=decoded_cache_dir,
+        decoded_cache_rebuild=False,
     )
 
     # Detect storage mode (dir vs combined)
@@ -412,27 +433,76 @@ def run_training(args) -> None:
     if (os.name == "nt") and (not is_dir_mode) and args.workers > 0:
         print("Note: Windows + combined JSON detected -> forcing workers=0 to avoid RAM blowups.")
         args.workers = 0
+    if args.use_packed_skeleton_cache and not is_dir_mode:
+        print("Note: --use_packed_skeleton_cache is only used for per-video JSON directories; ignoring it for combined JSON.")
+    if args.use_decoded_skeleton_cache and not is_dir_mode:
+        print("Note: --use_decoded_skeleton_cache is only used for per-video JSON directories; ignoring it for combined JSON.")
     print(f"Dataset mode: {'dir' if is_dir_mode else 'combined'} | workers={args.workers}")
 
     persistent_workers = args.workers > 0
     prefetch_factor = max(2, int(args.prefetch))
     if (os.name == "nt") and is_dir_mode and args.workers > 0:
-        # On Windows each spawned worker keeps its own file cache. With high worker
-        # counts plus aggressive prefetch this can grow RAM over epochs and kill a worker.
-        if persistent_workers:
-            print("Note: Windows + per-video JSON -> disabling persistent_workers for loader stability.")
-            persistent_workers = False
-        if prefetch_factor > 2:
-            print(f"Note: Windows + per-video JSON -> capping prefetch_factor {prefetch_factor} -> 2.")
-            prefetch_factor = 2
-        safe_file_cache = min(int(train_ds.cfg.file_cache_size), 8)
-        if safe_file_cache != int(train_ds.cfg.file_cache_size):
-            print(
-                f"Note: Windows + per-video JSON -> capping per-worker file_cache "
-                f"{train_ds.cfg.file_cache_size} -> {safe_file_cache}."
-            )
-            train_ds.cfg.file_cache_size = safe_file_cache
-            val_ds.cfg.file_cache_size = safe_file_cache
+        if args.use_decoded_skeleton_cache:
+            if not persistent_workers:
+                persistent_workers = True
+            if prefetch_factor > 2:
+                print(f"Note: Windows + decoded skeleton cache -> capping prefetch_factor {prefetch_factor} -> 2.")
+                prefetch_factor = 2
+            if int(train_ds.cfg.file_cache_size) != 0:
+                print(
+                    f"Note: Windows + decoded skeleton cache -> disabling per-worker file_cache "
+                    f"{train_ds.cfg.file_cache_size} -> 0."
+                )
+                train_ds.cfg.file_cache_size = 0
+                val_ds.cfg.file_cache_size = 0
+            print("Note: Windows + decoded skeleton cache -> keeping persistent_workers=True for high-worker throughput.")
+        elif args.use_packed_skeleton_cache:
+            if not persistent_workers:
+                persistent_workers = True
+            if prefetch_factor > 2:
+                print(f"Note: Windows + packed skeleton cache -> capping prefetch_factor {prefetch_factor} -> 2.")
+                prefetch_factor = 2
+            if int(train_ds.cfg.file_cache_size) != 0:
+                print(
+                    f"Note: Windows + packed skeleton cache -> disabling per-worker file_cache "
+                    f"{train_ds.cfg.file_cache_size} -> 0."
+                )
+                train_ds.cfg.file_cache_size = 0
+                val_ds.cfg.file_cache_size = 0
+            print("Note: Windows + packed skeleton cache -> keeping persistent_workers=True for high-worker throughput.")
+        else:
+            # On Windows each worker owns its own dataset instance. For moderate worker
+            # counts we stay in the safer mode; for intentionally high worker counts we
+            # keep the workers but aggressively reduce queue/cache pressure.
+            if args.workers > 8:
+                if not persistent_workers:
+                    persistent_workers = True
+                if prefetch_factor != 1:
+                    print(f"Note: Windows + per-video JSON + high workers -> capping prefetch_factor {prefetch_factor} -> 1.")
+                    prefetch_factor = 1
+                if int(train_ds.cfg.file_cache_size) != 0:
+                    print(
+                        f"Note: Windows + per-video JSON + high workers -> disabling per-worker file_cache "
+                        f"{train_ds.cfg.file_cache_size} -> 0."
+                    )
+                    train_ds.cfg.file_cache_size = 0
+                    val_ds.cfg.file_cache_size = 0
+                print("Note: Windows + per-video JSON + high workers -> keeping persistent_workers=True.")
+            else:
+                if persistent_workers:
+                    print("Note: Windows + per-video JSON -> disabling persistent_workers for loader stability.")
+                    persistent_workers = False
+                if prefetch_factor > 2:
+                    print(f"Note: Windows + per-video JSON -> capping prefetch_factor {prefetch_factor} -> 2.")
+                    prefetch_factor = 2
+                safe_file_cache = min(int(train_ds.cfg.file_cache_size), 8)
+                if safe_file_cache != int(train_ds.cfg.file_cache_size):
+                    print(
+                        f"Note: Windows + per-video JSON -> capping per-worker file_cache "
+                        f"{train_ds.cfg.file_cache_size} -> {safe_file_cache}."
+                    )
+                    train_ds.cfg.file_cache_size = safe_file_cache
+                    val_ds.cfg.file_cache_size = safe_file_cache
 
     # Save label map & ds cfg
     with (out_dir / "label2idx.json").open("w", encoding="utf-8") as f:
@@ -714,6 +784,8 @@ def run_training(args) -> None:
         "tb_full_logging_enabled": bool(args.tb_full_logging),
         "features": {
             "tensorboard": bool(args.tensorboard),
+            "use_packed_skeleton_cache": bool(args.use_packed_skeleton_cache),
+            "use_decoded_skeleton_cache": bool(args.use_decoded_skeleton_cache),
             "tb_log_all_classes": bool(args.tb_log_all_classes),
             "tb_log_tail_buckets": bool(args.tb_log_tail_buckets),
             "tb_log_confusion_pairs": bool(args.tb_log_confusion_pairs),
@@ -1192,6 +1264,8 @@ def run_training(args) -> None:
                 "use_cosine_head": bool(args.use_cosine_head),
                 "use_ctr_hand_refine": bool(args.use_ctr_hand_refine),
                 "ctr_in_stream_encoder": bool(args.ctr_in_stream_encoder),
+                "use_packed_skeleton_cache": bool(args.use_packed_skeleton_cache),
+                "use_decoded_skeleton_cache": bool(args.use_decoded_skeleton_cache),
                 "tb_full_logging": bool(args.tb_full_logging),
                 "tb_watchlist_k": int(args.tb_watchlist_k),
             },

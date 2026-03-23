@@ -131,6 +131,38 @@ def parse_args():
     # Dataset I/O perf
     p.add_argument("--file_cache", type=int, default=64, help="small per-dataset file cache for per-video JSON (0=off)")
     p.add_argument(
+        "--use_packed_skeleton_cache",
+        action="store_true",
+        help="Use a sidecar packed mmap cache for per-video skeleton JSON to improve high-worker throughput.",
+    )
+    p.add_argument(
+        "--use_decoded_skeleton_cache",
+        action="store_true",
+        help="Use a sidecar decoded mmap cache that removes JSON parsing from Dataset.__getitem__.",
+    )
+    p.add_argument(
+        "--packed_skeleton_cache_dir",
+        type=str,
+        default="",
+        help="Optional directory for the packed skeleton cache (default: sidecar next to --json directory).",
+    )
+    p.add_argument(
+        "--decoded_skeleton_cache_dir",
+        type=str,
+        default="",
+        help="Optional directory for the decoded skeleton cache (default: sidecar next to --json directory).",
+    )
+    p.add_argument(
+        "--packed_skeleton_cache_rebuild",
+        action="store_true",
+        help="Force rebuild of the packed skeleton cache before training.",
+    )
+    p.add_argument(
+        "--decoded_skeleton_cache_rebuild",
+        action="store_true",
+        help="Force rebuild of the decoded skeleton cache before training.",
+    )
+    p.add_argument(
         "--prefer_pp",
         dest="prefer_pp",
         action="store_true",
