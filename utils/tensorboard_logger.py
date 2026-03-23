@@ -106,6 +106,11 @@ class TensorboardLogger:
         self.writer.add_hparams(clean_hparams, clean_metrics)
         self.writer.flush()
 
+    def flush(self) -> None:
+        if self.writer is None:
+            return
+        self.writer.flush()
+
     def close(self) -> None:
         if self.writer is None:
             return

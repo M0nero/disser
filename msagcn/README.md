@@ -83,6 +83,22 @@ Logs are written to `runs/<run_name>`. Start TensorBoard with:
 tensorboard --logdir runs
 ```
 
+Enable the full monitoring bundle for macro-F1, tail classes, confusion pairs, per-class curves,
+prediction/error CSVs, and CTR topology diagnostics:
+
+```
+python -m msagcn.train ... --tensorboard --logdir outputs/runs --run_name agcn_full \
+  --tb_full_logging --tb_confusion_every 5 --tb_predictions_every 1 --tb_tables_k 50
+```
+
+With `--tb_full_logging`, the run writes:
+- stable per-class TensorBoard tags under `val_all/*`
+- head/mid/tail aggregates under `val_bucket/*`
+- fixed tail watchlist curves under `val_watch/*`
+- CTR diagnostics under `topology/*`
+- text summaries under `tables/*`
+- structured artifacts under `--out/analysis/`
+
 ## Outputs
 
 Training writes into `--out`:
@@ -91,6 +107,14 @@ Training writes into `--out`:
 - `history.json` (epoch metrics)
 - `report_epXXX.json` (per-class report, every 5 epochs)
 - `label2idx.json`, `ds_config.json`
+
+When full logging is enabled, `--out/analysis/` also contains:
+- `run_manifest.json`, `train_support.csv`, `buckets.csv`, `watchlist.csv`, `epoch_index.csv`
+- `per_class/per_class_epXXX.{csv,json}`
+- `predictions/predictions_epXXX.csv`
+- `errors/errors_epXXX.csv`
+- `confusion/confusion_pairs_epXXX.{csv,json}`
+- `best_per_class.*`, `best_predictions.csv`, `best_errors.csv`, `best_confusion_pairs.*`
 
 Resume training from the latest checkpoint:
 

@@ -102,6 +102,17 @@ def parse_args():
     p.add_argument("--tb_log_examples", action="store_true", help="Log sample predictions to TensorBoard")
     p.add_argument("--tb_examples_k", type=int, default=5, help="Number of examples to log")
     p.add_argument("--tb_examples_every", type=int, default=5, help="Log examples every N epochs")
+    p.add_argument("--tb_full_logging", action="store_true", help="Enable full TensorBoard + analysis artifact logging")
+    p.add_argument("--tb_log_all_classes", action="store_true", help="Log per-class val metrics for every class")
+    p.add_argument("--tb_log_tail_buckets", action="store_true", help="Log head/mid/tail aggregate metrics")
+    p.add_argument("--tb_log_confusion_pairs", action="store_true", help="Write machine-readable confusion pairs and text tables")
+    p.add_argument("--tb_log_predictions_csv", action="store_true", help="Write per-sample validation predictions CSV")
+    p.add_argument("--tb_log_errors_csv", action="store_true", help="Write per-sample validation errors CSV")
+    p.add_argument("--tb_log_topology", action="store_true", help="Log CTR/adaptive-topology diagnostics")
+    p.add_argument("--tb_watchlist_k", type=int, default=64, help="Size of the fixed tail-class watchlist")
+    p.add_argument("--tb_confusion_every", type=int, default=5, help="Log confusion images/tables every N epochs")
+    p.add_argument("--tb_predictions_every", type=int, default=1, help="Write predictions/errors artifacts every N epochs")
+    p.add_argument("--tb_tables_k", type=int, default=50, help="Max rows for TensorBoard text tables")
 
     p.add_argument("--workers", type=int, default=min(8, os.cpu_count() or 8))
     p.add_argument("--prefetch", type=int, default=6)
@@ -169,4 +180,18 @@ def parse_args():
     # Prior & TTA
     p.add_argument("--tta_mirror", action="store_true")
 
-    return p.parse_args()
+    args = p.parse_args()
+    if args.tb_full_logging:
+        if not args.tensorboard:
+            p.error("--tb_full_logging requires --tensorboard")
+        args.tb_log_all_classes = True
+        args.tb_log_tail_buckets = True
+        args.tb_log_confusion_pairs = True
+        args.tb_log_predictions_csv = True
+        args.tb_log_errors_csv = True
+        args.tb_log_topology = True
+        args.tb_log_confusion = True
+        args.tb_predictions_every = 1
+        args.tb_confusion_every = 5
+        args.tb_tables_k = 50
+    return args

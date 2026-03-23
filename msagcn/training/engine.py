@@ -1,17 +1,45 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import time
-from typing import Dict, List, Tuple
+from typing import Dict, List, Mapping, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
-from sklearn.metrics import f1_score
+from sklearn.metrics import f1_score, precision_recall_fscore_support
 from torch import amp
 
-from .metrics import push_lowest_conf
+from .metrics import build_confusion_pairs, compute_calibration_metrics, push_lowest_conf
 from .utils import move_to_device
 from utils.tensorboard_logger import TensorboardLogger
+
+
+@dataclass
+class TrainOutputs:
+    loss: float
+    global_step: int
+    nonfinite_batches: int
+    skipped_updates: int
+
+
+@dataclass
+class EvalOutputs:
+    loss: float
+    acc: float
+    macro_f1: float
+    topk_acc: Dict[int, float]
+    labels: List[int]
+    preds: List[int]
+    probs_top1: List[float]
+    probs_top2: List[float]
+    entropy: List[float]
+    margin: List[float]
+    records: List[Dict[str, object]]
+    per_class: Dict[int, Dict[str, object]]
+    confusion_pairs: List[Dict[str, object]]
+    examples: List[Dict[str, object]]
+    calibration: Dict[str, float]
 
 
 def train_one_epoch(
@@ -44,6 +72,8 @@ def train_one_epoch(
     t_load_sum = 0.0
     t_fwd_sum = 0.0
     steps = 0
+    nonfinite_batches = 0
+    skipped_updates = 0
     max_batches = max_batches if max_batches and max_batches > 0 else None
     tb_enabled = tb_logger is not None and tb_logger.enabled and tb_log_every > 0
 
@@ -83,12 +113,17 @@ def train_one_epoch(
         if not torch.isfinite(loss):
             print("WARN: non-finite loss encountered -> batch skipped")
             optimizer.zero_grad(set_to_none=True)
+            nonfinite_batches += 1
+            skipped_updates += 1
             continue
 
         if tb_enabled and (global_step % tb_log_every == 0):
             lr = float(optimizer.param_groups[0]["lr"]) if optimizer.param_groups else 0.0
             tb_logger.scalar("train/loss", float(loss.item()) * accum_steps, global_step)
             tb_logger.scalar("train/lr", lr, global_step)
+            tb_logger.scalar("train/amp_scale", float(scaler.get_scale()) if hasattr(scaler, "get_scale") else 1.0, global_step)
+            tb_logger.scalar("train/nonfinite_batches", float(nonfinite_batches), global_step)
+            tb_logger.scalar("train/skipped_updates", float(skipped_updates), global_step)
 
         scaler.scale(loss).backward()
 
@@ -115,7 +150,14 @@ def train_one_epoch(
             with torch.no_grad():
                 probs = logits.detach().softmax(dim=1)
                 entropy = float((-probs * torch.log(probs.clamp_min(1e-9))).sum(dim=1).mean())
-                conf = float(probs.max(dim=1).values.mean())
+                top2_vals = probs.topk(k=min(2, probs.size(1)), dim=1).values
+                conf = float(top2_vals[:, 0].mean())
+                if top2_vals.size(1) > 1:
+                    margin = top2_vals[:, 0] - top2_vals[:, 1]
+                else:
+                    margin = top2_vals[:, 0]
+                margin_mean = float(margin.mean())
+                margin_p10 = float(torch.quantile(margin, q=0.10)) if margin.numel() > 1 else margin_mean
             print(
                 f"   step {step:04d} | loss={float(loss.item() * accum_steps):.4f} | "
                 f"entropy={entropy:.3f} | conf={conf:.3f}"
@@ -123,6 +165,9 @@ def train_one_epoch(
             if tb_enabled:
                 tb_logger.scalar("train/entropy", entropy, global_step)
                 tb_logger.scalar("train/confidence", conf, global_step)
+                tb_logger.scalar("train/confidence_mean", conf, global_step)
+                tb_logger.scalar("train/prob_margin_mean", margin_mean, global_step)
+                tb_logger.scalar("train/prob_margin_p10", margin_p10, global_step)
 
     if total_n > 0:
         print(f"   dataloader_time~{t_load_sum:.1f}s | fwd+bwd_time~{t_fwd_sum:.1f}s | steps={steps}")
@@ -132,7 +177,12 @@ def train_one_epoch(
             tb_logger.scalar("train/dataloader_time_sec", float(t_load_sum), global_step)
             tb_logger.scalar("train/fwd_bwd_time_sec", float(t_fwd_sum), global_step)
             tb_logger.scalar("train/epoch_time_sec", float(epoch_time), global_step)
-    return total_loss / max(1, total_n), global_step
+    return TrainOutputs(
+        loss=(total_loss / max(1, total_n)),
+        global_step=global_step,
+        nonfinite_batches=int(nonfinite_batches),
+        skipped_updates=int(skipped_updates),
+    )
 
 
 @torch.no_grad()
@@ -151,17 +201,32 @@ def evaluate(
     topk: Tuple[int, ...] = (3, 5),
     collect_examples: bool = False,
     examples_k: int = 5,
-):
+    epoch: int = 0,
+    global_step: int = 0,
+    idx2label: Mapping[int, str] | None = None,
+    train_support: np.ndarray | None = None,
+    bucket_by_class: Mapping[int, str] | None = None,
+) -> EvalOutputs:
     model.eval()
     total_loss = 0.0
     total_n = 0
     all_preds: List[int] = []
     all_labels: List[int] = []
+    all_conf: List[float] = []
+    all_top2: List[float] = []
+    all_margin: List[float] = []
+    all_entropy: List[float] = []
+    all_correct: List[float] = []
+    all_true_prob: List[float] = []
+    all_prob_sq_sum: List[float] = []
     wrong_examples: List[Dict[str, object]] = []
     correct_examples: List[Dict[str, object]] = []
+    records: List[Dict[str, object]] = []
     topk = tuple(sorted({int(k) for k in topk if int(k) > 0}))
     topk_correct = {k: 0 for k in topk}
     max_batches = max_batches if max_batches and max_batches > 0 else None
+    idx2label = dict(idx2label or {})
+    num_classes = int(len(train_support)) if train_support is not None else 0
 
     for step, (X, y, metas) in enumerate(loader, start=1):
         if max_batches is not None and step > max_batches:
@@ -209,6 +274,22 @@ def evaluate(
         preds = logits.argmax(dim=1)
         all_preds.extend(preds.cpu().tolist())
         all_labels.extend(y.cpu().tolist())
+        probs = torch.softmax(logits, dim=1)
+        top2_vals, top2_idx = probs.topk(k=min(2, probs.size(1)), dim=1)
+        conf = top2_vals[:, 0]
+        second = top2_vals[:, 1] if top2_vals.size(1) > 1 else torch.zeros_like(conf)
+        margin = conf - second
+        entropy = (-probs * torch.log(probs.clamp_min(1e-9))).sum(dim=1)
+        true_prob = probs.gather(1, y.view(-1, 1)).squeeze(1).clamp_min(1e-9)
+        prob_sq_sum = probs.square().sum(dim=1)
+        correct = preds.eq(y).float()
+        all_conf.extend(conf.detach().cpu().tolist())
+        all_top2.extend(second.detach().cpu().tolist())
+        all_margin.extend(margin.detach().cpu().tolist())
+        all_entropy.extend(entropy.detach().cpu().tolist())
+        all_true_prob.extend(true_prob.detach().cpu().tolist())
+        all_prob_sq_sum.extend(prob_sq_sum.detach().cpu().tolist())
+        all_correct.extend(correct.detach().cpu().tolist())
         if topk:
             maxk = min(max(topk), logits.size(1))
             _, pred_topk = logits.topk(maxk, dim=1)
@@ -216,22 +297,36 @@ def evaluate(
             for k in topk:
                 kk = min(k, pred_topk.size(1))
                 topk_correct[k] += int(correct[:, :kk].any(dim=1).sum().item())
-        if collect_examples and metas is not None:
-            probs = torch.softmax(logits, dim=1)
-            conf = probs.max(dim=1).values.detach().cpu().tolist()
+        if metas is not None:
+            top5_k = min(5, probs.size(1))
+            top5_vals, top5_idx = probs.topk(top5_k, dim=1)
             for i, meta in enumerate(metas):
                 item = {
+                    "epoch": int(epoch),
+                    "global_step": int(global_step),
                     "video": meta.get("video", ""),
                     "t0": meta.get("t0", ""),
                     "t1": meta.get("t1", ""),
                     "true": int(y[i].item()),
                     "pred": int(preds[i].item()),
-                    "conf": float(conf[i]),
+                    "true_id": int(y[i].item()),
+                    "pred_id": int(preds[i].item()),
+                    "true_label": str(idx2label.get(int(y[i].item()), str(int(y[i].item())))),
+                    "pred_label": str(idx2label.get(int(preds[i].item()), str(int(preds[i].item())))),
+                    "conf": float(conf[i].item()),
+                    "margin": float(margin[i].item()),
+                    "entropy": float(entropy[i].item()),
+                    "top5_ids": [int(x) for x in top5_idx[i].detach().cpu().tolist()],
+                    "top5_labels": [str(idx2label.get(int(x), str(int(x)))) for x in top5_idx[i].detach().cpu().tolist()],
+                    "top5_probs": [float(x) for x in top5_vals[i].detach().cpu().tolist()],
+                    "correct": int(preds[i].item() == y[i].item()),
                 }
-                if item["true"] != item["pred"]:
-                    push_lowest_conf(wrong_examples, item, int(max(1, examples_k)))
-                else:
-                    push_lowest_conf(correct_examples, item, int(max(1, examples_k)))
+                records.append(item)
+                if collect_examples:
+                    if item["true"] != item["pred"]:
+                        push_lowest_conf(wrong_examples, item, int(max(1, examples_k)))
+                    else:
+                        push_lowest_conf(correct_examples, item, int(max(1, examples_k)))
 
     macro_f1 = f1_score(all_labels, all_preds, average="macro") if total_n else 0.0
     acc = (np.array(all_preds) == np.array(all_labels)).mean() if total_n else 0.0
@@ -239,4 +334,72 @@ def evaluate(
     examples = wrong_examples
     if len(examples) < int(max(1, examples_k)):
         examples = examples + correct_examples
-    return total_loss / max(1, total_n), acc, macro_f1, topk_acc, all_preds, all_labels, examples
+    if num_classes <= 0:
+        num_classes = (max(max(all_labels, default=-1), max(all_preds, default=-1)) + 1) if total_n else 0
+
+    if num_classes > 0:
+        labels_range = list(range(num_classes))
+        p_all, r_all, f1_all, _ = precision_recall_fscore_support(
+            all_labels,
+            all_preds,
+            labels=labels_range,
+            zero_division=0,
+        )
+        support_val = np.bincount(np.asarray(all_labels, dtype=np.int64), minlength=num_classes)
+        pred_count = np.bincount(np.asarray(all_preds, dtype=np.int64), minlength=num_classes)
+        conf_sum = np.zeros(num_classes, dtype=np.float64)
+        conf_wrong_sum = np.zeros(num_classes, dtype=np.float64)
+        conf_wrong_cnt = np.zeros(num_classes, dtype=np.float64)
+        margin_sum = np.zeros(num_classes, dtype=np.float64)
+        for cls, pred, conf_v, margin_v in zip(all_labels, all_preds, all_conf, all_margin):
+            conf_sum[int(cls)] += float(conf_v)
+            margin_sum[int(cls)] += float(margin_v)
+            if int(cls) != int(pred):
+                conf_wrong_sum[int(cls)] += float(conf_v)
+                conf_wrong_cnt[int(cls)] += 1.0
+        per_class: Dict[int, Dict[str, object]] = {}
+        for class_id in range(num_classes):
+            val_support = int(support_val[class_id])
+            per_class[class_id] = {
+                "class_id": int(class_id),
+                "label": str(idx2label.get(class_id, str(class_id))),
+                "bucket": str(bucket_by_class.get(class_id, "none")) if bucket_by_class else "none",
+                "support_val": val_support,
+                "support_train": int(train_support[class_id]) if train_support is not None and class_id < len(train_support) else 0,
+                "precision": float(p_all[class_id]),
+                "recall": float(r_all[class_id]),
+                "f1": float(f1_all[class_id]),
+                "pred_count": int(pred_count[class_id]),
+                "true_count": val_support,
+                "conf_mean": float(conf_sum[class_id] / max(1, val_support)),
+                "conf_wrong_mean": float(conf_wrong_sum[class_id] / max(1.0, conf_wrong_cnt[class_id])),
+                "margin_mean": float(margin_sum[class_id] / max(1, val_support)),
+            }
+    else:
+        per_class = {}
+
+    confusion_pairs = build_confusion_pairs(
+        all_labels,
+        all_preds,
+        idx2label,
+        support_true=[int(v.get("support_val", 0)) for _, v in sorted(per_class.items())] if per_class else None,
+        bucket_by_class=bucket_by_class,
+    )
+    calibration = compute_calibration_metrics(all_conf, all_correct, all_true_prob, all_prob_sq_sum, num_bins=15)
+    return EvalOutputs(
+        loss=(total_loss / max(1, total_n)),
+        acc=float(acc),
+        macro_f1=float(macro_f1),
+        topk_acc=topk_acc,
+        labels=all_labels,
+        preds=all_preds,
+        probs_top1=all_conf,
+        probs_top2=all_top2,
+        entropy=all_entropy,
+        margin=all_margin,
+        records=records,
+        per_class=per_class,
+        confusion_pairs=confusion_pairs,
+        examples=examples,
+        calibration=calibration,
+    )

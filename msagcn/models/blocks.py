@@ -101,6 +101,7 @@ class CTRHandRefine(nn.Module):
             bias=False,
         )
         self.alpha = nn.Parameter(torch.tensor(float(alpha_init), dtype=torch.float32))
+        self.last_stats: dict[str, float] = {}
 
     def forward(self, y: torch.Tensor, A_hand_prior: torch.Tensor) -> torch.Tensor:
         B, C, V, T = y.shape
@@ -125,6 +126,21 @@ class CTRHandRefine(nn.Module):
         alpha = self.alpha.to(dtype=y.dtype)
         refined = hand_prior + alpha * q_rel
         delta = refined - hand_prior  # residual correction relative to the static hand prior
+        q_rel_abs = q_rel.abs()
+        hand_prior_abs = hand_prior.abs()
+        self.last_stats = {
+            "alpha": float(self.alpha.detach().cpu().item()),
+            "delta_abs_mean": float(delta.detach().abs().mean().cpu().item()),
+            "delta_abs_max": float(delta.detach().abs().amax().cpu().item()),
+            "delta_std": float(delta.detach().float().std(unbiased=False).cpu().item()),
+            "delta_to_static_ratio": float(
+                (delta.detach().abs().mean() / hand_prior_abs.mean().clamp_min(1e-6)).cpu().item()
+            ),
+            "q_norm": float(q.detach().float().norm(dim=2).mean().cpu().item()),
+            "k_norm": float(k.detach().float().norm(dim=2).mean().cpu().item()),
+            "q_saturation": float((q_rel_abs.detach() > 0.95).float().mean().cpu().item()),
+            "refined_hand_density": float((refined.detach().abs() > 1e-6).float().mean().cpu().item()),
+        }
 
         yh_group = yh.reshape(B, self.groups, self.ch_per_group, H, T).permute(0, 1, 2, 4, 3).contiguous()
         hand_delta = torch.einsum("bgctu,bgvu->bgctv", yh_group, delta)
@@ -203,6 +219,7 @@ class GCNBlock(nn.Module):
             if use_ctr_hand_refine
             else None
         )
+        self.last_topology_stats: dict[str, float] = {}
 
         # Temporal
         if use_mstcn and stride_t == 1:
@@ -261,12 +278,16 @@ class GCNBlock(nn.Module):
 
         y_proj = y
         y = self._apply_adjacency(y_proj, A_eff)
+        self.last_topology_stats = {}
         if self.ctr_hand_refine is not None:
             H = min(y.size(2), self.ctr_hand_refine.hand_nodes, A_eff.size(-1))
             if H > 0:
                 hand_delta = self.ctr_hand_refine(y_proj, A_eff[:H, :H])
                 y = y.clone()
                 y[:, :, :H, :] = y[:, :, :H, :] + hand_delta
+                self.last_topology_stats = dict(self.ctr_hand_refine.last_stats)
+                self.last_topology_stats["hand_delta_abs_mean"] = float(hand_delta.detach().abs().mean().cpu().item())
+                self.last_topology_stats["hand_nodes"] = float(H)
 
         # 3) BN->ReLU->TCN->SE->Dropout2d->DropPath + Residual
         y = self.bn(self.conv(y))
