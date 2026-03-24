@@ -139,7 +139,8 @@ class MultiStreamAGCN(nn.Module):
         mask: Optional[torch.Tensor] = None,  # (B,1,V,T)
         A: Optional[torch.Tensor] = None,  # (V,V) or (K,V,V)
         y: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        return_features: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         assert isinstance(X, dict) and len(X) > 0, "X must be dict of streams"
         X = {k: v for k, v in X.items() if k in self.streams}
         if len(X) == 0:
@@ -170,4 +171,7 @@ class MultiStreamAGCN(nn.Module):
         g = self.pool(y_feat, cur_mask)  # (B,C)
         g = self.embed_norm(g)
         out = self.head(g, y) if self._use_cos else self.head(g)
-        return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+        out = torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+        if return_features:
+            return out, g
+        return out

@@ -93,11 +93,14 @@ python -m msagcn.train ... --tensorboard --logdir outputs/runs --run_name agcn_f
 
 With `--tb_full_logging`, the run writes:
 - stable per-class TensorBoard tags under `val_all/*`
-- head/mid/tail aggregates under `val_bucket/*`
-- fixed tail watchlist curves under `val_watch/*`
+- support buckets under `val_bucket/*` when train support is non-uniform
+- difficulty buckets under `val_difficulty/*` when train support is uniform (balanced few-shot splits)
+- fixed support-tail or hardest-class watchlist curves under `val_watch/*`
 - CTR diagnostics under `topology/*`
 - text summaries under `tables/*`
 - structured artifacts under `--out/analysis/`
+
+Bucket analytics defaults to `--tb_bucket_mode auto`. In balanced runs where every class has the same train support, the logger switches from support buckets to difficulty buckets and freezes the assignment after `--tb_difficulty_freeze_epoch` using an EMA of per-class F1.
 
 ## Outputs
 
@@ -125,6 +128,7 @@ python -m msagcn.train ... --out outputs/runs/agcn_run --resume outputs/runs/agc
 Notes:
 - `--epochs` is the total target epoch count, not "extra epochs after resume".
 - `--resume_model_only` loads model / EMA weights from a checkpoint but resets optimizer, scheduler, scaler, best score, and history.
+- early stopping defaults to auto-resolved patience/min-delta; use positive values to override, or `--early_stop_patience 0` to disable it.
 
 ## Experimental Graph Refinement
 
@@ -164,12 +168,108 @@ Optional flags:
 - `--decoded_skeleton_cache_rebuild` to rebuild the decoded cache
 - if both decoded and packed cache flags are passed, the decoded cache path wins
 
+## Auto Workers
+
+For portable training on different machines, you can let `msagcn` benchmark and cache a safe
+train-loader profile automatically instead of hard-coding `--workers`.
+
+- `--auto_workers` benchmarks a small set of worker counts on the current machine
+- it keeps the existing Windows-safe loader rules for raw / packed / decoded skeleton paths
+- the chosen profile is cached locally by machine fingerprint and reused on later matching runs
+- if every benchmark candidate fails, training falls back to a safe `workers=0` profile instead of crashing
+
+Run-local artifacts:
+- `analysis/auto_workers_decision.json`
+- `analysis/auto_workers_candidates.csv`
+
+Example:
+
+```
+python -m msagcn.train --json datasets/skeletons --csv datasets/data/annotations.csv --out outputs/runs/agcn_auto \
+  --use_decoded_skeleton_cache --auto_workers
+```
+
+Optional flags:
+- `--auto_workers_max <N>` to cap the benchmark ladder
+- `--auto_workers_rebench` to ignore the cached decision and benchmark again
+- `--auto_workers_warmup_batches <N>` and `--auto_workers_measure_batches <N>` to control benchmark length
+
 To ablate a stronger variant that also applies the same hand-only refinement inside the
 pre-fusion stream encoder, add:
 
 ```
   --ctr_in_stream_encoder
 ```
+
+## Supervised Contrastive Auxiliary
+
+An optional supervised-contrastive auxiliary loss can be added on the pooled embedding
+after graph pooling and `embed_norm`, while keeping the classifier head unchanged.
+This is a training-only auxiliary objective:
+
+- the cosine / classifier head remains the main classifier
+- evaluation stays logits-based
+- anchors without same-label positives in the current batch are safely ignored
+- the effect may be weak when a batch has very few repeated labels
+- by default the auxiliary starts right after LR warmup; use `0` to force it from epoch 1
+
+Example:
+
+```
+python -m msagcn.train --json datasets/skeletons --csv datasets/data/annotations.csv --out outputs/runs/agcn_supcon \
+  --use_supcon --supcon_weight 0.05 --supcon_temp 0.07
+```
+
+To delay the auxiliary until later in training, add for example:
+
+```
+  --supcon_start_epoch 5
+```
+
+Use `--supcon_start_epoch -1` for the default auto mode, which resolves to `warmup_epochs + 1`.
+
+## Class-Balanced SupCon Batches
+
+Batch-local SupCon can be weak when ordinary random shuffle produces too few repeated labels inside
+each train batch. For SupCon experiments you can optionally replace random shuffle with a simple
+class-balanced batch sampler:
+
+- each train batch is built as `classes_per_batch x samples_per_class`
+- this affects only the train loader
+- validation stays unchanged
+- this is not the old `--weighted_sampler`
+
+Example for a `64`-sample batch with `16` classes and `4` samples per class:
+
+```
+python -m msagcn.train --json datasets/skeletons --csv datasets/data/annotations.csv --out outputs/runs/agcn_supcon_cb \
+  --batch 64 --use_supcon --supcon_weight 0.05 --supcon_temp 0.07 \
+  --supcon_class_balanced_batch --supcon_classes_per_batch 16 --supcon_samples_per_class 4
+```
+
+When enabled, `--supcon_classes_per_batch * --supcon_samples_per_class` must exactly equal `--batch`.
+
+## Hybrid SupCon Batches
+
+If fully class-balanced `N x K` batches reduce class diversity too much, you can use a hybrid
+SupCon batch sampler instead:
+
+- a fixed number of labels are repeated inside the batch to create positive pairs
+- the remaining slots are filled with singleton labels to keep many unique classes per batch
+- this affects only the train loader
+- validation stays unchanged
+
+Example for `batch=64` with `16` repeated labels, `2` samples each, plus `32` singleton labels:
+
+```
+python -m msagcn.train --json datasets/skeletons --csv datasets/data/annotations.csv --out outputs/runs/agcn_supcon_mixed \
+  --batch 64 --use_supcon --supcon_weight 0.03 --supcon_temp 0.07 \
+  --supcon_mixed_batch --supcon_mixed_repeated_classes 16 --supcon_mixed_repeated_samples 2
+```
+
+When enabled:
+- `--supcon_mixed_repeated_samples` must be at least `2`
+- `--supcon_mixed_repeated_classes * --supcon_mixed_repeated_samples <= --batch`
 
 ## Notes
 

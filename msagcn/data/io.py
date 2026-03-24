@@ -286,6 +286,7 @@ class PackedVideoStore:
         prefer_pp: bool = True,
         rebuild: bool = False,
         vids: List[str] | None = None,
+        context_label: str = "",
     ) -> "PackedVideoStore":
         cache_dir = Path(cache_dir)
         source_dir = Path(source_dir)
@@ -328,8 +329,9 @@ class PackedVideoStore:
             return payload
 
         payload = _load_existing()
+        prefix = f"[{context_label}] " if context_label else ""
         if payload is None:
-            print(f"Building packed skeleton cache in {cache_dir} ...")
+            print(f"{prefix}Building packed skeleton cache in {cache_dir} ...")
             tmp_data = cache_dir / f"{cls.DATA_NAME}.tmp"
             tmp_index = cache_dir / f"{cls.INDEX_NAME}.tmp"
             entries: Dict[str, Dict[str, Any]] = {}
@@ -356,9 +358,9 @@ class PackedVideoStore:
             tmp_index.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
             os.replace(tmp_data, data_path)
             os.replace(tmp_index, index_path)
-            print(f"Packed skeleton cache ready: {len(entries)} videos | data={data_path}")
+            print(f"{prefix}Packed skeleton cache ready: {len(entries)} videos | data={data_path}")
         else:
-            print(f"Using packed skeleton cache: {cache_dir}")
+            print(f"{prefix}Using packed skeleton cache: {cache_dir}")
         if vids is not None:
             subset_entries = {str(vid): payload["entries"][str(vid)] for vid in vids if str(vid) in payload["entries"]}
             payload = dict(payload)
@@ -483,6 +485,7 @@ class DecodedVideoStore:
         prefer_pp: bool = True,
         rebuild: bool = False,
         vids: List[str] | None = None,
+        context_label: str = "",
     ) -> "DecodedVideoStore":
         cache_dir = Path(cache_dir)
         source_dir = Path(source_dir)
@@ -525,8 +528,9 @@ class DecodedVideoStore:
             return payload
 
         payload = _load_existing()
+        prefix = f"[{context_label}] " if context_label else ""
         if payload is None:
-            print(f"Building decoded skeleton cache in {cache_dir} ...")
+            print(f"{prefix}Building decoded skeleton cache in {cache_dir} ...")
             tmp_data = cache_dir / f"{cls.DATA_NAME}.tmp"
             tmp_index = cache_dir / f"{cls.INDEX_NAME}.tmp"
             entries: Dict[str, Dict[str, Any]] = {}
@@ -557,9 +561,9 @@ class DecodedVideoStore:
             os.replace(tmp_data, data_path)
             os.replace(tmp_index, index_path)
             data_size_gb = float(data_path.stat().st_size) / (1024.0 ** 3)
-            print(f"Decoded skeleton cache ready: {len(entries)} videos | data={data_path} | size={data_size_gb:.2f} GB")
+            print(f"{prefix}Decoded skeleton cache ready: {len(entries)} videos | data={data_path} | size={data_size_gb:.2f} GB")
         else:
-            print(f"Using decoded skeleton cache: {cache_dir}")
+            print(f"{prefix}Using decoded skeleton cache: {cache_dir}")
         if vids is not None:
             subset_entries = {str(vid): payload["entries"][str(vid)] for vid in vids if str(vid) in payload["entries"]}
             payload = dict(payload)

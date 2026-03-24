@@ -18,6 +18,10 @@ from utils.tensorboard_logger import TensorboardLogger
 @dataclass
 class TrainOutputs:
     loss: float
+    total_loss: float
+    supcon_loss: float
+    supcon_valid_anchors: int
+    supcon_positive_pairs: int
     global_step: int
     nonfinite_batches: int
     skipped_updates: int
@@ -62,20 +66,35 @@ def train_one_epoch(
     tb_logger: TensorboardLogger | None = None,
     tb_log_every: int = 1,
     global_step: int = 0,
+    supcon_criterion=None,
+    supcon_weight: float = 0.0,
+    supcon_start_epoch: int = 0,
+    epoch: int = 0,
+    log_batch_label_stats: bool = False,
+    expected_batch_unique_classes: int | None = None,
+    expected_batch_samples_per_class: int | None = None,
+    expected_mixed_repeated_classes: int | None = None,
+    expected_mixed_repeated_samples: int | None = None,
+    expected_mixed_singleton_classes: int | None = None,
 ):
     model.train()
     optimizer.zero_grad(set_to_none=True)
 
     epoch_start = time.time()
     total_loss = 0.0
+    total_objective = 0.0
     total_n = 0
     t_load_sum = 0.0
     t_fwd_sum = 0.0
     steps = 0
     nonfinite_batches = 0
     skipped_updates = 0
+    supcon_loss_sum = 0.0
+    supcon_valid_anchor_sum = 0
+    supcon_positive_pair_sum = 0
     max_batches = max_batches if max_batches and max_batches > 0 else None
     tb_enabled = tb_logger is not None and tb_logger.enabled and tb_log_every > 0
+    supcon_active = bool(supcon_criterion is not None and float(supcon_weight) > 0.0 and int(epoch) >= int(supcon_start_epoch))
 
     for step, (X, y, metas) in enumerate(loader, start=1):
         if max_batches is not None and step > max_batches:
@@ -96,6 +115,59 @@ def train_one_epoch(
 
         if step == 1 and "joints" in x_streams:
             print("debug | |joints|_mean =", float(x_streams["joints"].abs().mean()))
+        if step == 1 and expected_batch_unique_classes is not None and expected_batch_samples_per_class is not None:
+            _, label_counts = torch.unique(y.detach(), return_counts=True)
+            unique_classes = int(label_counts.numel())
+            min_label_count = int(label_counts.min().item()) if label_counts.numel() > 0 else 0
+            max_label_count = int(label_counts.max().item()) if label_counts.numel() > 0 else 0
+            print(
+                "class-balanced batch check | "
+                f"unique_classes={unique_classes} | min_count={min_label_count} | max_count={max_label_count}"
+            )
+            expected_unique = int(expected_batch_unique_classes)
+            expected_count = int(expected_batch_samples_per_class)
+            if unique_classes != expected_unique or min_label_count != expected_count or max_label_count != expected_count:
+                raise RuntimeError(
+                    "Class-balanced batch sampler verification failed on the first train batch: "
+                    f"expected {expected_unique} classes x {expected_count} samples, got "
+                    f"{unique_classes} unique classes with count range [{min_label_count}, {max_label_count}]."
+                )
+        if (
+            step == 1
+            and expected_mixed_repeated_classes is not None
+            and expected_mixed_repeated_samples is not None
+            and expected_mixed_singleton_classes is not None
+        ):
+            _, label_counts = torch.unique(y.detach(), return_counts=True)
+            unique_classes = int(label_counts.numel())
+            repeated_counts = label_counts[label_counts > 1]
+            repeated_classes = int(repeated_counts.numel())
+            repeated_min = int(repeated_counts.min().item()) if repeated_counts.numel() > 0 else 0
+            repeated_max = int(repeated_counts.max().item()) if repeated_counts.numel() > 0 else 0
+            singleton_classes = int((label_counts == 1).sum().item())
+            print(
+                "mixed supcon batch check | "
+                f"unique_classes={unique_classes} | "
+                f"repeated_classes={repeated_classes} | "
+                f"repeated_count_min={repeated_min} | repeated_count_max={repeated_max} | "
+                f"singleton_classes={singleton_classes}"
+            )
+            expected_repeated_classes = int(expected_mixed_repeated_classes)
+            expected_repeated_samples = int(expected_mixed_repeated_samples)
+            expected_singletons = int(expected_mixed_singleton_classes)
+            if (
+                repeated_classes != expected_repeated_classes
+                or repeated_min != expected_repeated_samples
+                or repeated_max != expected_repeated_samples
+                or singleton_classes != expected_singletons
+            ):
+                raise RuntimeError(
+                    "Hybrid SupCon batch sampler verification failed on the first train batch: "
+                    f"expected {expected_repeated_classes} repeated classes x {expected_repeated_samples} samples "
+                    f"+ {expected_singletons} singleton classes, got "
+                    f"{repeated_classes} repeated classes with count range [{repeated_min}, {repeated_max}] "
+                    f"and {singleton_classes} singleton classes."
+                )
 
         t1 = time.time()
         # --- autocast (AMP) ---
@@ -104,9 +176,20 @@ def train_one_epoch(
             dtype=amp_dtype,
             enabled=use_amp,
         ):
-            logits = model(x_streams, mask=mask, A=A, y=y)
+            if supcon_active:
+                logits, features = model(x_streams, mask=mask, A=A, y=y, return_features=True)
+                features = torch.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+            else:
+                logits = model(x_streams, mask=mask, A=A, y=y)
             logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0)
-            loss = criterion(logits, y) / accum_steps
+            cls_loss = criterion(logits, y)
+            if supcon_active:
+                supcon_loss = supcon_criterion(features, y).to(dtype=cls_loss.dtype)
+                total_batch_loss = cls_loss + float(supcon_weight) * supcon_loss
+            else:
+                supcon_loss = cls_loss.new_zeros(())
+                total_batch_loss = cls_loss
+            loss = total_batch_loss / accum_steps
         t_fwd_sum += time.time() - t1
 
         # NaN guard
@@ -119,11 +202,42 @@ def train_one_epoch(
 
         if tb_enabled and (global_step % tb_log_every == 0):
             lr = float(optimizer.param_groups[0]["lr"]) if optimizer.param_groups else 0.0
-            tb_logger.scalar("train/loss", float(loss.item()) * accum_steps, global_step)
+            supcon_stats = getattr(supcon_criterion, "last_stats", {}) if supcon_active else {}
+            tb_logger.scalar("train/loss", float(cls_loss.item()), global_step)
+            tb_logger.scalar("train/total_loss", float(total_batch_loss.item()), global_step)
+            tb_logger.scalar("train/supcon_loss", float(supcon_loss.item()), global_step)
+            tb_logger.scalar(
+                "train/supcon_valid_anchors",
+                float(supcon_stats.get("valid_anchor_count", 0)),
+                global_step,
+            )
+            tb_logger.scalar(
+                "train/supcon_positive_pairs",
+                float(supcon_stats.get("positive_pair_count", 0)),
+                global_step,
+            )
             tb_logger.scalar("train/lr", lr, global_step)
             tb_logger.scalar("train/amp_scale", float(scaler.get_scale()) if hasattr(scaler, "get_scale") else 1.0, global_step)
             tb_logger.scalar("train/nonfinite_batches", float(nonfinite_batches), global_step)
             tb_logger.scalar("train/skipped_updates", float(skipped_updates), global_step)
+            if log_batch_label_stats:
+                _, label_counts = torch.unique(y.detach(), return_counts=True)
+                repeated_counts = label_counts[label_counts > 1]
+                tb_logger.scalar("train/batch_unique_classes", float(label_counts.numel()), global_step)
+                tb_logger.scalar("train/batch_max_label_count", float(label_counts.max().item()), global_step)
+                tb_logger.scalar("train/batch_min_label_count", float(label_counts.min().item()), global_step)
+                tb_logger.scalar("train/batch_repeated_classes", float(repeated_counts.numel()), global_step)
+                tb_logger.scalar("train/batch_singleton_classes", float((label_counts == 1).sum().item()), global_step)
+                tb_logger.scalar(
+                    "train/batch_repeat_count_min",
+                    float(repeated_counts.min().item()) if repeated_counts.numel() > 0 else 0.0,
+                    global_step,
+                )
+                tb_logger.scalar(
+                    "train/batch_repeat_count_max",
+                    float(repeated_counts.max().item()) if repeated_counts.numel() > 0 else 0.0,
+                    global_step,
+                )
 
         scaler.scale(loss).backward()
 
@@ -142,9 +256,15 @@ def train_one_epoch(
                 tb_logger.scalar("train/grad_norm", float(grad_norm), global_step)
 
         bs = y.size(0)
-        total_loss += float(loss.item()) * accum_steps * bs
+        total_loss += float(cls_loss.item()) * bs
+        total_objective += float(total_batch_loss.item()) * bs
         total_n += bs
         steps += 1
+        supcon_loss_sum += float(supcon_loss.item()) * bs
+        if supcon_active:
+            supcon_stats = getattr(supcon_criterion, "last_stats", {})
+            supcon_valid_anchor_sum += int(supcon_stats.get("valid_anchor_count", 0))
+            supcon_positive_pair_sum += int(supcon_stats.get("positive_pair_count", 0))
 
         if log_interval > 0 and (step % log_interval == 0):
             with torch.no_grad():
@@ -160,7 +280,7 @@ def train_one_epoch(
                 margin_mean = float(margin_f.mean())
                 margin_p10 = float(torch.quantile(margin_f, q=0.10)) if margin_f.numel() > 1 else margin_mean
             print(
-                f"   step {step:04d} | loss={float(loss.item() * accum_steps):.4f} | "
+                f"   step {step:04d} | loss={float(total_batch_loss.item()):.4f} | "
                 f"entropy={entropy:.3f} | conf={conf:.3f}"
             )
             if tb_enabled:
@@ -180,6 +300,10 @@ def train_one_epoch(
             tb_logger.scalar("train/epoch_time_sec", float(epoch_time), global_step)
     return TrainOutputs(
         loss=(total_loss / max(1, total_n)),
+        total_loss=(total_objective / max(1, total_n)),
+        supcon_loss=(supcon_loss_sum / max(1, total_n)),
+        supcon_valid_anchors=int(supcon_valid_anchor_sum),
+        supcon_positive_pairs=int(supcon_positive_pair_sum),
         global_step=global_step,
         nonfinite_batches=int(nonfinite_batches),
         skipped_updates=int(skipped_updates),

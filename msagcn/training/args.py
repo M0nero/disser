@@ -82,8 +82,24 @@ def parse_args():
     p.add_argument("--label_smoothing", type=float, default=0.0)
     p.add_argument("--ema_decay", type=float, default=0.0, help="EMA decay for model weights (0=off)")
     p.add_argument("--warmup_frac", type=float, default=0.10, help="Fraction of total epochs to use for LR warmup (0 disables)")
-    p.add_argument("--early_stop_patience", type=int, default=10, help="Stop if val_f1 does not improve for N epochs (0 disables)")
-    p.add_argument("--early_stop_min_delta", type=float, default=0.0, help="Minimum val_f1 increase to reset early stopping patience")
+    p.add_argument(
+        "--early_stop_patience",
+        type=int,
+        default=-1,
+        help="Stop if val_f1 does not improve for N armed epochs. -1 = auto, 0 disables.",
+    )
+    p.add_argument(
+        "--early_stop_min_delta",
+        type=float,
+        default=-1.0,
+        help="Minimum val_f1 increase to reset early stopping patience. Negative = auto.",
+    )
+    p.add_argument(
+        "--early_stop_start_epoch",
+        type=int,
+        default=0,
+        help="Epoch at which early stopping becomes active. 0 = auto burn-in based on warmup and patience.",
+    )
     p.add_argument("--limit_train_batches", type=int, default=0, help="Debug: cap train batches per epoch")
     p.add_argument("--limit_val_batches", type=int, default=0, help="Debug: cap val batches")
     p.add_argument("--overfit_batches", type=int, default=0, help="Debug: use same limited #batches for train+val")
@@ -104,17 +120,51 @@ def parse_args():
     p.add_argument("--tb_examples_every", type=int, default=5, help="Log examples every N epochs")
     p.add_argument("--tb_full_logging", action="store_true", help="Enable full TensorBoard + analysis artifact logging")
     p.add_argument("--tb_log_all_classes", action="store_true", help="Log per-class val metrics for every class")
-    p.add_argument("--tb_log_tail_buckets", action="store_true", help="Log head/mid/tail aggregate metrics")
+    p.add_argument("--tb_log_tail_buckets", action="store_true", help="Log aggregate bucket metrics (support buckets or difficulty buckets)")
     p.add_argument("--tb_log_confusion_pairs", action="store_true", help="Write machine-readable confusion pairs and text tables")
     p.add_argument("--tb_log_predictions_csv", action="store_true", help="Write per-sample validation predictions CSV")
     p.add_argument("--tb_log_errors_csv", action="store_true", help="Write per-sample validation errors CSV")
     p.add_argument("--tb_log_topology", action="store_true", help="Log CTR/adaptive-topology diagnostics")
-    p.add_argument("--tb_watchlist_k", type=int, default=64, help="Size of the fixed tail-class watchlist")
+    p.add_argument(
+        "--tb_watchlist_k",
+        type=int,
+        default=64,
+        help="Size of the fixed watchlist (tail classes in support mode, hardest classes in difficulty mode)",
+    )
+    p.add_argument(
+        "--tb_bucket_mode",
+        type=str,
+        default="auto",
+        choices=("auto", "support", "difficulty"),
+        help="Bucket mode for aggregate class analytics (auto switches to difficulty mode when train support is uniform).",
+    )
+    p.add_argument(
+        "--tb_difficulty_freeze_epoch",
+        type=int,
+        default=10,
+        help="Freeze difficulty buckets/watchlist after this epoch when using difficulty mode.",
+    )
+    p.add_argument(
+        "--tb_difficulty_ema",
+        type=float,
+        default=0.8,
+        help="EMA decay for per-class F1 difficulty scores before freeze.",
+    )
     p.add_argument("--tb_confusion_every", type=int, default=5, help="Log confusion images/tables every N epochs")
     p.add_argument("--tb_predictions_every", type=int, default=1, help="Write predictions/errors artifacts every N epochs")
     p.add_argument("--tb_tables_k", type=int, default=50, help="Max rows for TensorBoard text tables")
 
     p.add_argument("--workers", type=int, default=min(8, os.cpu_count() or 8))
+    p.add_argument("--auto_workers", action="store_true", help="Auto-benchmark and cache a safe/effective train loader worker profile")
+    p.add_argument(
+        "--auto_workers_max",
+        type=int,
+        default=0,
+        help="Upper bound for auto worker search (0 = pick a sensible machine/data-mode bound automatically).",
+    )
+    p.add_argument("--auto_workers_rebench", action="store_true", help="Ignore cached auto-workers decisions and benchmark again")
+    p.add_argument("--auto_workers_warmup_batches", type=int, default=4, help="Warmup batches for auto worker benchmark")
+    p.add_argument("--auto_workers_measure_batches", type=int, default=16, help="Measured batches for auto worker benchmark")
     p.add_argument("--prefetch", type=int, default=6)
     p.add_argument("--no_prefetch", action="store_true")
     p.add_argument("--seed", type=int, default=42)
@@ -127,7 +177,50 @@ def parse_args():
 
     # Sampling & Loss options
     p.add_argument("--weighted_sampler", action="store_true", help="Use WeightedRandomSampler for train")
+    p.add_argument(
+        "--supcon_class_balanced_batch",
+        action="store_true",
+        help="Use a class-balanced train batch sampler (classes_per_batch x samples_per_class), intended for SupCon experiments.",
+    )
+    p.add_argument(
+        "--supcon_mixed_batch",
+        action="store_true",
+        help="Use a hybrid SupCon batch sampler: repeated-label groups plus singleton labels to preserve class diversity.",
+    )
+    p.add_argument(
+        "--supcon_classes_per_batch",
+        type=int,
+        default=16,
+        help="Number of unique labels per train batch when --supcon_class_balanced_batch is enabled.",
+    )
+    p.add_argument(
+        "--supcon_samples_per_class",
+        type=int,
+        default=4,
+        help="Number of samples per label in a class-balanced train batch.",
+    )
+    p.add_argument(
+        "--supcon_mixed_repeated_classes",
+        type=int,
+        default=16,
+        help="Number of repeated labels per train batch when --supcon_mixed_batch is enabled.",
+    )
+    p.add_argument(
+        "--supcon_mixed_repeated_samples",
+        type=int,
+        default=2,
+        help="Samples per repeated label when --supcon_mixed_batch is enabled.",
+    )
     p.add_argument("--use_logit_adjustment", action="store_true", help="Use Logit-Adjusted CrossEntropy")
+    p.add_argument("--use_supcon", action="store_true", help="Enable supervised contrastive auxiliary loss on pooled embeddings")
+    p.add_argument("--supcon_weight", type=float, default=0.05, help="Weight for the supervised contrastive auxiliary loss")
+    p.add_argument("--supcon_temp", type=float, default=0.07, help="Temperature for supervised contrastive loss")
+    p.add_argument(
+        "--supcon_start_epoch",
+        type=int,
+        default=-1,
+        help="Start applying the supervised contrastive auxiliary from this 1-based epoch (-1 = auto after warmup, 0 = from epoch 1).",
+    )
     # Dataset I/O perf
     p.add_argument("--file_cache", type=int, default=64, help="small per-dataset file cache for per-video JSON (0=off)")
     p.add_argument(
@@ -226,4 +319,35 @@ def parse_args():
         args.tb_predictions_every = 1
         args.tb_confusion_every = 5
         args.tb_tables_k = 50
+    args.tb_difficulty_freeze_epoch = max(1, int(args.tb_difficulty_freeze_epoch))
+    args.tb_difficulty_ema = float(min(max(args.tb_difficulty_ema, 0.0), 0.999))
+    args.auto_workers_max = max(0, int(args.auto_workers_max))
+    args.auto_workers_warmup_batches = max(1, int(args.auto_workers_warmup_batches))
+    args.auto_workers_measure_batches = max(1, int(args.auto_workers_measure_batches))
+    args.supcon_classes_per_batch = max(1, int(args.supcon_classes_per_batch))
+    args.supcon_samples_per_class = max(1, int(args.supcon_samples_per_class))
+    args.supcon_mixed_repeated_classes = max(1, int(args.supcon_mixed_repeated_classes))
+    args.supcon_mixed_repeated_samples = max(2, int(args.supcon_mixed_repeated_samples))
+    if args.supcon_class_balanced_batch and args.supcon_mixed_batch:
+        p.error("--supcon_class_balanced_batch cannot be combined with --supcon_mixed_batch")
+    if args.supcon_class_balanced_batch:
+        if args.weighted_sampler:
+            p.error("--supcon_class_balanced_batch cannot be combined with --weighted_sampler")
+        expected_batch = int(args.supcon_classes_per_batch * args.supcon_samples_per_class)
+        if expected_batch != int(args.batch):
+            p.error(
+                "--supcon_class_balanced_batch requires "
+                "--supcon_classes_per_batch * --supcon_samples_per_class == --batch "
+                f"(got {args.supcon_classes_per_batch} * {args.supcon_samples_per_class} = {expected_batch}, batch={args.batch})"
+            )
+    if args.supcon_mixed_batch:
+        if args.weighted_sampler:
+            p.error("--supcon_mixed_batch cannot be combined with --weighted_sampler")
+        repeated_total = int(args.supcon_mixed_repeated_classes * args.supcon_mixed_repeated_samples)
+        if repeated_total > int(args.batch):
+            p.error(
+                "--supcon_mixed_batch requires "
+                "--supcon_mixed_repeated_classes * --supcon_mixed_repeated_samples <= --batch "
+                f"(got {args.supcon_mixed_repeated_classes} * {args.supcon_mixed_repeated_samples} = {repeated_total}, batch={args.batch})"
+            )
     return args

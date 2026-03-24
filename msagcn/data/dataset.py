@@ -188,6 +188,7 @@ class MultiStreamGestureDataset(Dataset):
                     prefer_pp=self.cfg.prefer_pp,
                     rebuild=decoded_cache_rebuild,
                     vids=list(self._file_by_vid.keys()),
+                    context_label=self.split,
                 )
             elif use_packed_cache:
                 if packed_cache_dir:
@@ -201,6 +202,7 @@ class MultiStreamGestureDataset(Dataset):
                     prefer_pp=self.cfg.prefer_pp,
                     rebuild=packed_cache_rebuild,
                     vids=list(self._file_by_vid.keys()),
+                    context_label=self.split,
                 )
             for vid, path in self._file_by_vid.items():
                 if self._decoded_store is not None and self._decoded_store.has_video(vid):

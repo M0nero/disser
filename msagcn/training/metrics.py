@@ -67,9 +67,12 @@ def build_confusion_image(
 
     label_names = [_short_label(idx2label.get(i, str(i))) for i in topk_idx] + ["other"]
 
-    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
 
-    fig, ax = plt.subplots(figsize=(8, 8), dpi=120)
+    fig = Figure(figsize=(8, 8), dpi=120)
+    canvas = FigureCanvasAgg(fig)
+    ax = fig.add_subplot(111)
     im = ax.imshow(cm, interpolation="nearest", cmap="Blues")
     ax.figure.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     ax.set_xticks(np.arange(len(label_names)))
@@ -80,23 +83,10 @@ def build_confusion_image(
     ax.set_ylabel("True")
     ax.set_title("Confusion (top-K + other)")
     fig.tight_layout()
-    fig.canvas.draw()
-    w, h = fig.canvas.get_width_height()
-
-    # Matplotlib backends differ here: TkAgg may not expose tostring_rgb(),
-    # while Agg-like canvases expose buffer_rgba(). Use the most portable path.
-    if hasattr(fig.canvas, "buffer_rgba"):
-        rgba = np.asarray(fig.canvas.buffer_rgba(), dtype=np.uint8)
-        img = np.ascontiguousarray(rgba[..., :3])
-    elif hasattr(fig.canvas, "tostring_rgb"):
-        img = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8).reshape(h, w, 3)
-    elif hasattr(fig.canvas, "tostring_argb"):
-        argb = np.frombuffer(fig.canvas.tostring_argb(), dtype=np.uint8).reshape(h, w, 4)
-        img = np.ascontiguousarray(argb[..., 1:])
-    else:
-        raise RuntimeError(f"Unsupported matplotlib canvas for confusion image: {type(fig.canvas).__name__}")
-
-    plt.close(fig)
+    canvas.draw()
+    rgba = np.asarray(canvas.buffer_rgba(), dtype=np.uint8)
+    img = np.ascontiguousarray(rgba[..., :3])
+    fig.clear()
     return img, topk_idx.tolist()
 
 

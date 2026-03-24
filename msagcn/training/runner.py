@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import csv
+import gc
 import json
 import os
 import shutil
 import time
+from collections import Counter
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Iterable
@@ -17,15 +19,16 @@ from sklearn.metrics import classification_report, f1_score, precision_recall_fs
 from torch import amp
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
-from msagcn.data import DSConfig, MultiStreamGestureDataset, build_sample_weights
+from msagcn.data import ClassBalancedBatchSampler, DSConfig, HybridSupConBatchSampler, MultiStreamGestureDataset, build_sample_weights
 from msagcn.models import MultiStreamAGCN
 from utils.tensorboard_logger import TensorboardLogger
 
 from .ema import ModelEma
 from .engine import evaluate, train_one_epoch
-from .losses import LogitAdjustedCrossEntropyLoss
+from .losses import LogitAdjustedCrossEntropyLoss, SupervisedContrastiveLoss
 from .metrics import (
     _sanitize_label,
+    build_confusion_pairs,
     build_confusion_image,
     format_confusion_pairs_text,
     format_examples_text,
@@ -35,6 +38,17 @@ from .metrics import (
 )
 from .prefetch import PrefetchLoader
 from .utils import build_mirror_idx, select_hist_params, set_seed
+from .auto_workers import (
+    LoaderProfile,
+    build_auto_workers_fingerprint,
+    build_worker_candidates,
+    choose_best_candidate,
+    get_auto_workers_cache_path,
+    load_auto_workers_record,
+    profile_to_dict,
+    resolve_loader_profile,
+    save_auto_workers_record,
+)
 
 
 def _load_history_file(path: Path) -> list[dict]:
@@ -128,7 +142,42 @@ def _compute_train_support(train_ds: MultiStreamGestureDataset, label2idx: dict[
     return counts
 
 
-def _build_bucket_rows(train_support: np.ndarray, idx2label: dict[int, str]) -> tuple[dict[int, str], list[dict[str, Any]]]:
+def _support_is_uniform(train_support: np.ndarray) -> bool:
+    nonzero = np.asarray(train_support, dtype=np.int64)
+    nonzero = nonzero[nonzero > 0]
+    return bool(nonzero.size == 0 or np.unique(nonzero).size <= 1)
+
+
+def _resolve_bucket_mode(train_support: np.ndarray, requested_mode: str) -> tuple[str, bool]:
+    support_is_uniform = _support_is_uniform(train_support)
+    if requested_mode == "auto":
+        return ("difficulty" if support_is_uniform else "support"), support_is_uniform
+    return str(requested_mode), support_is_uniform
+
+
+def _bucket_mode_spec(bucket_mode: str) -> dict[str, Any]:
+    if bucket_mode == "difficulty":
+        return {
+            "mode": "difficulty",
+            "bucket_names": ("easy", "mid", "hard"),
+            "focus_bucket": "hard",
+            "focus_label": "hard",
+            "secondary_bucket": "easy",
+            "secondary_label": "easy",
+            "tb_prefix": "val_difficulty",
+        }
+    return {
+        "mode": "support",
+        "bucket_names": ("head", "mid", "tail"),
+        "focus_bucket": "tail",
+        "focus_label": "tail",
+        "secondary_bucket": "head",
+        "secondary_label": "head",
+        "tb_prefix": "val_bucket",
+    }
+
+
+def _build_support_bucket_rows(train_support: np.ndarray, idx2label: dict[int, str]) -> tuple[dict[int, str], list[dict[str, Any]]]:
     valid = [idx for idx, support in enumerate(train_support.tolist()) if int(support) > 0]
     order = sorted(valid, key=lambda idx: (-int(train_support[idx]), int(idx)))
     n_valid = len(order)
@@ -150,13 +199,16 @@ def _build_bucket_rows(train_support: np.ndarray, idx2label: dict[int, str]) -> 
                 "label": str(idx2label.get(int(class_id), str(class_id))),
                 "support_train": int(train_support[class_id]),
                 "bucket": bucket,
+                "bucket_mode": "support",
+                "rank_by_metric": int(rank),
                 "rank_by_support": int(rank),
+                "difficulty_score": "",
             }
         )
     return bucket_by_class, rows
 
 
-def _build_watchlist_rows(
+def _build_support_watchlist_rows(
     train_support: np.ndarray,
     idx2label: dict[int, str],
     bucket_by_class: dict[int, str],
@@ -171,14 +223,96 @@ def _build_watchlist_rows(
             "label": str(idx2label.get(int(class_id), str(class_id))),
             "support_train": int(train_support[class_id]),
             "bucket": str(bucket_by_class.get(int(class_id), "none")),
+            "bucket_mode": "support",
+            "difficulty_score": "",
+            "watch_reason": "low_support",
         }
         for class_id in watch
     ]
 
 
-def _bucket_aggregates(per_class: dict[int, dict[str, Any]], bucket_by_class: dict[int, str]) -> dict[str, float]:
+def _update_difficulty_scores(
+    score_state: dict[str, float],
+    per_class: dict[int, dict[str, Any]],
+    *,
+    ema_decay: float,
+) -> None:
+    decay = float(np.clip(ema_decay, 0.0, 0.999))
+    for class_id, row in per_class.items():
+        if int(row.get("support_val", 0)) <= 0:
+            continue
+        key = str(int(class_id))
+        current = float(row.get("f1", 0.0))
+        prev = score_state.get(key)
+        score_state[key] = current if prev is None else (decay * float(prev) + (1.0 - decay) * current)
+
+
+def _build_difficulty_bucket_rows(
+    score_state: dict[str, float],
+    train_support: np.ndarray,
+    idx2label: dict[int, str],
+) -> tuple[dict[int, str], list[dict[str, Any]]]:
+    valid = [idx for idx, support in enumerate(train_support.tolist()) if int(support) > 0]
+    order = sorted(valid, key=lambda idx: (-float(score_state.get(str(int(idx)), 0.0)), int(idx)))
+    n_valid = len(order)
+    easy_end = max(1, int(np.ceil(0.20 * n_valid))) if n_valid > 0 else 0
+    mid_end = max(easy_end, int(np.ceil(0.50 * n_valid))) if n_valid > 0 else 0
+    bucket_by_class: dict[int, str] = {}
+    rows: list[dict[str, Any]] = []
+    for rank, class_id in enumerate(order):
+        if rank < easy_end:
+            bucket = "easy"
+        elif rank < mid_end:
+            bucket = "mid"
+        else:
+            bucket = "hard"
+        bucket_by_class[int(class_id)] = bucket
+        rows.append(
+            {
+                "class_id": int(class_id),
+                "label": str(idx2label.get(int(class_id), str(class_id))),
+                "support_train": int(train_support[class_id]),
+                "bucket": bucket,
+                "bucket_mode": "difficulty",
+                "rank_by_metric": int(rank),
+                "rank_by_support": "",
+                "difficulty_score": float(score_state.get(str(int(class_id)), 0.0)),
+            }
+        )
+    return bucket_by_class, rows
+
+
+def _build_difficulty_watchlist_rows(
+    score_state: dict[str, float],
+    train_support: np.ndarray,
+    idx2label: dict[int, str],
+    bucket_by_class: dict[int, str],
+    watchlist_k: int,
+) -> list[dict[str, Any]]:
+    valid = [idx for idx, support in enumerate(train_support.tolist()) if int(support) > 0]
+    order = sorted(valid, key=lambda idx: (float(score_state.get(str(int(idx)), 0.0)), int(idx)))
+    watch = order[: min(max(1, int(watchlist_k)), len(order))]
+    return [
+        {
+            "class_id": int(class_id),
+            "label": str(idx2label.get(int(class_id), str(class_id))),
+            "support_train": int(train_support[class_id]),
+            "bucket": str(bucket_by_class.get(int(class_id), "none")),
+            "bucket_mode": "difficulty",
+            "difficulty_score": float(score_state.get(str(int(class_id)), 0.0)),
+            "watch_reason": "low_difficulty_score",
+        }
+        for class_id in watch
+    ]
+
+
+def _bucket_aggregates(
+    per_class: dict[int, dict[str, Any]],
+    bucket_by_class: dict[int, str],
+    bucket_names: tuple[str, ...],
+) -> dict[str, float]:
     out: dict[str, float] = {}
-    for bucket in ("head", "mid", "tail"):
+    for bucket in bucket_names:
         rows = [row for class_id, row in per_class.items() if bucket_by_class.get(int(class_id)) == bucket]
         if not rows:
             out[f"f1_{bucket}"] = 0.0
@@ -194,6 +328,55 @@ def _bucket_aggregates(per_class: dict[int, dict[str, Any]], bucket_by_class: di
         out[f"r_{bucket}"] = float(np.mean(r_vals))
         out[f"zero_f1_{bucket}_count"] = float(sum(1 for value in f1_vals if value <= 1e-12))
     return out
+
+
+def _compute_per_class_distribution_metrics(per_class: dict[int, dict[str, Any]]) -> dict[str, float]:
+    rows = [row for row in per_class.values() if int(row.get("support_val", 0)) > 0]
+    if not rows:
+        return {
+            "per_class_f1_p10": 0.0,
+            "per_class_f1_p25": 0.0,
+            "per_class_f1_median": 0.0,
+            "per_class_recall_p10": 0.0,
+        }
+    f1_vals = np.asarray([float(row.get("f1", 0.0)) for row in rows], dtype=np.float64)
+    recall_vals = np.asarray([float(row.get("recall", 0.0)) for row in rows], dtype=np.float64)
+    return {
+        "per_class_f1_p10": float(np.quantile(f1_vals, 0.10)),
+        "per_class_f1_p25": float(np.quantile(f1_vals, 0.25)),
+        "per_class_f1_median": float(np.median(f1_vals)),
+        "per_class_recall_p10": float(np.quantile(recall_vals, 0.10)),
+    }
+
+
+def _write_bucket_artifacts(analysis_dir: Path, bucket_rows: list[dict[str, Any]], watchlist_rows: list[dict[str, Any]]) -> None:
+    _write_csv(
+        analysis_dir / "buckets.csv",
+        ["class_id", "label", "support_train", "bucket", "bucket_mode", "rank_by_metric", "rank_by_support", "difficulty_score"],
+        bucket_rows,
+    )
+    _write_csv(
+        analysis_dir / "watchlist.csv",
+        ["class_id", "label", "support_train", "bucket", "bucket_mode", "difficulty_score", "watch_reason"],
+        watchlist_rows,
+    )
+
+
+def _apply_bucket_annotations(
+    eval_out,
+    *,
+    idx2label: dict[int, str],
+    bucket_by_class: dict[int, str],
+) -> None:
+    for class_id, row in eval_out.per_class.items():
+        row["bucket"] = str(bucket_by_class.get(int(class_id), "none"))
+    eval_out.confusion_pairs = build_confusion_pairs(
+        eval_out.labels,
+        eval_out.preds,
+        idx2label,
+        support_true=[int(v.get("support_val", 0)) for _, v in sorted(eval_out.per_class.items())] if eval_out.per_class else None,
+        bucket_by_class=bucket_by_class,
+    )
 
 
 def _prediction_csv_rows(records: list[dict[str, Any]], train_support: np.ndarray, bucket_by_class: dict[int, str]) -> list[dict[str, Any]]:
@@ -225,10 +408,10 @@ def _prediction_csv_rows(records: list[dict[str, Any]], train_support: np.ndarra
     return rows
 
 
-def _select_error_rows(rows: list[dict[str, Any]], *, only_tail: bool = False, limit: int = 50) -> list[dict[str, Any]]:
+def _select_error_rows(rows: list[dict[str, Any]], *, bucket_filter: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
     filtered = [row for row in rows if int(row.get("correct", 0)) == 0]
-    if only_tail:
-        filtered = [row for row in filtered if row.get("bucket_true") == "tail"]
+    if bucket_filter:
+        filtered = [row for row in filtered if row.get("bucket_true") == bucket_filter]
     filtered.sort(key=lambda row: (-float(row.get("conf", 0.0)), -float(row.get("margin", 0.0)), str(row.get("video", ""))))
     return filtered[: max(1, int(limit))]
 
@@ -283,6 +466,43 @@ def _module_tag_name(name: str) -> str:
     return name.replace(".", "/")
 
 
+def _resolve_early_stop_start_epoch(*, total_epochs: int, warmup_epochs: int, patience: int, requested: int) -> int:
+    total = max(1, int(total_epochs))
+    if int(requested) > 0:
+        return min(total, int(requested))
+    warmup = max(0, int(warmup_epochs))
+    burn_in = warmup + max(int(patience), warmup)
+    return min(total, burn_in)
+
+
+def _resolve_early_stop_patience(*, total_epochs: int, requested: int) -> int:
+    if int(requested) == 0:
+        return 0
+    if int(requested) > 0:
+        return int(requested)
+    total = max(1, int(total_epochs))
+    return int(min(12, max(8, int(np.ceil(total / 6.0)))))
+
+
+def _resolve_early_stop_min_delta(*, total_epochs: int, requested: float) -> float:
+    if float(requested) >= 0.0:
+        return float(requested)
+    total = max(1, int(total_epochs))
+    auto = 1e-3 * float(np.sqrt(60.0 / float(total)))
+    return float(np.clip(auto, 5e-4, 2e-3))
+
+
+def _resolve_supcon_start_epoch(*, total_epochs: int, warmup_epochs: int, requested: int) -> int:
+    total = max(1, int(total_epochs))
+    req = int(requested)
+    if req > 0:
+        return min(total, req)
+    if req == 0:
+        return 1
+    warmup = max(0, int(warmup_epochs))
+    return min(total, warmup + 1)
+
+
 def _collect_topology_scalars(model: nn.Module) -> dict[str, float]:
     scalars: dict[str, float] = {}
     for name, module in model.named_modules():
@@ -296,6 +516,430 @@ def _collect_topology_scalars(model: nn.Module) -> dict[str, float]:
             except Exception:
                 continue
     return scalars
+
+
+def _batch_label_count_summary(label_ids: list[int]) -> dict[str, int]:
+    counts = Counter(int(x) for x in label_ids)
+    repeated = [int(v) for v in counts.values() if int(v) > 1]
+    singletons = [int(v) for v in counts.values() if int(v) == 1]
+    return {
+        "unique_classes": int(len(counts)),
+        "min_count": int(min(counts.values()) if counts else 0),
+        "max_count": int(max(counts.values()) if counts else 0),
+        "repeated_classes": int(len(repeated)),
+        "repeated_min": int(min(repeated) if repeated else 0),
+        "repeated_max": int(max(repeated) if repeated else 0),
+        "singleton_classes": int(len(singletons)),
+    }
+
+
+def _detect_cache_mode(*, args, is_dir_mode: bool) -> str:
+    if not is_dir_mode:
+        return "none"
+    if bool(args.use_decoded_skeleton_cache):
+        return "decoded"
+    if bool(args.use_packed_skeleton_cache):
+        return "packed"
+    return "none"
+
+
+def _train_sampler_mode(args) -> str:
+    if bool(args.supcon_class_balanced_batch):
+        return "class_balanced"
+    if bool(getattr(args, "supcon_mixed_batch", False)):
+        return "mixed"
+    if bool(args.weighted_sampler):
+        return "weighted"
+    return "random"
+
+
+def _loader_profile_from_record(record: dict[str, Any] | None) -> LoaderProfile | None:
+    if not isinstance(record, dict):
+        return None
+    payload = record.get("profile")
+    if not isinstance(payload, dict):
+        return None
+    try:
+        return LoaderProfile(
+            workers=int(payload.get("workers", 0)),
+            persistent_workers=bool(payload.get("persistent_workers", False)),
+            prefetch_factor=(None if payload.get("prefetch_factor") is None else int(payload.get("prefetch_factor"))),
+            file_cache_size=int(payload.get("file_cache_size", 0)),
+            pin_memory=bool(payload.get("pin_memory", False)),
+            pin_memory_device=(str(payload["pin_memory_device"]) if payload.get("pin_memory_device") else None),
+            use_prefetch_loader=bool(payload.get("use_prefetch_loader", False)),
+            notes=tuple(payload.get("notes", ())),
+        )
+    except Exception:
+        return None
+
+
+def _apply_loader_profile(
+    train_ds: MultiStreamGestureDataset,
+    val_ds: MultiStreamGestureDataset | None,
+    profile: LoaderProfile,
+) -> None:
+    train_ds.cfg.file_cache_size = int(profile.file_cache_size)
+    if val_ds is not None:
+        val_ds.cfg.file_cache_size = int(profile.file_cache_size)
+
+
+def _build_loader_kwargs(
+    *,
+    profile: LoaderProfile,
+    collate_fn,
+    benchmark: bool,
+) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "num_workers": int(profile.workers),
+        "persistent_workers": bool(profile.persistent_workers),
+        "collate_fn": collate_fn,
+        "pin_memory": bool(profile.pin_memory),
+    }
+    if profile.pin_memory_device:
+        kwargs["pin_memory_device"] = profile.pin_memory_device
+    if profile.prefetch_factor is not None and int(profile.workers) > 0:
+        kwargs["prefetch_factor"] = int(profile.prefetch_factor)
+    if benchmark and int(profile.workers) > 0:
+        kwargs["timeout"] = 20
+    return kwargs
+
+
+def _build_train_loader(
+    *,
+    train_ds: MultiStreamGestureDataset,
+    label2idx: dict[str, int],
+    weights_tensor: torch.Tensor,
+    args,
+    profile: LoaderProfile,
+    device: torch.device,
+    benchmark: bool = False,
+) -> tuple[DataLoader | PrefetchLoader, DataLoader, Any | None]:
+    dl_worker_kwargs = _build_loader_kwargs(
+        profile=profile,
+        collate_fn=MultiStreamGestureDataset.collate_fn,
+        benchmark=benchmark,
+    )
+    class_balanced_batch_sampler = (
+        ClassBalancedBatchSampler(
+            train_ds.samples,
+            label2idx,
+            classes_per_batch=int(args.supcon_classes_per_batch),
+            samples_per_class=int(args.supcon_samples_per_class),
+            seed=int(args.seed),
+        )
+        if args.supcon_class_balanced_batch
+        else None
+    )
+    mixed_batch_sampler = (
+        HybridSupConBatchSampler(
+            train_ds.samples,
+            label2idx,
+            batch_size=int(args.batch),
+            repeated_classes_per_batch=int(args.supcon_mixed_repeated_classes),
+            repeated_samples_per_class=int(args.supcon_mixed_repeated_samples),
+            seed=int(args.seed),
+        )
+        if getattr(args, "supcon_mixed_batch", False)
+        else None
+    )
+    batch_sampler = class_balanced_batch_sampler if class_balanced_batch_sampler is not None else mixed_batch_sampler
+    if batch_sampler is not None:
+        base_loader = DataLoader(
+            train_ds,
+            batch_sampler=batch_sampler,
+            **dl_worker_kwargs,
+        )
+    else:
+        sampler = (
+            WeightedRandomSampler(weights_tensor, num_samples=int(weights_tensor.numel()), replacement=True)
+            if args.weighted_sampler
+            else None
+        )
+        generator = torch.Generator()
+        generator.manual_seed(int(args.seed))
+        base_loader = DataLoader(
+            train_ds,
+            batch_size=int(args.batch),
+            sampler=sampler if sampler is not None else None,
+            shuffle=False if sampler is not None else True,
+            drop_last=True,
+            generator=generator if sampler is None else None,
+            **dl_worker_kwargs,
+        )
+    loader: DataLoader | PrefetchLoader = base_loader
+    if profile.use_prefetch_loader:
+        loader = PrefetchLoader(base_loader, device)
+    return loader, base_loader, batch_sampler
+
+
+def _build_val_loader(
+    *,
+    val_ds: MultiStreamGestureDataset,
+    args,
+    profile: LoaderProfile,
+    device: torch.device,
+    benchmark: bool = False,
+) -> tuple[DataLoader | PrefetchLoader, DataLoader]:
+    dl_worker_kwargs = _build_loader_kwargs(
+        profile=profile,
+        collate_fn=MultiStreamGestureDataset.collate_fn,
+        benchmark=benchmark,
+    )
+    base_loader = DataLoader(
+        val_ds,
+        batch_size=int(args.batch),
+        shuffle=False,
+        **dl_worker_kwargs,
+    )
+    loader: DataLoader | PrefetchLoader = base_loader
+    if profile.use_prefetch_loader:
+        loader = PrefetchLoader(base_loader, device)
+    return loader, base_loader
+
+
+def _shutdown_loader_workers(loader: DataLoader | PrefetchLoader | None) -> None:
+    if loader is None:
+        return
+    base = loader.loader if isinstance(loader, PrefetchLoader) else loader
+    iterator = getattr(base, "_iterator", None)
+    if iterator is not None:
+        shutdown = getattr(iterator, "_shutdown_workers", None)
+        if callable(shutdown):
+            try:
+                shutdown()
+            except Exception:
+                pass
+
+
+def _benchmark_train_loader_profile(
+    *,
+    train_ds: MultiStreamGestureDataset,
+    label2idx: dict[str, int],
+    weights_tensor: torch.Tensor,
+    args,
+    profile: LoaderProfile,
+    device: torch.device,
+) -> dict[str, Any]:
+    loader: DataLoader | PrefetchLoader | None = None
+    base_loader: DataLoader | None = None
+    train_batch_sampler: Any | None = None
+    warmup_batches = max(0, int(args.auto_workers_warmup_batches))
+    measure_batches = max(1, int(args.auto_workers_measure_batches))
+    total_target = warmup_batches + measure_batches
+    result: dict[str, Any] = {
+        "workers": int(profile.workers),
+        "success": False,
+        "samples_per_sec": 0.0,
+        "batch_per_sec": 0.0,
+        "mean_batch_time": 0.0,
+        "first_batch_time": 0.0,
+        "measured_batches": 0,
+        "measured_samples": 0,
+        "persistent_workers": bool(profile.persistent_workers),
+        "prefetch_factor": (int(profile.prefetch_factor) if profile.prefetch_factor is not None else 0),
+        "file_cache_size": int(profile.file_cache_size),
+        "use_prefetch_loader": bool(profile.use_prefetch_loader),
+        "pin_memory": bool(profile.pin_memory),
+        "error": "",
+        "notes": " | ".join(str(note) for note in profile.notes),
+    }
+    try:
+        _apply_loader_profile(train_ds, None, profile)
+        loader, base_loader, train_batch_sampler = _build_train_loader(
+            train_ds=train_ds,
+            label2idx=label2idx,
+            weights_tensor=weights_tensor,
+            args=args,
+            profile=profile,
+            device=device,
+            benchmark=True,
+        )
+        if train_batch_sampler is not None and hasattr(train_batch_sampler, "set_epoch"):
+            train_batch_sampler.set_epoch(0)
+        iterator = iter(loader)
+        measured_batches = 0
+        measured_samples = 0
+        measured_time = 0.0
+        first_batch_time = None
+        for batch_idx in range(total_target):
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            t0 = time.perf_counter()
+            _, y, _ = next(iterator)
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            dt = float(time.perf_counter() - t0)
+            if first_batch_time is None:
+                first_batch_time = dt
+            if batch_idx >= warmup_batches:
+                measured_batches += 1
+                measured_samples += int(y.size(0))
+                measured_time += dt
+        if measured_batches <= 0 or measured_time <= 0.0:
+            raise RuntimeError("benchmark did not observe any measured batches")
+        result["success"] = True
+        result["measured_batches"] = int(measured_batches)
+        result["measured_samples"] = int(measured_samples)
+        result["first_batch_time"] = float(first_batch_time or 0.0)
+        result["mean_batch_time"] = float(measured_time / measured_batches)
+        result["batch_per_sec"] = float(measured_batches / measured_time)
+        result["samples_per_sec"] = float(measured_samples / measured_time)
+    except StopIteration:
+        result["error"] = "loader exhausted before enough benchmark batches were collected"
+    except Exception as exc:
+        result["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        _shutdown_loader_workers(loader)
+        _shutdown_loader_workers(base_loader)
+        del loader
+        del base_loader
+        del train_batch_sampler
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+    return result
+
+
+def _resolve_auto_workers(
+    *,
+    train_ds: MultiStreamGestureDataset,
+    label2idx: dict[str, int],
+    weights_tensor: torch.Tensor,
+    args,
+    device: torch.device,
+    json_path: Path,
+    is_dir_mode: bool,
+    cache_mode: str,
+) -> tuple[LoaderProfile, dict[str, Any]]:
+    sampler_mode = _train_sampler_mode(args)
+    fingerprint_payload, fingerprint_hash = build_auto_workers_fingerprint(
+        args=args,
+        json_path=json_path,
+        dataset_mode=("dir" if is_dir_mode else "combined"),
+        cache_mode=cache_mode,
+        train_size=len(train_ds),
+        sampler_mode=sampler_mode,
+    )
+    info: dict[str, Any] = {
+        "enabled": True,
+        "from_cache": False,
+        "fingerprint": fingerprint_payload,
+        "fingerprint_hash": fingerprint_hash,
+        "cache_hit": False,
+        "cache_path": "",
+        "fallback_reason": "",
+        "candidates": [],
+        "selected_candidate": {},
+        "profile": {},
+        "benchmark_samples_per_sec": 0.0,
+    }
+
+    cached_record = None if args.auto_workers_rebench else load_auto_workers_record(fingerprint_hash)
+    cached_profile = _loader_profile_from_record(cached_record)
+    if cached_profile is not None:
+        info["from_cache"] = True
+        info["cache_hit"] = True
+        info["cache_path"] = str(get_auto_workers_cache_path())
+        info["profile"] = profile_to_dict(cached_profile)
+        info["selected_candidate"] = dict(cached_record.get("benchmark", {})) if isinstance(cached_record, dict) else {}
+        info["candidates"] = list(cached_record.get("candidates", [])) if isinstance(cached_record, dict) else []
+        info["benchmark_samples_per_sec"] = float(info["selected_candidate"].get("samples_per_sec", 0.0))
+        return cached_profile, info
+
+    if args.auto_workers_rebench:
+        print("Auto-workers: cache bypass requested -> benchmarking loader candidates again.")
+    else:
+        print("Auto-workers: cache miss -> benchmarking loader candidates.")
+    cpu_count = int(os.cpu_count() or 1)
+    candidate_workers = build_worker_candidates(
+        auto_workers_max=int(args.auto_workers_max),
+        cpu_count=cpu_count,
+        os_name=os.name,
+        is_dir_mode=is_dir_mode,
+        cache_mode=cache_mode,
+    )
+    print(f"Auto-workers candidates: {candidate_workers}")
+    for requested_workers in candidate_workers:
+        profile = resolve_loader_profile(
+            requested_workers=int(requested_workers),
+            requested_prefetch=int(args.prefetch),
+            requested_file_cache_size=int(args.file_cache),
+            os_name=os.name,
+            is_dir_mode=is_dir_mode,
+            cache_mode=cache_mode,
+            device_type=device.type,
+            no_prefetch=bool(args.no_prefetch),
+            cuda_index=(torch.cuda.current_device() if device.type == "cuda" else None),
+        )
+        print(
+            "Auto-workers bench | "
+            f"requested={requested_workers} -> workers={profile.workers}, "
+            f"persistent={int(profile.persistent_workers)}, "
+            f"prefetch={profile.prefetch_factor if profile.prefetch_factor is not None else 0}, "
+            f"file_cache={profile.file_cache_size}"
+        )
+        row = _benchmark_train_loader_profile(
+            train_ds=train_ds,
+            label2idx=label2idx,
+            weights_tensor=weights_tensor,
+            args=args,
+            profile=profile,
+            device=device,
+        )
+        row["requested_workers"] = int(requested_workers)
+        row["profile"] = profile_to_dict(profile)
+        info["candidates"].append(row)
+        if row.get("success"):
+            print(
+                "  -> success | "
+                f"samples_per_sec={float(row['samples_per_sec']):.2f} | "
+                f"batch_per_sec={float(row['batch_per_sec']):.2f} | "
+                f"first_batch_time={float(row['first_batch_time']):.3f}s"
+            )
+        else:
+            print(f"  -> failed | {row.get('error', 'unknown error')}")
+
+    selected = choose_best_candidate(info["candidates"])
+    if selected is not None:
+        chosen_profile = LoaderProfile(**selected["profile"])
+        info["selected_candidate"] = {k: v for k, v in selected.items() if k != "profile"}
+        info["profile"] = profile_to_dict(chosen_profile)
+        info["benchmark_samples_per_sec"] = float(selected.get("samples_per_sec", 0.0))
+        print(
+            "Auto-workers selected | "
+            f"workers={chosen_profile.workers}, "
+            f"persistent={int(chosen_profile.persistent_workers)}, "
+            f"prefetch={chosen_profile.prefetch_factor if chosen_profile.prefetch_factor is not None else 0}, "
+            f"file_cache={chosen_profile.file_cache_size}, "
+            f"samples_per_sec={float(selected.get('samples_per_sec', 0.0)):.2f}"
+        )
+    else:
+        info["fallback_reason"] = "no successful benchmark candidates; using safe fallback workers=0"
+        chosen_profile = resolve_loader_profile(
+            requested_workers=0,
+            requested_prefetch=int(args.prefetch),
+            requested_file_cache_size=int(args.file_cache),
+            os_name=os.name,
+            is_dir_mode=is_dir_mode,
+            cache_mode=cache_mode,
+            device_type=device.type,
+            no_prefetch=bool(args.no_prefetch),
+            cuda_index=(torch.cuda.current_device() if device.type == "cuda" else None),
+        )
+        info["profile"] = profile_to_dict(chosen_profile)
+        print(f"Auto-workers fallback | {info['fallback_reason']}")
+
+    cache_record = {
+        "version": 1,
+        "timestamp_unix": int(time.time()),
+        "profile": info["profile"],
+        "benchmark": dict(info["selected_candidate"]),
+        "candidates": list(info["candidates"]),
+    }
+    cache_path = save_auto_workers_record(fingerprint_hash, cache_record)
+    info["cache_path"] = str(cache_path)
+    return chosen_profile, info
 
 
 def run_training(args) -> None:
@@ -430,79 +1074,17 @@ def run_training(args) -> None:
     # Detect storage mode (dir vs combined)
     json_path = Path(args.json)
     is_dir_mode = json_path.is_dir()
-    if (os.name == "nt") and (not is_dir_mode) and args.workers > 0:
-        print("Note: Windows + combined JSON detected -> forcing workers=0 to avoid RAM blowups.")
-        args.workers = 0
     if args.use_packed_skeleton_cache and not is_dir_mode:
         print("Note: --use_packed_skeleton_cache is only used for per-video JSON directories; ignoring it for combined JSON.")
     if args.use_decoded_skeleton_cache and not is_dir_mode:
         print("Note: --use_decoded_skeleton_cache is only used for per-video JSON directories; ignoring it for combined JSON.")
-    print(f"Dataset mode: {'dir' if is_dir_mode else 'combined'} | workers={args.workers}")
-
-    persistent_workers = args.workers > 0
-    prefetch_factor = max(2, int(args.prefetch))
-    if (os.name == "nt") and is_dir_mode and args.workers > 0:
-        if args.use_decoded_skeleton_cache:
-            if not persistent_workers:
-                persistent_workers = True
-            if prefetch_factor > 2:
-                print(f"Note: Windows + decoded skeleton cache -> capping prefetch_factor {prefetch_factor} -> 2.")
-                prefetch_factor = 2
-            if int(train_ds.cfg.file_cache_size) != 0:
-                print(
-                    f"Note: Windows + decoded skeleton cache -> disabling per-worker file_cache "
-                    f"{train_ds.cfg.file_cache_size} -> 0."
-                )
-                train_ds.cfg.file_cache_size = 0
-                val_ds.cfg.file_cache_size = 0
-            print("Note: Windows + decoded skeleton cache -> keeping persistent_workers=True for high-worker throughput.")
-        elif args.use_packed_skeleton_cache:
-            if not persistent_workers:
-                persistent_workers = True
-            if prefetch_factor > 2:
-                print(f"Note: Windows + packed skeleton cache -> capping prefetch_factor {prefetch_factor} -> 2.")
-                prefetch_factor = 2
-            if int(train_ds.cfg.file_cache_size) != 0:
-                print(
-                    f"Note: Windows + packed skeleton cache -> disabling per-worker file_cache "
-                    f"{train_ds.cfg.file_cache_size} -> 0."
-                )
-                train_ds.cfg.file_cache_size = 0
-                val_ds.cfg.file_cache_size = 0
-            print("Note: Windows + packed skeleton cache -> keeping persistent_workers=True for high-worker throughput.")
-        else:
-            # On Windows each worker owns its own dataset instance. For moderate worker
-            # counts we stay in the safer mode; for intentionally high worker counts we
-            # keep the workers but aggressively reduce queue/cache pressure.
-            if args.workers > 8:
-                if not persistent_workers:
-                    persistent_workers = True
-                if prefetch_factor != 1:
-                    print(f"Note: Windows + per-video JSON + high workers -> capping prefetch_factor {prefetch_factor} -> 1.")
-                    prefetch_factor = 1
-                if int(train_ds.cfg.file_cache_size) != 0:
-                    print(
-                        f"Note: Windows + per-video JSON + high workers -> disabling per-worker file_cache "
-                        f"{train_ds.cfg.file_cache_size} -> 0."
-                    )
-                    train_ds.cfg.file_cache_size = 0
-                    val_ds.cfg.file_cache_size = 0
-                print("Note: Windows + per-video JSON + high workers -> keeping persistent_workers=True.")
-            else:
-                if persistent_workers:
-                    print("Note: Windows + per-video JSON -> disabling persistent_workers for loader stability.")
-                    persistent_workers = False
-                if prefetch_factor > 2:
-                    print(f"Note: Windows + per-video JSON -> capping prefetch_factor {prefetch_factor} -> 2.")
-                    prefetch_factor = 2
-                safe_file_cache = min(int(train_ds.cfg.file_cache_size), 8)
-                if safe_file_cache != int(train_ds.cfg.file_cache_size):
-                    print(
-                        f"Note: Windows + per-video JSON -> capping per-worker file_cache "
-                        f"{train_ds.cfg.file_cache_size} -> {safe_file_cache}."
-                    )
-                    train_ds.cfg.file_cache_size = safe_file_cache
-                    val_ds.cfg.file_cache_size = safe_file_cache
+    requested_workers = int(args.workers)
+    cache_mode = _detect_cache_mode(args=args, is_dir_mode=is_dir_mode)
+    dataset_mode_name = "dir" if is_dir_mode else "combined"
+    if args.auto_workers:
+        print(f"Dataset mode: {dataset_mode_name} | requested_workers={requested_workers} | auto_workers=on")
+    else:
+        print(f"Dataset mode: {dataset_mode_name} | workers={requested_workers}")
 
     # Save label map & ds cfg
     with (out_dir / "label2idx.json").open("w", encoding="utf-8") as f:
@@ -511,9 +1093,6 @@ def run_training(args) -> None:
         json.dump(ds_cfg_dict, f, ensure_ascii=False, indent=2)
 
     train_support = _compute_train_support(train_ds, label2idx)
-    bucket_by_class, bucket_rows = _build_bucket_rows(train_support, idx2label)
-    watchlist_rows = _build_watchlist_rows(train_support, idx2label, bucket_by_class, int(args.tb_watchlist_k))
-    watchlist_ids = [int(row["class_id"]) for row in watchlist_rows]
     _write_csv(
         analysis_dir / "train_support.csv",
         ["class_id", "label", "support_train"],
@@ -526,10 +1105,8 @@ def run_training(args) -> None:
             for class_id in range(len(train_support))
         ],
     )
-    _write_csv(analysis_dir / "buckets.csv", ["class_id", "label", "support_train", "bucket", "rank_by_support"], bucket_rows)
-    _write_csv(analysis_dir / "watchlist.csv", ["class_id", "label", "support_train", "bucket"], watchlist_rows)
 
-    # Sampler weights
+    # Sampler weights / train batch composition
     weights = build_sample_weights(
         train_ds.samples,
         label2idx,
@@ -539,40 +1116,139 @@ def run_training(args) -> None:
         cover_key="both_coverage",
         cover_floor=0.3,
     )
-    sampler = (
-        WeightedRandomSampler(torch.tensor(weights, dtype=torch.double), num_samples=len(weights), replacement=True)
-        if args.weighted_sampler
-        else None
-    )
+    weights_tensor = torch.tensor(weights, dtype=torch.double)
 
-    # DataLoaders (always build; prefetch optional)
-    dl_kwargs = dict(
-        batch_size=args.batch,
-        num_workers=args.workers,
-        persistent_workers=persistent_workers,
-        collate_fn=MultiStreamGestureDataset.collate_fn,
-    )
-    if device.type == "cuda":
-        dl_kwargs["pin_memory"] = True
-        dl_kwargs["pin_memory_device"] = f"cuda:{torch.cuda.current_device()}"
+    auto_workers_info: dict[str, Any] = {
+        "enabled": False,
+        "from_cache": False,
+        "fingerprint": {},
+        "fingerprint_hash": "",
+        "cache_hit": False,
+        "cache_path": "",
+        "fallback_reason": "",
+        "candidates": [],
+        "selected_candidate": {},
+        "profile": {},
+        "benchmark_samples_per_sec": 0.0,
+    }
+    if args.auto_workers:
+        effective_profile, auto_workers_info = _resolve_auto_workers(
+            train_ds=train_ds,
+            label2idx=label2idx,
+            weights_tensor=weights_tensor,
+            args=args,
+            device=device,
+            json_path=json_path,
+            is_dir_mode=is_dir_mode,
+            cache_mode=cache_mode,
+        )
+        if auto_workers_info.get("from_cache"):
+            print(f"Auto-workers cache hit: {auto_workers_info.get('cache_path', '')}")
     else:
-        dl_kwargs["pin_memory"] = False
-
-    if args.workers > 0:
-        dl_kwargs["prefetch_factor"] = prefetch_factor
-
-    train_loader = DataLoader(
-        train_ds,
-        sampler=sampler if (args.weighted_sampler and sampler is not None) else None,
-        shuffle=False if (args.weighted_sampler and sampler is not None) else True,
-        drop_last=True,
-        **dl_kwargs,
+        effective_profile = resolve_loader_profile(
+            requested_workers=requested_workers,
+            requested_prefetch=int(args.prefetch),
+            requested_file_cache_size=int(args.file_cache),
+            os_name=os.name,
+            is_dir_mode=is_dir_mode,
+            cache_mode=cache_mode,
+            device_type=device.type,
+            no_prefetch=bool(args.no_prefetch),
+            cuda_index=(torch.cuda.current_device() if device.type == "cuda" else None),
+        )
+    _apply_loader_profile(train_ds, val_ds, effective_profile)
+    for note in effective_profile.notes:
+        print(f"Note: {note}")
+    print(
+        "Loader profile: "
+        f"workers={effective_profile.workers} | "
+        f"persistent={int(effective_profile.persistent_workers)} | "
+        f"prefetch={effective_profile.prefetch_factor if effective_profile.prefetch_factor is not None else 0} | "
+        f"file_cache={effective_profile.file_cache_size} | "
+        f"prefetch_loader={int(effective_profile.use_prefetch_loader)}"
     )
-    val_loader = DataLoader(val_ds, shuffle=False, **dl_kwargs)
 
-    if device.type == "cuda" and not args.no_prefetch:
-        train_loader = PrefetchLoader(train_loader, device)
-        val_loader = PrefetchLoader(val_loader, device)
+    candidate_fieldnames = [
+        "requested_workers",
+        "workers",
+        "success",
+        "samples_per_sec",
+        "batch_per_sec",
+        "mean_batch_time",
+        "first_batch_time",
+        "measured_batches",
+        "measured_samples",
+        "persistent_workers",
+        "prefetch_factor",
+        "file_cache_size",
+        "use_prefetch_loader",
+        "pin_memory",
+        "error",
+        "notes",
+    ]
+    if args.auto_workers:
+        _write_json(analysis_dir / "auto_workers_decision.json", auto_workers_info)
+        _write_csv(
+            analysis_dir / "auto_workers_candidates.csv",
+            candidate_fieldnames,
+            [
+                {key: row.get(key, "") for key in candidate_fieldnames}
+                for row in auto_workers_info.get("candidates", [])
+            ],
+        )
+
+    # Reset RNG after loader autotune so the real training run starts from the configured seed.
+    if args.auto_workers:
+        set_seed(args.seed)
+
+    train_loader, train_loader_base, train_batch_sampler = _build_train_loader(
+        train_ds=train_ds,
+        label2idx=label2idx,
+        weights_tensor=weights_tensor,
+        args=args,
+        profile=effective_profile,
+        device=device,
+        benchmark=False,
+    )
+    if train_batch_sampler is not None:
+        preview_batch = next(iter(train_batch_sampler))
+        preview_labels = [int(label2idx[train_ds.samples[idx][1]]) for idx in preview_batch]
+        preview_summary = _batch_label_count_summary(preview_labels)
+        if args.supcon_class_balanced_batch:
+            print(
+                "Using class-balanced batch sampler: "
+                f"{int(args.supcon_classes_per_batch)} classes x {int(args.supcon_samples_per_class)} samples "
+                f"(batch={int(args.batch)}, batches/epoch~{len(train_batch_sampler)})."
+            )
+            print(
+                "Class-balanced preview | "
+                f"unique_classes={preview_summary['unique_classes']} | "
+                f"min_count={preview_summary['min_count']} | "
+                f"max_count={preview_summary['max_count']}"
+            )
+        elif args.supcon_mixed_batch:
+            singleton_slots = int(args.batch) - int(args.supcon_mixed_repeated_classes * args.supcon_mixed_repeated_samples)
+            print(
+                "Using mixed SupCon batch sampler: "
+                f"{int(args.supcon_mixed_repeated_classes)} repeated classes x {int(args.supcon_mixed_repeated_samples)} samples "
+                f"+ {singleton_slots} singleton classes "
+                f"(batch={int(args.batch)}, batches/epoch~{len(train_batch_sampler)})."
+            )
+            print(
+                "Mixed batch preview | "
+                f"unique_classes={preview_summary['unique_classes']} | "
+                f"repeated_classes={preview_summary['repeated_classes']} | "
+                f"repeated_min={preview_summary['repeated_min']} | "
+                f"repeated_max={preview_summary['repeated_max']} | "
+                f"singleton_classes={preview_summary['singleton_classes']}"
+            )
+    val_loader, val_loader_base = _build_val_loader(
+        val_ds=val_ds,
+        args=args,
+        profile=effective_profile,
+        device=device,
+        benchmark=False,
+    )
 
     # Model
     depths = tuple(int(x) for x in args.depths.split(","))
@@ -627,12 +1303,18 @@ def run_training(args) -> None:
     else:
         smoothing = max(0.0, float(args.label_smoothing))
         criterion = nn.CrossEntropyLoss(label_smoothing=smoothing if smoothing > 0 else 0.0)
+    supcon_criterion = SupervisedContrastiveLoss(temperature=args.supcon_temp) if args.use_supcon else None
 
     # Optimizer & scheduler
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
     warmup_epochs = int(max(0, round(args.warmup_frac * args.epochs)))
     if warmup_epochs >= args.epochs:
         warmup_epochs = max(0, args.epochs - 1)
+    supcon_start_epoch = _resolve_supcon_start_epoch(
+        total_epochs=int(args.epochs),
+        warmup_epochs=int(warmup_epochs),
+        requested=int(args.supcon_start_epoch),
+    )
     if warmup_epochs > 0:
         main_epochs = max(1, args.epochs - warmup_epochs)
         sched = optim.lr_scheduler.SequentialLR(
@@ -661,13 +1343,27 @@ def run_training(args) -> None:
         print(f"Debug limits -> train:{train_limit or 'full'} | val:{val_limit or 'full'}")
 
     best_f1 = -1.0
-    es_patience = max(0, int(args.early_stop_patience))
-    es_min_delta = max(0.0, float(args.early_stop_min_delta))
+    es_patience = _resolve_early_stop_patience(total_epochs=int(args.epochs), requested=int(args.early_stop_patience))
+    es_min_delta = _resolve_early_stop_min_delta(total_epochs=int(args.epochs), requested=float(args.early_stop_min_delta))
+    es_start_epoch = _resolve_early_stop_start_epoch(
+        total_epochs=int(args.epochs),
+        warmup_epochs=int(warmup_epochs),
+        patience=int(es_patience),
+        requested=int(args.early_stop_start_epoch),
+    )
     epochs_no_improve = 0
     history = []
     global_step = 0
     start_epoch = 1
-    analysis_state: dict[str, Any] = {"per_class_peak_f1": {}, "epoch_index": []}
+    analysis_state: dict[str, Any] = {
+        "per_class_peak_f1": {},
+        "epoch_index": [],
+        "difficulty_scores": {},
+        "difficulty_frozen": False,
+        "difficulty_freeze_epoch": 0,
+        "bucket_mode": "",
+        "support_is_uniform": False,
+    }
 
     if args.resume:
         resume_path = Path(args.resume).expanduser()
@@ -740,6 +1436,11 @@ def run_training(args) -> None:
             analysis_state = ckpt.get("analysis_state") if isinstance(ckpt.get("analysis_state"), dict) else analysis_state
             analysis_state.setdefault("per_class_peak_f1", {})
             analysis_state.setdefault("epoch_index", [])
+            analysis_state.setdefault("difficulty_scores", {})
+            analysis_state.setdefault("difficulty_frozen", False)
+            analysis_state.setdefault("difficulty_freeze_epoch", 0)
+            analysis_state.setdefault("bucket_mode", "")
+            analysis_state.setdefault("support_is_uniform", False)
             best_f1 = float(
                 ckpt.get(
                     "best_f1",
@@ -766,10 +1467,45 @@ def run_training(args) -> None:
                     f"Checkpoint is already at epoch {start_epoch - 1}, but --epochs={args.epochs}. "
                     "Pass a larger total epoch count to continue training."
                 )
+            if start_epoch <= es_start_epoch and epochs_no_improve != 0:
+                print(
+                    f"Resetting epochs_no_improve from checkpoint because early stopping is not armed until epoch {es_start_epoch}."
+                )
+                epochs_no_improve = 0
             print(
                 f"Resuming full training state from {resume_path} | "
                 f"next_epoch={start_epoch} | best_f1={best_f1:.4f} | global_step={global_step}"
             )
+
+    bucket_mode, support_is_uniform = _resolve_bucket_mode(train_support, str(args.tb_bucket_mode))
+    if analysis_state.get("bucket_mode") and str(analysis_state.get("bucket_mode")) != bucket_mode:
+        print(
+            "Warning: checkpoint analytics bucket mode differs from the current run. "
+            f"saved={analysis_state.get('bucket_mode')} current={bucket_mode}"
+        )
+    analysis_state["bucket_mode"] = bucket_mode
+    analysis_state["support_is_uniform"] = bool(support_is_uniform)
+    bucket_spec = _bucket_mode_spec(bucket_mode)
+    if bucket_mode == "difficulty":
+        if support_is_uniform:
+            print("Note: train support is uniform -> switching TensorBoard buckets to difficulty mode.")
+        bucket_by_class, bucket_rows = _build_difficulty_bucket_rows(
+            analysis_state.setdefault("difficulty_scores", {}),
+            train_support,
+            idx2label,
+        )
+        watchlist_rows = _build_difficulty_watchlist_rows(
+            analysis_state.setdefault("difficulty_scores", {}),
+            train_support,
+            idx2label,
+            bucket_by_class,
+            int(args.tb_watchlist_k),
+        )
+    else:
+        bucket_by_class, bucket_rows = _build_support_bucket_rows(train_support, idx2label)
+        watchlist_rows = _build_support_watchlist_rows(train_support, idx2label, bucket_by_class, int(args.tb_watchlist_k))
+    watchlist_ids = [int(row["class_id"]) for row in watchlist_rows]
+    _write_bucket_artifacts(analysis_dir, bucket_rows, watchlist_rows)
 
     hist_params = select_hist_params(model, ("stems.", "head."))
 
@@ -782,10 +1518,26 @@ def run_training(args) -> None:
         "best_ckpt_path": str((out_dir / "best.ckpt").resolve()),
         "last_ckpt_path": str((out_dir / "last.ckpt").resolve()),
         "tb_full_logging_enabled": bool(args.tb_full_logging),
+        "bucket_mode_requested": str(args.tb_bucket_mode),
+        "bucket_mode_effective": bucket_mode,
+        "support_is_uniform": bool(support_is_uniform),
+        "early_stop": {
+            "patience_requested": int(args.early_stop_patience),
+            "patience_effective": int(es_patience),
+            "min_delta_requested": float(args.early_stop_min_delta),
+            "min_delta_effective": float(es_min_delta),
+            "start_epoch_requested": int(args.early_stop_start_epoch),
+            "start_epoch_effective": int(es_start_epoch),
+            "warmup_epochs": int(warmup_epochs),
+        },
         "features": {
             "tensorboard": bool(args.tensorboard),
             "use_packed_skeleton_cache": bool(args.use_packed_skeleton_cache),
             "use_decoded_skeleton_cache": bool(args.use_decoded_skeleton_cache),
+            "auto_workers": bool(args.auto_workers),
+            "use_supcon": bool(args.use_supcon),
+            "supcon_class_balanced_batch": bool(args.supcon_class_balanced_batch),
+            "supcon_mixed_batch": bool(args.supcon_mixed_batch),
             "tb_log_all_classes": bool(args.tb_log_all_classes),
             "tb_log_tail_buckets": bool(args.tb_log_tail_buckets),
             "tb_log_confusion_pairs": bool(args.tb_log_confusion_pairs),
@@ -797,9 +1549,36 @@ def run_training(args) -> None:
         },
         "tb_flags": {
             "tb_watchlist_k": int(args.tb_watchlist_k),
+            "tb_bucket_mode": str(args.tb_bucket_mode),
+            "tb_difficulty_freeze_epoch": int(args.tb_difficulty_freeze_epoch),
+            "tb_difficulty_ema": float(args.tb_difficulty_ema),
             "tb_confusion_every": int(args.tb_confusion_every),
             "tb_predictions_every": int(args.tb_predictions_every),
             "tb_tables_k": int(args.tb_tables_k),
+        },
+        "supcon": {
+            "enabled": bool(args.use_supcon),
+            "weight": float(args.supcon_weight),
+            "temperature": float(args.supcon_temp),
+            "start_epoch_requested": int(args.supcon_start_epoch),
+            "start_epoch_effective": int(supcon_start_epoch),
+            "class_balanced_batch": bool(args.supcon_class_balanced_batch),
+            "classes_per_batch": int(args.supcon_classes_per_batch),
+            "samples_per_class": int(args.supcon_samples_per_class),
+            "mixed_batch": bool(args.supcon_mixed_batch),
+            "mixed_repeated_classes": int(args.supcon_mixed_repeated_classes),
+            "mixed_repeated_samples": int(args.supcon_mixed_repeated_samples),
+        },
+        "auto_workers": {
+            "enabled": bool(args.auto_workers),
+            "from_cache": bool(auto_workers_info.get("from_cache", False)),
+            "effective_workers": int(effective_profile.workers),
+            "profile": profile_to_dict(effective_profile),
+            "fingerprint_hash": str(auto_workers_info.get("fingerprint_hash", "")),
+            "candidates_tested": int(len(auto_workers_info.get("candidates", []))),
+            "benchmark_samples_per_sec": float(auto_workers_info.get("benchmark_samples_per_sec", 0.0)),
+            "fallback_reason": str(auto_workers_info.get("fallback_reason", "")),
+            "cache_path": str(auto_workers_info.get("cache_path", "")),
         },
     }
     _write_json(analysis_dir / "run_manifest.json", run_manifest)
@@ -817,10 +1596,55 @@ def run_training(args) -> None:
         tb_logger.scalar("meta/train_samples", float(len(train_ds)), 0)
         tb_logger.scalar("meta/val_samples", float(len(val_ds)), 0)
         tb_logger.scalar("meta/tb_full_logging", float(bool(args.tb_full_logging)), 0)
+        tb_logger.scalar("meta/early_stop_patience", float(es_patience), 0)
+        tb_logger.scalar("meta/early_stop_min_delta", float(es_min_delta), 0)
+        tb_logger.scalar("meta/early_stop_start_epoch", float(es_start_epoch), 0)
+        tb_logger.scalar("meta/support_is_uniform", float(bool(support_is_uniform)), 0)
+        tb_logger.scalar("meta/bucket_mode_support", float(bucket_mode == "support"), 0)
+        tb_logger.scalar("meta/bucket_mode_difficulty", float(bucket_mode == "difficulty"), 0)
+        tb_logger.scalar("meta/auto_workers_enabled", float(bool(args.auto_workers)), 0)
+        tb_logger.scalar("meta/auto_workers_effective", float(effective_profile.workers), 0)
+        tb_logger.scalar("meta/auto_workers_from_cache", float(bool(auto_workers_info.get("from_cache", False))), 0)
+        tb_logger.scalar(
+            "meta/auto_workers_benchmark_samples_per_sec",
+            float(auto_workers_info.get("benchmark_samples_per_sec", 0.0)),
+            0,
+        )
+        tb_logger.scalar("meta/auto_workers_profile_persistent", float(bool(effective_profile.persistent_workers)), 0)
+        tb_logger.scalar(
+            "meta/auto_workers_profile_prefetch",
+            float(effective_profile.prefetch_factor if effective_profile.prefetch_factor is not None else 0),
+            0,
+        )
+        tb_logger.scalar("meta/use_supcon", float(bool(args.use_supcon)), 0)
+        tb_logger.scalar("meta/supcon_weight", float(args.supcon_weight), 0)
+        tb_logger.scalar("meta/supcon_temp", float(args.supcon_temp), 0)
+        tb_logger.scalar("meta/supcon_start_epoch", float(supcon_start_epoch), 0)
+        tb_logger.scalar("meta/supcon_class_balanced_batch", float(bool(args.supcon_class_balanced_batch)), 0)
+        tb_logger.scalar("meta/supcon_classes_per_batch", float(args.supcon_classes_per_batch), 0)
+        tb_logger.scalar("meta/supcon_samples_per_class", float(args.supcon_samples_per_class), 0)
+        tb_logger.scalar("meta/supcon_mixed_batch", float(bool(args.supcon_mixed_batch)), 0)
+        tb_logger.scalar("meta/supcon_mixed_repeated_classes", float(args.supcon_mixed_repeated_classes), 0)
+        tb_logger.scalar("meta/supcon_mixed_repeated_samples", float(args.supcon_mixed_repeated_samples), 0)
         tb_logger.text("meta/run_manifest", json.dumps(run_manifest, ensure_ascii=False, indent=2), 0)
+
+    if es_patience > 0:
+        print(
+            f"Early stopping armed from epoch {es_start_epoch} "
+            f"(warmup_epochs={warmup_epochs}, patience={es_patience}, min_delta={es_min_delta:.6f})."
+        )
+    else:
+        print("Early stopping disabled.")
+    if args.use_supcon:
+        print(
+            f"SupCon auxiliary armed from epoch {supcon_start_epoch} "
+            f"(warmup_epochs={warmup_epochs}, requested_start={int(args.supcon_start_epoch)})."
+        )
 
     for epoch in range(start_epoch, args.epochs + 1):
         t0 = time.time()
+        if train_batch_sampler is not None and hasattr(train_batch_sampler, "set_epoch"):
+            train_batch_sampler.set_epoch(int(epoch))
         train_out = train_one_epoch(
             model,
             train_loader,
@@ -840,8 +1664,23 @@ def run_training(args) -> None:
             tb_logger=tb_logger,
             tb_log_every=int(args.log_every_steps),
             global_step=global_step,
+            supcon_criterion=supcon_criterion,
+            supcon_weight=float(args.supcon_weight),
+            supcon_start_epoch=int(supcon_start_epoch),
+            epoch=int(epoch),
+            log_batch_label_stats=bool(args.supcon_class_balanced_batch or args.supcon_mixed_batch),
+            expected_batch_unique_classes=(int(args.supcon_classes_per_batch) if args.supcon_class_balanced_batch else None),
+            expected_batch_samples_per_class=(int(args.supcon_samples_per_class) if args.supcon_class_balanced_batch else None),
+            expected_mixed_repeated_classes=(int(args.supcon_mixed_repeated_classes) if args.supcon_mixed_batch else None),
+            expected_mixed_repeated_samples=(int(args.supcon_mixed_repeated_samples) if args.supcon_mixed_batch else None),
+            expected_mixed_singleton_classes=(
+                int(args.batch - (args.supcon_mixed_repeated_classes * args.supcon_mixed_repeated_samples))
+                if args.supcon_mixed_batch
+                else None
+            ),
         )
         tr_loss = float(train_out.loss)
+        tr_total_loss = float(train_out.total_loss)
         global_step = int(train_out.global_step)
         eval_model = ema.module if ema is not None else model
         collect_examples = bool(
@@ -867,6 +1706,30 @@ def run_training(args) -> None:
             train_support=train_support,
             bucket_by_class=bucket_by_class,
         )
+        if bucket_mode == "difficulty":
+            difficulty_scores = analysis_state.setdefault("difficulty_scores", {})
+            difficulty_frozen = bool(analysis_state.get("difficulty_frozen", False))
+            if not difficulty_frozen:
+                _update_difficulty_scores(
+                    difficulty_scores,
+                    eval_out.per_class,
+                    ema_decay=float(args.tb_difficulty_ema),
+                )
+                if epoch >= int(args.tb_difficulty_freeze_epoch):
+                    difficulty_frozen = True
+                    analysis_state["difficulty_freeze_epoch"] = int(epoch)
+            analysis_state["difficulty_frozen"] = bool(difficulty_frozen)
+            bucket_by_class, bucket_rows = _build_difficulty_bucket_rows(difficulty_scores, train_support, idx2label)
+            watchlist_rows = _build_difficulty_watchlist_rows(
+                difficulty_scores,
+                train_support,
+                idx2label,
+                bucket_by_class,
+                int(args.tb_watchlist_k),
+            )
+            watchlist_ids = [int(row["class_id"]) for row in watchlist_rows]
+            _apply_bucket_annotations(eval_out, idx2label=idx2label, bucket_by_class=bucket_by_class)
+            _write_bucket_artifacts(analysis_dir, bucket_rows, watchlist_rows)
         sched.step()
         val_loss = float(eval_out.loss)
         val_acc = float(eval_out.acc)
@@ -881,8 +1744,6 @@ def run_training(args) -> None:
             f"[Ep {epoch:03d}] TL={tr_loss:.4f} | VL={val_loss:.4f} | VA={val_acc:.3f} | VF1={val_f1:.3f} | "
             f"lr={optimizer.param_groups[0]['lr']:.2e} | {dt:.1f}s"
         )
-        from collections import Counter
-
         print("pred top5:", Counter(val_preds).most_common(5))
 
         f1_micro = f1_score(val_labels, val_preds, average="micro") if val_labels else 0.0
@@ -892,13 +1753,17 @@ def run_training(args) -> None:
             if val_labels
             else (0.0, 0.0, 0.0, None)
         )
-        bucket_metrics = _bucket_aggregates(eval_out.per_class, bucket_by_class)
+        bucket_metrics = _bucket_aggregates(eval_out.per_class, bucket_by_class, tuple(bucket_spec["bucket_names"]))
+        per_class_dist = _compute_per_class_distribution_metrics(eval_out.per_class)
         zero_f1_count = int(sum(1 for row in eval_out.per_class.values() if float(row["f1"]) <= 1e-12))
         nonzero_f1_count = int(len(eval_out.per_class) - zero_f1_count)
         conf_arr = np.asarray(eval_out.probs_top1, dtype=np.float64) if eval_out.probs_top1 else np.zeros(0, dtype=np.float64)
         margin_arr = np.asarray(eval_out.margin, dtype=np.float64) if eval_out.margin else np.zeros(0, dtype=np.float64)
         entropy_arr = np.asarray(eval_out.entropy, dtype=np.float64) if eval_out.entropy else np.zeros(0, dtype=np.float64)
         correct_arr = np.asarray([int(p == t) for p, t in zip(val_preds, val_labels)], dtype=np.int64) if val_labels else np.zeros(0, dtype=np.int64)
+        high_conf_wrong_mask = (correct_arr == 0) & (conf_arr >= 0.90) if conf_arr.size else np.zeros(0, dtype=bool)
+        high_conf_wrong_count = int(high_conf_wrong_mask.sum()) if high_conf_wrong_mask.size else 0
+        high_conf_wrong_rate = float(high_conf_wrong_count / max(1, len(val_labels))) if val_labels else 0.0
         confidence_mean = float(conf_arr.mean()) if conf_arr.size else 0.0
         confidence_correct_mean = float(conf_arr[correct_arr == 1].mean()) if np.any(correct_arr == 1) else 0.0
         confidence_wrong_mean = float(conf_arr[correct_arr == 0].mean()) if np.any(correct_arr == 0) else 0.0
@@ -908,15 +1773,22 @@ def run_training(args) -> None:
         f1_gain_vs_prev = float(val_f1 - history[-1]["val_f1"]) if history else 0.0
         loss_gap_train_minus_val = float(tr_loss - val_loss)
         f1_gap_macro_minus_weighted = float(val_f1 - f1_weighted)
+        es_armed = bool(es_patience > 0 and epoch >= es_start_epoch)
 
         history.append(
             dict(
                 epoch=epoch,
                 train_loss=tr_loss,
+                train_total_loss=tr_total_loss,
+                train_supcon_loss=float(train_out.supcon_loss),
+                train_supcon_valid_anchors=int(train_out.supcon_valid_anchors),
+                train_supcon_positive_pairs=int(train_out.supcon_positive_pairs),
                 val_loss=val_loss,
                 val_acc=val_acc,
                 val_f1=val_f1,
-                val_f1_tail=float(bucket_metrics.get("f1_tail", 0.0)),
+                val_bucket_mode=bucket_mode,
+                val_f1_tail=(float(bucket_metrics.get("f1_tail", 0.0)) if bucket_mode == "support" else None),
+                val_f1_hard=(float(bucket_metrics.get("f1_hard", 0.0)) if bucket_mode == "difficulty" else None),
                 val_ece=float(eval_out.calibration.get("ece_15bin", 0.0)),
                 val_brier=float(eval_out.calibration.get("brier", 0.0)),
                 val_nll=float(eval_out.calibration.get("nll", 0.0)),
@@ -928,6 +1800,7 @@ def run_training(args) -> None:
             row_out = dict(row)
             row_out["epoch"] = int(epoch)
             row_out["global_step"] = int(global_step)
+            row_out["bucket_mode"] = bucket_mode
             per_class_rows.append(row_out)
         worst_classes_rows = sorted(per_class_rows, key=lambda row: (float(row["f1"]), int(row["support_train"]), int(row["class_id"])))
         biggest_late_drop_rows = _compute_biggest_late_drops(
@@ -937,11 +1810,15 @@ def run_training(args) -> None:
         )
         prediction_rows = _prediction_csv_rows(eval_out.records, train_support, bucket_by_class)
         error_rows = [row for row in prediction_rows if int(row["correct"]) == 0]
-        worst_error_rows = _select_error_rows(prediction_rows, only_tail=False, limit=int(args.tb_tables_k))
-        tail_error_rows = _select_error_rows(prediction_rows, only_tail=True, limit=int(args.tb_tables_k))
+        worst_error_rows = _select_error_rows(prediction_rows, bucket_filter=None, limit=int(args.tb_tables_k))
+        focus_error_rows = _select_error_rows(
+            prediction_rows,
+            bucket_filter=str(bucket_spec["focus_bucket"]),
+            limit=int(args.tb_tables_k),
+        )
         confusion_pairs_top = eval_out.confusion_pairs[: max(1, int(args.tb_tables_k))]
         confusion_pairs_tail = [
-            row for row in eval_out.confusion_pairs if str(row.get("bucket_true")) == "tail"
+            row for row in eval_out.confusion_pairs if str(row.get("bucket_true")) == str(bucket_spec["focus_bucket"])
         ][: max(1, int(args.tb_tables_k))]
         watchlist_id_set = set(watchlist_ids)
         confusion_pairs_watchlist = [
@@ -949,6 +1826,7 @@ def run_training(args) -> None:
         ][: max(1, int(args.tb_tables_k))]
 
         if tb_logger.enabled:
+            tb_logger.scalar("meta/early_stop_armed", float(es_armed), global_step)
             tb_logger.scalar("val/loss", float(val_loss), global_step)
             tb_logger.scalar("val/acc", float(val_acc), global_step)
             tb_logger.scalar("val/f1_macro", float(val_f1), global_step)
@@ -968,6 +1846,12 @@ def run_training(args) -> None:
                 tb_logger.scalar("val/prob_margin_mean", prob_margin_mean, global_step)
                 tb_logger.scalar("val/prob_margin_wrong_mean", prob_margin_wrong_mean, global_step)
                 tb_logger.scalar("val/entropy_mean", entropy_mean, global_step)
+                tb_logger.scalar("val/per_class_f1_p10", float(per_class_dist["per_class_f1_p10"]), global_step)
+                tb_logger.scalar("val/per_class_f1_p25", float(per_class_dist["per_class_f1_p25"]), global_step)
+                tb_logger.scalar("val/per_class_f1_median", float(per_class_dist["per_class_f1_median"]), global_step)
+                tb_logger.scalar("val/per_class_recall_p10", float(per_class_dist["per_class_recall_p10"]), global_step)
+                tb_logger.scalar("val/high_conf_wrong_count", float(high_conf_wrong_count), global_step)
+                tb_logger.scalar("val/high_conf_wrong_rate", float(high_conf_wrong_rate), global_step)
                 tb_logger.scalar("val/precision_macro", float(p_macro), global_step)
                 tb_logger.scalar("val/recall_macro", float(r_macro), global_step)
                 tb_logger.scalar("val/zero_f1_count", float(zero_f1_count), global_step)
@@ -997,18 +1881,35 @@ def run_training(args) -> None:
                         tb_logger.scalar(f"val/p_worst/{label_name}", float(row["precision"]), global_step)
                         tb_logger.scalar(f"val/r_worst/{label_name}", float(row["recall"]), global_step)
                 if args.tb_log_tail_buckets or args.tb_full_logging:
-                    tb_logger.scalar("val_bucket/f1_head", float(bucket_metrics.get("f1_head", 0.0)), global_step)
-                    tb_logger.scalar("val_bucket/f1_mid", float(bucket_metrics.get("f1_mid", 0.0)), global_step)
-                    tb_logger.scalar("val_bucket/f1_tail", float(bucket_metrics.get("f1_tail", 0.0)), global_step)
-                    tb_logger.scalar("val_bucket/p_head", float(bucket_metrics.get("p_head", 0.0)), global_step)
-                    tb_logger.scalar("val_bucket/p_mid", float(bucket_metrics.get("p_mid", 0.0)), global_step)
-                    tb_logger.scalar("val_bucket/p_tail", float(bucket_metrics.get("p_tail", 0.0)), global_step)
-                    tb_logger.scalar("val_bucket/r_head", float(bucket_metrics.get("r_head", 0.0)), global_step)
-                    tb_logger.scalar("val_bucket/r_mid", float(bucket_metrics.get("r_mid", 0.0)), global_step)
-                    tb_logger.scalar("val_bucket/r_tail", float(bucket_metrics.get("r_tail", 0.0)), global_step)
-                    tb_logger.scalar("val_bucket/zero_f1_head_count", float(bucket_metrics.get("zero_f1_head_count", 0.0)), global_step)
-                    tb_logger.scalar("val_bucket/zero_f1_mid_count", float(bucket_metrics.get("zero_f1_mid_count", 0.0)), global_step)
-                    tb_logger.scalar("val_bucket/zero_f1_tail_count", float(bucket_metrics.get("zero_f1_tail_count", 0.0)), global_step)
+                    tb_logger.scalar("meta/difficulty_frozen", float(bool(analysis_state.get("difficulty_frozen", False))), global_step)
+                    tb_logger.scalar("meta/bucket_mode_support", float(bucket_mode == "support"), global_step)
+                    tb_logger.scalar("meta/bucket_mode_difficulty", float(bucket_mode == "difficulty"), global_step)
+                    if bucket_mode == "support":
+                        tb_logger.scalar("val_bucket/f1_head", float(bucket_metrics.get("f1_head", 0.0)), global_step)
+                        tb_logger.scalar("val_bucket/f1_mid", float(bucket_metrics.get("f1_mid", 0.0)), global_step)
+                        tb_logger.scalar("val_bucket/f1_tail", float(bucket_metrics.get("f1_tail", 0.0)), global_step)
+                        tb_logger.scalar("val_bucket/p_head", float(bucket_metrics.get("p_head", 0.0)), global_step)
+                        tb_logger.scalar("val_bucket/p_mid", float(bucket_metrics.get("p_mid", 0.0)), global_step)
+                        tb_logger.scalar("val_bucket/p_tail", float(bucket_metrics.get("p_tail", 0.0)), global_step)
+                        tb_logger.scalar("val_bucket/r_head", float(bucket_metrics.get("r_head", 0.0)), global_step)
+                        tb_logger.scalar("val_bucket/r_mid", float(bucket_metrics.get("r_mid", 0.0)), global_step)
+                        tb_logger.scalar("val_bucket/r_tail", float(bucket_metrics.get("r_tail", 0.0)), global_step)
+                        tb_logger.scalar("val_bucket/zero_f1_head_count", float(bucket_metrics.get("zero_f1_head_count", 0.0)), global_step)
+                        tb_logger.scalar("val_bucket/zero_f1_mid_count", float(bucket_metrics.get("zero_f1_mid_count", 0.0)), global_step)
+                        tb_logger.scalar("val_bucket/zero_f1_tail_count", float(bucket_metrics.get("zero_f1_tail_count", 0.0)), global_step)
+                    else:
+                        tb_logger.scalar("val_difficulty/f1_easy", float(bucket_metrics.get("f1_easy", 0.0)), global_step)
+                        tb_logger.scalar("val_difficulty/f1_mid", float(bucket_metrics.get("f1_mid", 0.0)), global_step)
+                        tb_logger.scalar("val_difficulty/f1_hard", float(bucket_metrics.get("f1_hard", 0.0)), global_step)
+                        tb_logger.scalar("val_difficulty/p_easy", float(bucket_metrics.get("p_easy", 0.0)), global_step)
+                        tb_logger.scalar("val_difficulty/p_mid", float(bucket_metrics.get("p_mid", 0.0)), global_step)
+                        tb_logger.scalar("val_difficulty/p_hard", float(bucket_metrics.get("p_hard", 0.0)), global_step)
+                        tb_logger.scalar("val_difficulty/r_easy", float(bucket_metrics.get("r_easy", 0.0)), global_step)
+                        tb_logger.scalar("val_difficulty/r_mid", float(bucket_metrics.get("r_mid", 0.0)), global_step)
+                        tb_logger.scalar("val_difficulty/r_hard", float(bucket_metrics.get("r_hard", 0.0)), global_step)
+                        tb_logger.scalar("val_difficulty/zero_f1_easy_count", float(bucket_metrics.get("zero_f1_easy_count", 0.0)), global_step)
+                        tb_logger.scalar("val_difficulty/zero_f1_mid_count", float(bucket_metrics.get("zero_f1_mid_count", 0.0)), global_step)
+                        tb_logger.scalar("val_difficulty/zero_f1_hard_count", float(bucket_metrics.get("zero_f1_hard_count", 0.0)), global_step)
                 if args.tb_log_all_classes or args.tb_full_logging:
                     for row in per_class_rows:
                         class_id = int(row["class_id"])
@@ -1038,16 +1939,45 @@ def run_training(args) -> None:
                         val_labels, val_preds, idx2label, topk=int(args.tb_confusion_topk), normalize=True
                     )
                     tb_logger.image("val/confusion_topk", img, global_step, dataformats="HWC")
-                    head_ids = [class_id for class_id, bucket in bucket_by_class.items() if bucket == "head"]
-                    tail_ids = [class_id for class_id, bucket in bucket_by_class.items() if bucket == "tail"]
-                    img_head, _ = build_confusion_image(
-                        val_labels, val_preds, idx2label, topk=int(args.tb_confusion_topk), normalize=True, class_ids=head_ids
+                    secondary_ids = [
+                        class_id
+                        for class_id, bucket in bucket_by_class.items()
+                        if bucket == str(bucket_spec["secondary_bucket"])
+                    ]
+                    focus_ids = [
+                        class_id
+                        for class_id, bucket in bucket_by_class.items()
+                        if bucket == str(bucket_spec["focus_bucket"])
+                    ]
+                    img_secondary, _ = build_confusion_image(
+                        val_labels,
+                        val_preds,
+                        idx2label,
+                        topk=int(args.tb_confusion_topk),
+                        normalize=True,
+                        class_ids=secondary_ids,
                     )
-                    tb_logger.image("val/confusion_head", img_head, global_step, dataformats="HWC")
-                    img_tail, _ = build_confusion_image(
-                        val_labels, val_preds, idx2label, topk=int(args.tb_confusion_topk), normalize=True, class_ids=tail_ids
+                    tb_logger.image(
+                        f"val/confusion_{bucket_spec['secondary_label']}",
+                        img_secondary,
+                        global_step,
+                        dataformats="HWC",
                     )
-                    tb_logger.image("val/confusion_tail", img_tail, global_step, dataformats="HWC")
+                    img_focus, _ = build_confusion_image(
+                        val_labels,
+                        val_preds,
+                        idx2label,
+                        topk=int(args.tb_confusion_topk),
+                        normalize=True,
+                        class_ids=focus_ids,
+                    )
+                    tb_logger.image(
+                        f"val/confusion_{bucket_spec['focus_label']}",
+                        img_focus,
+                        global_step,
+                        dataformats="HWC",
+                    )
+                    tb_logger.image("val/confusion_focus", img_focus, global_step, dataformats="HWC")
                     img_watch, _ = build_confusion_image(
                         val_labels, val_preds, idx2label, topk=int(args.tb_confusion_topk), normalize=True, class_ids=watchlist_ids
                     )
@@ -1066,7 +1996,17 @@ def run_training(args) -> None:
                 tb_logger.text("val/examples", text, global_step)
             if args.tb_log_confusion_pairs or args.tb_full_logging:
                 tb_logger.text("tables/confusion_pairs_top", format_confusion_pairs_text(confusion_pairs_top, max_rows=int(args.tb_tables_k)), global_step)
-                tb_logger.text("tables/confusion_pairs_tail", format_confusion_pairs_text(confusion_pairs_tail, max_rows=int(args.tb_tables_k)), global_step)
+                tb_logger.text(
+                    "tables/confusion_pairs_focus",
+                    format_confusion_pairs_text(confusion_pairs_tail, max_rows=int(args.tb_tables_k)),
+                    global_step,
+                )
+                if bucket_mode == "support":
+                    tb_logger.text(
+                        "tables/confusion_pairs_tail",
+                        format_confusion_pairs_text(confusion_pairs_tail, max_rows=int(args.tb_tables_k)),
+                        global_step,
+                    )
                 tb_logger.text(
                     "tables/confusion_pairs_watchlist",
                     format_confusion_pairs_text(confusion_pairs_watchlist, max_rows=int(args.tb_tables_k)),
@@ -1075,7 +2015,9 @@ def run_training(args) -> None:
             if analysis_artifacts_enabled:
                 tb_logger.text("tables/worst_classes", format_per_class_rows_text(worst_classes_rows, max_rows=int(args.tb_tables_k)), global_step)
                 tb_logger.text("tables/worst_errors", format_prediction_rows_text(worst_error_rows, max_rows=int(args.tb_tables_k)), global_step)
-                tb_logger.text("tables/tail_errors", format_prediction_rows_text(tail_error_rows, max_rows=int(args.tb_tables_k)), global_step)
+                tb_logger.text("tables/focus_errors", format_prediction_rows_text(focus_error_rows, max_rows=int(args.tb_tables_k)), global_step)
+                if bucket_mode == "support":
+                    tb_logger.text("tables/tail_errors", format_prediction_rows_text(focus_error_rows, max_rows=int(args.tb_tables_k)), global_step)
                 tb_logger.text(
                     "tables/biggest_late_drops",
                     format_table_text(
@@ -1107,6 +2049,7 @@ def run_training(args) -> None:
                     "class_id",
                     "label",
                     "bucket",
+                    "bucket_mode",
                     "support_train",
                     "support_val",
                     "precision",
@@ -1190,7 +2133,10 @@ def run_training(args) -> None:
             best_f1 = val_f1
             epochs_no_improve = 0
         else:
-            epochs_no_improve += 1
+            if es_armed:
+                epochs_no_improve += 1
+            else:
+                epochs_no_improve = 0
 
         if analysis_artifacts_enabled:
             epoch_index_rows = analysis_state.setdefault("epoch_index", [])
@@ -1200,11 +2146,12 @@ def run_training(args) -> None:
                     "global_step": int(global_step),
                     "best_f1_so_far": float(best_f1),
                     "event_log_dir": tb_path,
+                    "bucket_mode": bucket_mode,
                 }
             )
             _write_csv(
                 analysis_dir / "epoch_index.csv",
-                ["epoch", "global_step", "best_f1_so_far", "event_log_dir"],
+                ["epoch", "global_step", "best_f1_so_far", "event_log_dir", "bucket_mode"],
                 epoch_index_rows,
             )
 
@@ -1246,7 +2193,7 @@ def run_training(args) -> None:
         with (out_dir / "history.json").open("w", encoding="utf-8") as f:
             json.dump(history, f, ensure_ascii=False, indent=2)
 
-        if es_patience > 0 and epochs_no_improve >= es_patience:
+        if es_armed and epochs_no_improve >= es_patience:
             print(f"Early stopping: no val_f1 improvement for {es_patience} epochs. Best_f1={best_f1:.4f}")
             break
 
@@ -1268,6 +2215,11 @@ def run_training(args) -> None:
                 "use_decoded_skeleton_cache": bool(args.use_decoded_skeleton_cache),
                 "tb_full_logging": bool(args.tb_full_logging),
                 "tb_watchlist_k": int(args.tb_watchlist_k),
+                "tb_bucket_mode": str(args.tb_bucket_mode),
+                "bucket_mode_effective": bucket_mode,
+                "early_stop_patience_effective": int(es_patience),
+                "early_stop_min_delta_effective": float(es_min_delta),
+                "early_stop_start_epoch_effective": int(es_start_epoch),
             },
             {"best_val_f1": float(best_f1)},
         )
