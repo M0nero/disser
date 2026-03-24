@@ -295,6 +295,12 @@ def parse_args():
     p.add_argument("--use_cosine_head", action="store_true")
     p.add_argument("--cosine_margin", type=float, default=0.2)
     p.add_argument("--cosine_scale", type=float, default=30.0)
+    p.add_argument(
+        "--cosine_subcenters",
+        type=int,
+        default=1,
+        help="Number of cosine prototypes per class (1 keeps the original single-center cosine head).",
+    )
 
     # Perf toggles
     p.add_argument("--tf32", action="store_true", help="Enable TF32 (matmul & cudnn)")
@@ -324,6 +330,7 @@ def parse_args():
     args.auto_workers_max = max(0, int(args.auto_workers_max))
     args.auto_workers_warmup_batches = max(1, int(args.auto_workers_warmup_batches))
     args.auto_workers_measure_batches = max(1, int(args.auto_workers_measure_batches))
+    args.cosine_subcenters = max(1, int(args.cosine_subcenters))
     args.supcon_classes_per_batch = max(1, int(args.supcon_classes_per_batch))
     args.supcon_samples_per_class = max(1, int(args.supcon_samples_per_class))
     args.supcon_mixed_repeated_classes = max(1, int(args.supcon_mixed_repeated_classes))

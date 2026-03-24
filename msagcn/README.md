@@ -228,6 +228,22 @@ To delay the auxiliary until later in training, add for example:
 
 Use `--supcon_start_epoch -1` for the default auto mode, which resolves to `warmup_epochs + 1`.
 
+## Sub-Center Cosine Head
+
+If the single-prototype cosine head is too rigid for near-neighbor classes, you can give each
+class a small number of cosine prototypes while keeping the rest of the training pipeline unchanged.
+
+- `--cosine_subcenters 1` keeps the original cosine head
+- `--cosine_subcenters 2` or `3` enables a sub-center cosine classifier
+- logits are reduced by taking the best-matching prototype per class
+
+Example:
+
+```
+python -m msagcn.train --json datasets/skeletons --csv datasets/data/annotations.csv --out outputs/runs/agcn_subcenter \
+  --use_cosine_head --cosine_margin 0.2 --cosine_scale 30 --cosine_subcenters 2
+```
+
 ## Class-Balanced SupCon Batches
 
 Batch-local SupCon can be weak when ordinary random shuffle produces too few repeated labels inside

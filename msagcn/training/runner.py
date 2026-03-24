@@ -1282,6 +1282,7 @@ def run_training(args) -> None:
         use_cosine_head=args.use_cosine_head,
         cosine_margin=args.cosine_margin,
         cosine_scale=args.cosine_scale,
+        cosine_subcenters=args.cosine_subcenters,
     ).to(device)
     if args.channels_last and device.type == "cuda":
         model = model.to(memory_format=torch.channels_last)
@@ -1536,6 +1537,7 @@ def run_training(args) -> None:
             "use_decoded_skeleton_cache": bool(args.use_decoded_skeleton_cache),
             "auto_workers": bool(args.auto_workers),
             "use_supcon": bool(args.use_supcon),
+            "use_cosine_head": bool(args.use_cosine_head),
             "supcon_class_balanced_batch": bool(args.supcon_class_balanced_batch),
             "supcon_mixed_batch": bool(args.supcon_mixed_batch),
             "tb_log_all_classes": bool(args.tb_log_all_classes),
@@ -1568,6 +1570,12 @@ def run_training(args) -> None:
             "mixed_batch": bool(args.supcon_mixed_batch),
             "mixed_repeated_classes": int(args.supcon_mixed_repeated_classes),
             "mixed_repeated_samples": int(args.supcon_mixed_repeated_samples),
+        },
+        "head": {
+            "use_cosine_head": bool(args.use_cosine_head),
+            "cosine_margin": float(args.cosine_margin),
+            "cosine_scale": float(args.cosine_scale),
+            "cosine_subcenters": int(args.cosine_subcenters),
         },
         "auto_workers": {
             "enabled": bool(args.auto_workers),
@@ -2209,6 +2217,7 @@ def run_training(args) -> None:
                 "streams": str(args.streams),
                 "use_logit_adjustment": bool(args.use_logit_adjustment),
                 "use_cosine_head": bool(args.use_cosine_head),
+                "cosine_subcenters": int(args.cosine_subcenters),
                 "use_ctr_hand_refine": bool(args.use_ctr_hand_refine),
                 "ctr_in_stream_encoder": bool(args.ctr_in_stream_encoder),
                 "use_packed_skeleton_cache": bool(args.use_packed_skeleton_cache),

@@ -10,7 +10,7 @@ from .adjacency import _normalize_adjacency, _hand_adjacency_42
 from .attention import AttentionPoolVT, ChannelLayerNorm, NodeAttention, StreamAttention
 from .blocks import GCNBlock, StreamStem
 from .encoder import StreamFeatureEncoder
-from .heads import CosineClassifier
+from .heads import CosineClassifier, SubCenterCosineClassifier
 
 
 class MultiStreamAGCN(nn.Module):
@@ -31,6 +31,7 @@ class MultiStreamAGCN(nn.Module):
         use_cosine_head: bool = False,
         cosine_margin: float = 0.20,
         cosine_scale: float = 30.0,
+        cosine_subcenters: int = 1,
         use_ctr_hand_refine: bool = False,
         ctr_in_stream_encoder: bool = False,
         ctr_groups: int = 4,
@@ -107,7 +108,17 @@ class MultiStreamAGCN(nn.Module):
 
         # head
         if use_cosine_head:
-            self.head = CosineClassifier(depths[-1], num_classes, s=cosine_scale, m=cosine_margin)
+            cosine_subcenters = max(1, int(cosine_subcenters))
+            if cosine_subcenters > 1:
+                self.head = SubCenterCosineClassifier(
+                    depths[-1],
+                    num_classes,
+                    subcenters=cosine_subcenters,
+                    s=cosine_scale,
+                    m=cosine_margin,
+                )
+            else:
+                self.head = CosineClassifier(depths[-1], num_classes, s=cosine_scale, m=cosine_margin)
             self._use_cos = True
         else:
             self.head = nn.Sequential(
