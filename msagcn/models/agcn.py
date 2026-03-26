@@ -32,6 +32,8 @@ class MultiStreamAGCN(nn.Module):
         cosine_margin: float = 0.20,
         cosine_scale: float = 30.0,
         cosine_subcenters: int = 1,
+        use_family_head: bool = False,
+        num_families: int = 0,
         use_ctr_hand_refine: bool = False,
         ctr_in_stream_encoder: bool = False,
         ctr_groups: int = 4,
@@ -104,30 +106,43 @@ class MultiStreamAGCN(nn.Module):
 
         # pooling
         self.pool = AttentionPoolVT(depths[-1])
-        self.embed_norm = nn.LayerNorm(depths[-1])
+        self.feat_dim = int(depths[-1])
+        self.embed_norm = nn.LayerNorm(self.feat_dim)
 
         # head
         if use_cosine_head:
             cosine_subcenters = max(1, int(cosine_subcenters))
             if cosine_subcenters > 1:
                 self.head = SubCenterCosineClassifier(
-                    depths[-1],
+                    self.feat_dim,
                     num_classes,
                     subcenters=cosine_subcenters,
                     s=cosine_scale,
                     m=cosine_margin,
                 )
             else:
-                self.head = CosineClassifier(depths[-1], num_classes, s=cosine_scale, m=cosine_margin)
+                self.head = CosineClassifier(self.feat_dim, num_classes, s=cosine_scale, m=cosine_margin)
             self._use_cos = True
         else:
             self.head = nn.Sequential(
-                nn.Linear(depths[-1], depths[-1]),
+                nn.Linear(self.feat_dim, self.feat_dim),
                 nn.GELU(),
                 nn.Dropout(drop),
-                nn.Linear(depths[-1], num_classes),
+                nn.Linear(self.feat_dim, num_classes),
             )
             self._use_cos = False
+        self.use_family_head = bool(use_family_head and int(num_families) > 0)
+        self.num_families = int(num_families) if self.use_family_head else 0
+        self.family_head = (
+            nn.Sequential(
+                nn.Linear(self.feat_dim, self.feat_dim),
+                nn.GELU(),
+                nn.Dropout(drop),
+                nn.Linear(self.feat_dim, self.num_families),
+            )
+            if self.use_family_head
+            else None
+        )
 
     def _apply_stream_dropout(self, feats: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """Zero-out entire streams during training, keep keys; ensure >=1 stays."""
@@ -144,14 +159,12 @@ class MultiStreamAGCN(nn.Module):
                 feats[s] = feats[s] * 0.0
         return feats
 
-    def forward(
+    def forward_features(
         self,
-        X: Dict[str, torch.Tensor],  # streams -> (B,C,V,T)
-        mask: Optional[torch.Tensor] = None,  # (B,1,V,T)
-        A: Optional[torch.Tensor] = None,  # (V,V) or (K,V,V)
-        y: Optional[torch.Tensor] = None,
-        return_features: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        X: Dict[str, torch.Tensor],
+        mask: Optional[torch.Tensor] = None,
+        A: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         assert isinstance(X, dict) and len(X) > 0, "X must be dict of streams"
         X = {k: v for k, v in X.items() if k in self.streams}
         if len(X) == 0:
@@ -180,9 +193,36 @@ class MultiStreamAGCN(nn.Module):
                 cur_mask = F.interpolate(cur_mask.float(), size=(cur_mask.shape[2], y_feat.shape[-1]), mode="nearest")
 
         g = self.pool(y_feat, cur_mask)  # (B,C)
-        g = self.embed_norm(g)
-        out = self.head(g, y) if self._use_cos else self.head(g)
-        out = torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+        return self.embed_norm(g)
+
+    def forward_logits(self, features: torch.Tensor, y: Optional[torch.Tensor] = None) -> torch.Tensor:
+        out = self.head(features, y) if self._use_cos else self.head(features)
+        return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def forward_family_logits(self, features: torch.Tensor) -> Optional[torch.Tensor]:
+        if self.family_head is None:
+            return None
+        out = self.family_head(features)
+        return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def forward(
+        self,
+        X: Dict[str, torch.Tensor],  # streams -> (B,C,V,T)
+        mask: Optional[torch.Tensor] = None,  # (B,1,V,T)
+        A: Optional[torch.Tensor] = None,  # (V,V) or (K,V,V)
+        y: Optional[torch.Tensor] = None,
+        return_features: bool = False,
+        return_dict: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | dict[str, torch.Tensor]:
+        g = self.forward_features(X, mask=mask, A=A)
+        out = self.forward_logits(g, y=y)
+        family_logits = self.forward_family_logits(g) if (return_dict and self.use_family_head) else None
+        if return_dict:
+            return {
+                "logits": out,
+                "features": g,
+                "family_logits": family_logits,
+            }
         if return_features:
             return out, g
         return out

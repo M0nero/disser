@@ -3,7 +3,7 @@
     "skeletons": "datasets/skeletons/Slovo",
     "csv": "datasets/data/annotations.csv",
     "split": "train",
-    "out": "outputs/bio_out/prelabels_slovo_train",
+    "out": "outputs/bio_out_v2/prelabels_slovo_train",
     "num_workers": 8,
     "include_pose": false,
     "pose_keep": "0,9,10,11,12,13,14,15,16,23,24",
@@ -14,12 +14,14 @@
     "prefer_pp": true
   },
   "synth_build": {
-    "prelabel_dir": "outputs/bio_out/prelabels_slovo_train",
-    "extra_noev_prelabel_dir": [
-      "outputs/bio_out/prelabels_slovo_noev_train",
-      "outputs/ipnhand/prelabels_no_event"
+    "prelabel_dir": "outputs/bio_out_v2/prelabels_slovo_train",
+    "preferred_noev_prelabel_dir": [
+      "outputs/bio_out_v2/prelabels_slovo_noev_train"
     ],
-    "out_dir": "outputs/bio_out/synth_train",
+    "extra_noev_prelabel_dir": [
+      "outputs/ipnhand/prelabels_train"
+    ],
+    "out_dir": "outputs/bio_out_v2/synth_train",
     "num_samples": 100000,
     "seq_len": 256,
     "shard_size": 256,
@@ -27,22 +29,49 @@
     "max_signs": 6,
     "gap_min": 0,
     "gap_max": 20,
+    "include_sign_tails_as_noev": true,
+    "min_tail_len": 4,
+    "primary_noev_prob": 0.9,
+    "source_sampling": "uniform_source",
+    "sign_sampling": "uniform_label_source",
+    "stitch_noev_chunks": true,
     "blend_prob": 0.25,
     "seed": 1337
   },
   "train": {
-    "train_dir": "outputs/bio_out/synth_train",
-    "val_dir": "outputs/bio_out/synth_val",
-    "out_dir": "outputs/runs/bio_gru_v1",
-    "epochs": 15,
-    "batch_size": 64,
+    "train_dir": "outputs/bio_out_v2/synth_train",
+    "val_dir": "outputs/bio_out_v2/synth_val",
+    "out_dir": "outputs/runs/bio_gru_v2",
+    "epochs": 40,
+    "batch_size": 256,
+    "auto_workers": true,
+    "auto_workers_max": 28,
+    "train_shard_cache_items": 8,
+    "val_shard_cache_items": 2,
+    "console_log_format": "text",
+    "use_prefetch_loader": true,
+    "channels_last": false,
+    "compile": false,
     "lr": 0.002,
+    "warmup_frac": 0.1,
+    "ema_decay": 0.999,
+    "balanced_lambda_len": 0.1,
+    "balanced_lambda_trans": 0.75,
+    "balanced_lambda_berr": 0.05,
+    "balanced_lambda_bio_violation": 1.0,
+    "early_stop_patience": 5,
+    "early_stop_min_delta": 0.001,
+    "early_stop_armed_epoch": 0,
+    "label_smoothing": 0.0,
     "weight_decay": 0.0001,
     "grad_clip": 1.0,
     "p_with_b": 0.7,
     "wO": 1.0,
     "wB": 25.0,
     "wI": 4.0,
-    "num_workers": 24
+    "num_workers": 24,
+    "save_every_epochs": 5,
+    "save_analysis_artifacts": true,
+    "prediction_artifacts_every": 5
   }
 }

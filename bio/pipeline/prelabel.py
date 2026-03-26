@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
+import re
 import sys
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -16,7 +18,7 @@ import torch.nn.functional as F
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from bio.core.config_utils import load_config_section, write_run_config
+from bio.core.config_utils import load_config_section, write_dataset_manifest, write_run_config
 
 NUM_HAND_JOINTS = 21
 NUM_HAND_NODES = 42
@@ -74,6 +76,28 @@ class PrelabelConfig:
     min_valid_frames: int = 8
     file_cache_size: int = 0
     prefer_pp: bool = True
+
+
+@dataclass(frozen=True)
+class CsvSample:
+    vid: str
+    label_str: str
+    begin: int
+    end: int
+    split: str
+    dataset: str
+    source_group: str
+    sample_id: str
+    row_num: int
+
+
+@dataclass(frozen=True)
+class CsvParseResult:
+    rows: Tuple[CsvSample, ...]
+    rejected: Tuple[Dict[str, Any], ...]
+    skipped_split: int
+    total_rows: int
+    columns: Tuple[str, ...]
 
 
 class VideoStore:
@@ -170,8 +194,64 @@ def _is_missing(raw: Any) -> bool:
     return False
 
 
-def parse_csv(csv_path: Path, split: str) -> List[Tuple[str, str, int, int]]:
-    rows: List[Tuple[str, str, int, int]] = []
+def _slugify(text: str, *, max_len: int = 80) -> str:
+    clean = re.sub(r"[^A-Za-z0-9._-]+", "_", str(text or "").strip())
+    clean = clean.strip("._-")
+    if not clean:
+        clean = "sample"
+    return clean[:max_len]
+
+
+def _stable_sample_id(vid: str, label: str, begin: int, end: int) -> str:
+    digest = hashlib.sha1(f"{vid}|{begin}|{end}|{label}".encode("utf-8")).hexdigest()[:10]
+    return f"{_slugify(vid)}__{int(begin)}_{int(end)}__{digest}"
+
+
+def _norm_split_name(raw: Any) -> str:
+    val = str(raw or "").strip().lower()
+    if val == "test":
+        return "val"
+    return val
+
+
+def _parse_required_int(raw: Any, field: str) -> int:
+    if _is_missing(raw):
+        raise ValueError(f"missing_{field}")
+    try:
+        return int(float(raw))
+    except Exception as exc:
+        raise ValueError(f"invalid_{field}") from exc
+
+
+def _resolve_row_split(row: Dict[str, Any], split: str) -> Tuple[bool, Optional[str]]:
+    split = _norm_split_name(split)
+    raw_split = _norm_split_name(row.get("split"))
+    raw_train = row.get("train") or row.get("is_train")
+    if raw_split:
+        return raw_split == split, None
+    if raw_train is not None and str(raw_train).strip():
+        bt = _as_bool(str(raw_train))
+        if bt is None:
+            return str(raw_train).strip().lower() == split, None
+        return (bt if split == "train" else (not bt)), None
+    return False, "missing_split_value"
+
+
+def _validate_csv_schema(fieldnames: Sequence[str] | None) -> None:
+    fields = {str(name or "").strip() for name in (fieldnames or [])}
+    required = {"attachment_id", "text", "begin", "end"}
+    missing = sorted(x for x in required if x not in fields)
+    if missing:
+        raise RuntimeError(f"CSV is missing required columns: {', '.join(missing)}")
+    if "split" not in fields and "train" not in fields and "is_train" not in fields:
+        raise RuntimeError("CSV must contain either 'split' or 'train'/'is_train' columns.")
+
+
+def parse_csv(csv_path: Path, split: str) -> CsvParseResult:
+    rows: List[CsvSample] = []
+    rejected: List[Dict[str, Any]] = []
+    skipped_split = 0
+    total_rows = 0
     with csv_path.open("r", encoding="utf-8-sig", newline="") as f:
         sample = f.read(4096)
         f.seek(0)
@@ -188,53 +268,141 @@ def parse_csv(csv_path: Path, split: str) -> List[Tuple[str, str, int, int]]:
             dialect = _D()
 
         rdr = csv.DictReader(f, dialect=dialect)
-        for row in rdr:
-            use = True
-            raw_split = (row.get("split") or "").strip()
-            raw_train = row.get("train") or row.get("is_train")
+        _validate_csv_schema(rdr.fieldnames)
+        columns = tuple(str(x) for x in (rdr.fieldnames or []))
+        seen_sample_ids: set[str] = set()
 
-            if raw_split:
-                use = (raw_split.strip().lower() == split)
-            elif raw_train is not None:
-                bt = _as_bool(str(raw_train))
-                if bt is None:
-                    use = (str(raw_train).strip().lower() == split)
-                else:
-                    use = (bt if split == "train" else (not bt))
-
+        for row_num, row in enumerate(rdr, start=2):
+            total_rows += 1
+            use, split_reason = _resolve_row_split(row, split)
+            if split_reason is not None:
+                rejected.append(
+                    {
+                        "row_num": int(row_num),
+                        "reason": split_reason,
+                        "attachment_id": row.get("attachment_id", ""),
+                        "text": row.get("text", ""),
+                    }
+                )
+                continue
             if not use:
+                skipped_split += 1
                 continue
 
             vid_raw = (row.get("attachment_id") or "").strip()
             if not vid_raw:
+                rejected.append(
+                    {
+                        "row_num": int(row_num),
+                        "reason": "missing_attachment_id",
+                        "text": row.get("text", ""),
+                    }
+                )
                 continue
             vid = Path(vid_raw).stem
             if not vid:
+                rejected.append(
+                    {
+                        "row_num": int(row_num),
+                        "reason": "invalid_attachment_id",
+                        "attachment_id": vid_raw,
+                    }
+                )
                 continue
 
             label = (row.get("text") or "").strip()
             if not label:
+                rejected.append(
+                    {
+                        "row_num": int(row_num),
+                        "reason": "missing_label",
+                        "attachment_id": vid_raw,
+                    }
+                )
                 continue
 
             try:
-                begin = int(float(row.get("begin") or 0))
-            except Exception:
-                begin = 0
-            try:
-                end = int(float(row.get("end") or 0))
-            except Exception:
-                end = 0
+                begin = _parse_required_int(row.get("begin"), "begin")
+                end = _parse_required_int(row.get("end"), "end")
+            except ValueError as exc:
+                rejected.append(
+                    {
+                        "row_num": int(row_num),
+                        "reason": str(exc),
+                        "attachment_id": vid_raw,
+                        "text": label,
+                        "begin": row.get("begin"),
+                        "end": row.get("end"),
+                    }
+                )
+                continue
+            if begin < 0 or end < 0:
+                rejected.append(
+                    {
+                        "row_num": int(row_num),
+                        "reason": "negative_clip_bounds",
+                        "attachment_id": vid_raw,
+                        "text": label,
+                        "begin": begin,
+                        "end": end,
+                    }
+                )
+                continue
             if end <= begin:
-                end = 0
+                rejected.append(
+                    {
+                        "row_num": int(row_num),
+                        "reason": "invalid_clip_range",
+                        "attachment_id": vid_raw,
+                        "text": label,
+                        "begin": begin,
+                        "end": end,
+                    }
+                )
+                continue
 
-            rows.append((vid, label, begin, end))
+            sample_id = _stable_sample_id(vid, label, begin, end)
+            if sample_id in seen_sample_ids:
+                rejected.append(
+                    {
+                        "row_num": int(row_num),
+                        "reason": "duplicate_sample_id",
+                        "attachment_id": vid_raw,
+                        "text": label,
+                        "begin": begin,
+                        "end": end,
+                        "sample_id": sample_id,
+                    }
+                )
+                continue
+            seen_sample_ids.add(sample_id)
+
+            rows.append(
+                CsvSample(
+                    vid=vid,
+                    label_str=label,
+                    begin=begin,
+                    end=end,
+                    split=split,
+                    dataset="slovo",
+                    source_group=vid,
+                    sample_id=sample_id,
+                    row_num=int(row_num),
+                )
+            )
 
     if not rows:
         raise RuntimeError(
             "No samples for split after CSV filtering. "
-            "Check delimiter, column names, and split/train flags."
+            "Check delimiter, column names, split/train flags, and rejected_rows.json."
         )
-    return rows
+    return CsvParseResult(
+        rows=tuple(rows),
+        rejected=tuple(rejected),
+        skipped_split=int(skipped_split),
+        total_rows=int(total_rows),
+        columns=columns,
+    )
 
 
 def build_mirror_idx(include_pose: bool, pose_keep: Sequence[int]) -> np.ndarray:
@@ -702,6 +870,9 @@ def process_sample(
     begin_hint = int(task["begin"])
     end_hint = int(task["end"])
     out_path = Path(task["out_path"])
+    split = str(task.get("split", ""))
+    dataset = str(task.get("dataset", "slovo"))
+    source_group = str(task.get("source_group", vid))
 
     frames, meta = store.get_frames(vid)
     if not frames:
@@ -715,6 +886,9 @@ def process_sample(
             "error": "no_frames",
             "vid": vid,
             "sample_id": sample_id,
+            "split": split,
+            "dataset": dataset,
+            "source_group": source_group,
             "begin_hint": begin_hint,
             "end_hint": end_hint,
         }
@@ -728,6 +902,9 @@ def process_sample(
                 "start_idx": -1,
                 "end_idx": -1,
                 "is_no_event": bool(label_str.strip().lower() == "no_event"),
+                "split": split,
+                "dataset": dataset,
+                "source_group": source_group,
             },
             "stats": {
                 "segment_len": 0,
@@ -788,6 +965,9 @@ def process_sample(
         "end_hint": int(end_hint),
         "clip_begin": int(begin),
         "clip_end": int(end),
+        "split": split,
+        "dataset": dataset,
+        "source_group": source_group,
         "coords": meta.get("coords", ""),
         "include_pose": bool(cfg.include_pose),
         "pose_keep": list(cfg.pose_keep),
@@ -835,6 +1015,9 @@ def process_sample(
             "start_idx": int(start_idx),
             "end_idx": int(end_idx),
             "is_no_event": bool(is_no_event),
+            "split": split,
+            "dataset": dataset,
+            "source_group": source_group,
         },
         "stats": {
             "segment_len": seg_len,
@@ -873,12 +1056,30 @@ def write_index_files(out_dir: Path, rows: List[Dict[str, Any]]) -> None:
 
     index_csv = out_dir / "index.csv"
     if rows:
-        fields = ["vid", "label_str", "path_to_npz", "T_total", "start_idx", "end_idx", "is_no_event"]
+        fields = ["vid", "label_str", "path_to_npz", "T_total", "start_idx", "end_idx", "is_no_event", "split", "dataset", "source_group"]
         with index_csv.open("w", encoding="utf-8", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fields)
             writer.writeheader()
             for row in rows:
                 writer.writerow({k: row.get(k) for k in fields})
+
+
+def write_csv_audit(out_dir: Path, parsed: CsvParseResult) -> Dict[str, Any]:
+    reason_counts = Counter(str(item.get("reason", "unknown")) for item in parsed.rejected)
+    audit = {
+        "total_rows": int(parsed.total_rows),
+        "accepted_rows": int(len(parsed.rows)),
+        "skipped_split": int(parsed.skipped_split),
+        "rejected_rows": int(len(parsed.rejected)),
+        "rejected_reason_counts": dict(sorted(reason_counts.items())),
+        "columns": list(parsed.columns),
+    }
+    (out_dir / "csv_audit.json").write_text(json.dumps(audit, ensure_ascii=True, indent=2), encoding="utf-8")
+    (out_dir / "rejected_rows.json").write_text(
+        json.dumps(list(parsed.rejected), ensure_ascii=True, indent=2),
+        encoding="utf-8",
+    )
+    return audit
 
 
 def build_len_hist(lengths: List[int]) -> Dict[str, int]:
@@ -893,17 +1094,27 @@ def build_len_hist(lengths: List[int]) -> Dict[str, int]:
     return hist
 
 
-def write_summary(out_dir: Path, stats: List[Dict[str, Any]]) -> Dict[str, Any]:
+def write_summary(
+    out_dir: Path,
+    stats: List[Dict[str, Any]],
+    *,
+    split: str,
+    dataset: str,
+    csv_audit: Dict[str, Any],
+) -> Dict[str, Any]:
     total = len(stats)
     no_event = sum(1 for s in stats if s["is_no_event"])
     fallback = sum(1 for s in stats if s["used_fallback"])
     no_valid = sum(1 for s in stats if s["valid_frames"] == 0)
     lengths = [s["segment_len"] for s in stats if s["segment_len"] > 0]
     summary: Dict[str, Any] = {
+        "dataset": dataset,
+        "split": split,
         "total": total,
         "no_event": {"count": no_event, "frac": no_event / total if total else 0.0},
         "fallback": {"count": fallback, "frac": fallback / total if total else 0.0},
         "no_valid_hands": {"count": no_valid, "frac": no_valid / total if total else 0.0},
+        "csv_audit": csv_audit,
         "segment_len": {
             "count": len(lengths),
             "mean": float(np.mean(lengths)) if lengths else 0.0,
@@ -990,12 +1201,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[List[str]] = None) -> None:
     args = parse_args(argv)
-    split = args.split.strip().lower()
+    split = _norm_split_name(args.split)
     skeletons_path = Path(args.skeletons)
     csv_path = Path(args.csv)
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
-    write_run_config(out_dir, args, config_path=args.config, section="prelabel")
 
     if not skeletons_path.exists():
         raise FileNotFoundError(skeletons_path)
@@ -1030,11 +1240,27 @@ def main(argv: Optional[List[str]] = None) -> None:
         prefer_pp=args.prefer_pp,
     )
 
-    samples = parse_csv(csv_path, split)
+    parsed = parse_csv(csv_path, split)
     if args.debug_vid:
-        samples = [s for s in samples if s[0] == args.debug_vid]
-        if not samples:
+        debug_rows = [s for s in parsed.rows if s.vid == args.debug_vid or s.source_group == args.debug_vid]
+        if not debug_rows:
             raise RuntimeError(f"No samples found for debug_vid={args.debug_vid}")
+        parsed = CsvParseResult(
+            rows=tuple(debug_rows),
+            rejected=parsed.rejected,
+            skipped_split=parsed.skipped_split,
+            total_rows=parsed.total_rows,
+            columns=parsed.columns,
+        )
+
+    csv_audit = write_csv_audit(out_dir, parsed)
+    write_run_config(
+        out_dir,
+        args,
+        config_path=args.config,
+        section="prelabel",
+        extra={"prelabel_cfg": asdict(cfg), "csv_audit": csv_audit},
+    )
 
     store = VideoStore(skeletons_path, cache_size=cfg.file_cache_size, prefer_pp=cfg.prefer_pp)
     mirror_idx = build_mirror_idx(cfg.include_pose, cfg.pose_keep)
@@ -1048,14 +1274,12 @@ def main(argv: Optional[List[str]] = None) -> None:
         args.num_workers = 0
 
     tasks: List[Dict[str, Any]] = []
-    seen: Dict[str, int] = {}
-    for idx, (vid, label_str, begin, end) in enumerate(samples):
-        count = seen.get(vid, 0)
-        if count == 0:
-            sample_id = vid
-        else:
-            sample_id = f"{vid}__{count}"
-        seen[vid] = count + 1
+    for sample in parsed.rows:
+        vid = sample.vid
+        label_str = sample.label_str
+        begin = sample.begin
+        end = sample.end
+        sample_id = sample.sample_id
         out_path = out_dir / f"{sample_id}.npz"
         tasks.append(
             {
@@ -1064,6 +1288,9 @@ def main(argv: Optional[List[str]] = None) -> None:
                 "label_str": label_str,
                 "begin": begin,
                 "end": end,
+                "split": sample.split,
+                "dataset": sample.dataset,
+                "source_group": sample.source_group,
                 "out_path": str(out_path),
                 "debug": bool(args.debug_vid),
             }
@@ -1093,11 +1320,32 @@ def main(argv: Optional[List[str]] = None) -> None:
             if args.log_every and (i % args.log_every == 0):
                 print(f"Processed {i}/{len(tasks)}")
 
+    index_rows.sort(key=lambda item: str(item.get("path_to_npz", "")))
     write_index_files(out_dir, index_rows)
-    summary = write_summary(out_dir, stats_rows)
-
-    with (out_dir / "prelabel_config.json").open("w", encoding="utf-8") as f:
-        json.dump(asdict(cfg), f, ensure_ascii=True, indent=2)
+    summary = write_summary(out_dir, stats_rows, split=split, dataset="slovo", csv_audit=csv_audit)
+    write_dataset_manifest(
+        out_dir,
+        stage="prelabel",
+        args=args,
+        config_path=args.config,
+        section="prelabel",
+        inputs={
+            "skeletons": str(skeletons_path),
+            "csv": str(csv_path),
+        },
+        counts={
+            "accepted_rows": int(len(parsed.rows)),
+            "rejected_rows": int(len(parsed.rejected)),
+            "skipped_split": int(parsed.skipped_split),
+            "written_samples": int(len(index_rows)),
+            "split": split,
+        },
+        extra={
+            "dataset": "slovo",
+            "csv_audit": csv_audit,
+            "summary": summary,
+        },
+    )
 
     print("Done.")
     print(json.dumps(summary, ensure_ascii=True, indent=2))

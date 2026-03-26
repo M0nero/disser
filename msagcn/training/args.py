@@ -4,7 +4,7 @@ import argparse
 import os
 
 
-def parse_args():
+def parse_args(argv: list[str] | None = None):
     p = argparse.ArgumentParser("Train Multi-Stream AGCN (max F1)")
 
     # Data
@@ -221,6 +221,35 @@ def parse_args():
         default=-1,
         help="Start applying the supervised contrastive auxiliary from this 1-based epoch (-1 = auto after warmup, 0 = from epoch 1).",
     )
+    p.add_argument("--use_family_head", action="store_true", help="Enable an auxiliary family-classification head on top of pooled features")
+    p.add_argument("--family_map", type=str, default="", help="Path to a train-only family_map.json")
+    p.add_argument("--family_loss_weight", type=float, default=0.25, help="Weight for the auxiliary family classification loss")
+    p.add_argument("--family_warmup_epochs", type=int, default=0, help="Delay family supervision for the first N epochs")
+    p.add_argument("--family_label_smoothing", type=float, default=0.0, help="Label smoothing for the family classification loss")
+    p.add_argument("--num_families", type=int, default=0, help="Expected number of families (0 = infer from family_map)")
+    p.add_argument("--family_eval", action="store_true", help="Log validation family metrics when the auxiliary family head is enabled")
+    p.add_argument("--head_only_rebalance_epochs", type=int, default=0, help="Optional second-stage epochs that freeze the backbone and train only the class head")
+    p.add_argument("--head_only_rebalance_lr", type=float, default=1e-4, help="Learning rate for the optional classifier-only rebalance stage")
+    p.add_argument(
+        "--head_only_rebalance_only",
+        action="store_true",
+        help="Skip the main training loop and run only the classifier-only rebalance stage from the resumed checkpoint.",
+    )
+    p.add_argument(
+        "--auto_head_only_rebalance_stop",
+        action="store_true",
+        help="Enable early stopping inside the optional classifier-only rebalance stage; --head_only_rebalance_epochs stays the maximum cap.",
+    )
+    p.add_argument(
+        "--head_only_rebalance_use_logit_adjustment",
+        action="store_true",
+        help="Use logit-adjusted CE during the optional classifier-only rebalance stage",
+    )
+    p.add_argument(
+        "--head_only_rebalance_weighted_sampler",
+        action="store_true",
+        help="Use the legacy weighted sampler during the optional classifier-only rebalance stage",
+    )
     # Dataset I/O perf
     p.add_argument("--file_cache", type=int, default=64, help="small per-dataset file cache for per-video JSON (0=off)")
     p.add_argument(
@@ -311,7 +340,7 @@ def parse_args():
     # Prior & TTA
     p.add_argument("--tta_mirror", action="store_true")
 
-    args = p.parse_args()
+    args = p.parse_args(args=argv)
     if args.tb_full_logging:
         if not args.tensorboard:
             p.error("--tb_full_logging requires --tensorboard")
@@ -331,6 +360,14 @@ def parse_args():
     args.auto_workers_warmup_batches = max(1, int(args.auto_workers_warmup_batches))
     args.auto_workers_measure_batches = max(1, int(args.auto_workers_measure_batches))
     args.cosine_subcenters = max(1, int(args.cosine_subcenters))
+    args.family_loss_weight = max(0.0, float(args.family_loss_weight))
+    args.family_warmup_epochs = max(0, int(args.family_warmup_epochs))
+    args.family_label_smoothing = float(min(max(args.family_label_smoothing, 0.0), 0.999))
+    args.num_families = max(0, int(args.num_families))
+    args.head_only_rebalance_epochs = max(0, int(args.head_only_rebalance_epochs))
+    args.head_only_rebalance_lr = max(0.0, float(args.head_only_rebalance_lr))
+    if args.head_only_rebalance_only and args.head_only_rebalance_epochs <= 0:
+        p.error("--head_only_rebalance_only requires --head_only_rebalance_epochs > 0")
     args.supcon_classes_per_batch = max(1, int(args.supcon_classes_per_batch))
     args.supcon_samples_per_class = max(1, int(args.supcon_samples_per_class))
     args.supcon_mixed_repeated_classes = max(1, int(args.supcon_mixed_repeated_classes))
@@ -357,4 +394,8 @@ def parse_args():
                 "--supcon_mixed_repeated_classes * --supcon_mixed_repeated_samples <= --batch "
                 f"(got {args.supcon_mixed_repeated_classes} * {args.supcon_mixed_repeated_samples} = {repeated_total}, batch={args.batch})"
             )
+    if args.use_family_head and not args.family_map:
+        p.error("--use_family_head requires --family_map")
+    if args.family_eval and not args.use_family_head:
+        p.error("--family_eval requires --use_family_head")
     return args

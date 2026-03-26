@@ -11,8 +11,10 @@
   },
   "ipn_prelabel": {
     "manifest": "outputs/ipnhand/manifests/ipn_d0x_manifest.jsonl",
-    "skeleton_npz_dir": "datasets/ipnhand/segments_npz",
-    "out_dir": "outputs/ipnhand/prelabels_no_event",
-    "expect_V": 42
+    "segments_dir": "datasets/skeletons/ipnhand",
+    "out_dir": "outputs/ipnhand/prelabels_train",
+    "split": "train",
+    "expect_V": 42,
+    "prefer_pp": true
   }
 }

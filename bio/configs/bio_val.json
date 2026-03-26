@@ -1,17 +1,26 @@
 {
   "synth_build": {
-    "prelabel_dir": "outputs/bio_out/prelabels_slovo_val",
-    "extra_noev_prelabel_dir": [
-      "outputs/bio_out/prelabels_slovo_noev_val"
+    "prelabel_dir": "outputs/bio_out_v2/prelabels_slovo_val",
+    "preferred_noev_prelabel_dir": [
+      "outputs/bio_out_v2/prelabels_slovo_noev_val"
     ],
-    "out_dir": "outputs/bio_out/synth_val",
-    "num_samples": 20000,
+    "extra_noev_prelabel_dir": [
+      "outputs/ipnhand/prelabels_val"
+    ],
+    "out_dir": "outputs/bio_out_v2/synth_val",
+    "num_samples": 10000,
     "seq_len": 256,
     "shard_size": 256,
     "min_signs": 2,
     "max_signs": 6,
     "gap_min": 0,
     "gap_max": 20,
+    "include_sign_tails_as_noev": true,
+    "min_tail_len": 4,
+    "primary_noev_prob": 0.9,
+    "source_sampling": "uniform_source",
+    "sign_sampling": "uniform_label_source",
+    "stitch_noev_chunks": true,
     "blend_prob": 0.25,
     "seed": 1337
   }

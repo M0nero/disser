@@ -54,6 +54,8 @@ opt_einsum==3.4.0
 orjson==3.11.4
 packaging==25.0
 pandas==2.2.3
+pyarrow==18.1.0
+PySide6==6.8.2.1
 parso==0.8.5
 pillow==11.2.1
 platformdirs==4.5.0

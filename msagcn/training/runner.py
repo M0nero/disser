@@ -7,6 +7,7 @@ import os
 import shutil
 import time
 from collections import Counter
+from copy import deepcopy
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Iterable
@@ -25,6 +26,7 @@ from utils.tensorboard_logger import TensorboardLogger
 
 from .ema import ModelEma
 from .engine import evaluate, train_one_epoch
+from .family_utils import build_class_to_family_tensor, load_family_map
 from .losses import LogitAdjustedCrossEntropyLoss, SupervisedContrastiveLoss
 from .metrics import (
     _sanitize_label,
@@ -49,6 +51,7 @@ from .auto_workers import (
     resolve_loader_profile,
     save_auto_workers_record,
 )
+from .args import parse_args as _parse_train_args
 
 
 def _load_history_file(path: Path) -> list[dict]:
@@ -60,6 +63,38 @@ def _load_history_file(path: Path) -> list[dict]:
         print(f"Warning: failed to read history file {path}: {exc}")
         return []
     return data if isinstance(data, list) else []
+
+
+def _unwrap_model(model: nn.Module) -> nn.Module:
+    return model._orig_mod if hasattr(model, "_orig_mod") else model
+
+
+def _set_requires_grad(module: nn.Module | None, enabled: bool) -> None:
+    if module is None:
+        return
+    for param in module.parameters():
+        param.requires_grad = bool(enabled)
+
+
+def _configure_head_only_rebalance_trainables(model: nn.Module) -> list[str]:
+    base_model = _unwrap_model(model)
+    for param in base_model.parameters():
+        param.requires_grad = False
+    _set_requires_grad(getattr(base_model, "head", None), True)
+    _set_requires_grad(getattr(base_model, "family_head", None), False)
+    return ["head"]
+
+
+def _resolve_head_only_rebalance_auto_stop(max_epochs: int) -> tuple[int, float]:
+    max_epochs = max(1, int(max_epochs))
+    patience = int(min(3, max(2, int(np.ceil(float(max_epochs) / 3.0)))))
+    min_delta = float(np.clip(0.001 * np.sqrt(5.0 / float(max_epochs)), 5e-4, 2e-3))
+    return patience, min_delta
+
+
+def _load_checkpoint_model_for_eval(model: nn.Module, ckpt_payload: dict[str, Any], *, prefer_ema: bool = True) -> None:
+    state = ckpt_payload.get("ema_state") if prefer_ema and ckpt_payload.get("ema_state") is not None else ckpt_payload["model_state"]
+    model.load_state_dict(state, strict=True)
 
 
 def _optimizer_to_device(optimizer: optim.Optimizer, device: torch.device) -> None:
@@ -801,6 +836,249 @@ def _benchmark_train_loader_profile(
     return result
 
 
+def _run_head_only_rebalance_stage(
+    *,
+    model: nn.Module,
+    out_dir: Path,
+    analysis_dir: Path,
+    train_ds: MultiStreamGestureDataset,
+    val_loader,
+    label2idx: dict[str, int],
+    weights_tensor: torch.Tensor,
+    args,
+    profile: LoaderProfile,
+    device: torch.device,
+    A: torch.Tensor,
+    mirror_idx: torch.Tensor | None,
+    train_support: np.ndarray,
+    global_step: int,
+    use_amp: bool,
+    amp_dtype: torch.dtype,
+    tb_logger: TensorboardLogger | None,
+) -> tuple[dict[str, Any], int]:
+    summary: dict[str, Any] = {
+        "enabled": bool(args.head_only_rebalance_epochs > 0),
+        "epochs": int(args.head_only_rebalance_epochs),
+        "lr": float(args.head_only_rebalance_lr),
+        "auto_stop_enabled": bool(args.auto_head_only_rebalance_stop),
+        "auto_stop_patience": 0,
+        "auto_stop_min_delta": 0.0,
+        "use_logit_adjustment": bool(args.head_only_rebalance_use_logit_adjustment),
+        "weighted_sampler": bool(args.head_only_rebalance_weighted_sampler),
+        "skipped_reason": "",
+        "best_val_f1": 0.0,
+        "best_epoch": 0,
+        "epochs_ran": 0,
+        "stopped_early": False,
+        "stop_reason": "",
+        "history_path": "",
+        "best_ckpt_path": "",
+        "last_ckpt_path": "",
+    }
+    if int(args.head_only_rebalance_epochs) <= 0:
+        return summary, int(global_step)
+
+    best_ckpt_path = out_dir / "best.ckpt"
+    if not best_ckpt_path.exists():
+        summary["skipped_reason"] = f"missing {best_ckpt_path.name}"
+        return summary, int(global_step)
+
+    ckpt_payload = torch.load(best_ckpt_path, map_location="cpu", weights_only=False)
+    _load_checkpoint_model_for_eval(model, ckpt_payload, prefer_ema=True)
+    _configure_head_only_rebalance_trainables(model)
+    trainable_params = [param for param in model.parameters() if param.requires_grad]
+    if not trainable_params:
+        summary["skipped_reason"] = "no trainable class-head parameters found"
+        return summary, int(global_step)
+
+    rebalance_args = deepcopy(args)
+    rebalance_args.weighted_sampler = bool(args.head_only_rebalance_weighted_sampler)
+    rebalance_args.supcon_class_balanced_batch = False
+    rebalance_args.supcon_mixed_batch = False
+    train_loader = None
+    base_loader = None
+    rebalance_batch_sampler = None
+    try:
+        train_loader, base_loader, rebalance_batch_sampler = _build_train_loader(
+            train_ds=train_ds,
+            label2idx=label2idx,
+            weights_tensor=weights_tensor,
+            args=rebalance_args,
+            profile=profile,
+            device=device,
+            benchmark=False,
+        )
+
+        cls_counts = np.bincount([label2idx[lbl] for _, lbl, *_ in train_ds.samples], minlength=len(label2idx))
+        cls_counts = np.maximum(cls_counts, 1)
+        cls_counts = torch.tensor(cls_counts, dtype=torch.float32, device=device)
+        if args.head_only_rebalance_use_logit_adjustment:
+            criterion = LogitAdjustedCrossEntropyLoss(cls_counts)
+        else:
+            smoothing = max(0.0, float(args.label_smoothing))
+            criterion = nn.CrossEntropyLoss(label_smoothing=smoothing if smoothing > 0 else 0.0)
+
+        optimizer = optim.AdamW(trainable_params, lr=float(args.head_only_rebalance_lr), weight_decay=float(args.wd))
+        sched = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, int(args.head_only_rebalance_epochs)))
+        scaler = amp.GradScaler("cuda") if use_amp else amp.GradScaler(enabled=False)
+
+        history: list[dict[str, Any]] = []
+        best_stage_f1 = -1.0
+        best_stage_epoch = 0
+        auto_stop_enabled = bool(args.auto_head_only_rebalance_stop)
+        auto_stop_patience, auto_stop_min_delta = _resolve_head_only_rebalance_auto_stop(int(args.head_only_rebalance_epochs))
+        summary["auto_stop_patience"] = int(auto_stop_patience)
+        summary["auto_stop_min_delta"] = float(auto_stop_min_delta)
+        epochs_no_improve = 0
+        best_stage_ckpt_path = out_dir / "best_rebalance.ckpt"
+        last_stage_ckpt_path = out_dir / "last_rebalance.ckpt"
+        history_path = out_dir / "history_rebalance.json"
+
+        print(
+            "Starting head-only rebalance stage: "
+            f"epochs={int(args.head_only_rebalance_epochs)} | lr={float(args.head_only_rebalance_lr):.2e} | "
+            f"logit_adjustment={int(bool(args.head_only_rebalance_use_logit_adjustment))} | "
+            f"weighted_sampler={int(bool(args.head_only_rebalance_weighted_sampler))} | "
+            f"auto_stop={int(auto_stop_enabled)}"
+        )
+        if auto_stop_enabled:
+            print(
+                "Head-only rebalance auto-stop: "
+                f"patience={int(auto_stop_patience)} | min_delta={float(auto_stop_min_delta):.6f}"
+            )
+        for stage_epoch in range(1, int(args.head_only_rebalance_epochs) + 1):
+            if rebalance_batch_sampler is not None and hasattr(rebalance_batch_sampler, "set_epoch"):
+                rebalance_batch_sampler.set_epoch(int(stage_epoch))
+            t0 = time.time()
+            train_out = train_one_epoch(
+                model,
+                train_loader,
+                optimizer,
+                scaler,
+                criterion,
+                device,
+                accum_steps=int(args.accum),
+                grad_clip=float(args.grad_clip),
+                A=A,
+                use_channels_last=bool(args.channels_last),
+                use_amp=use_amp,
+                amp_dtype=amp_dtype,
+                max_batches=(args.limit_train_batches if args.limit_train_batches > 0 else None),
+                log_interval=int(args.log_interval),
+                ema=None,
+                tb_logger=tb_logger,
+                tb_log_every=int(args.log_every_steps),
+                global_step=int(global_step),
+                epoch=int(stage_epoch),
+                freeze_feature_extractor=True,
+            )
+            global_step = int(train_out.global_step)
+            eval_out = evaluate(
+                model,
+                val_loader,
+                criterion,
+                device,
+                A=A,
+                mirror_idx=mirror_idx,
+                use_channels_last=bool(args.channels_last),
+                use_amp=use_amp,
+                amp_dtype=amp_dtype,
+                max_batches=(args.limit_val_batches if args.limit_val_batches > 0 else None),
+                topk=(3, 5),
+                collect_examples=False,
+                epoch=int(args.epochs + stage_epoch),
+                global_step=int(global_step),
+                idx2label={v: k for k, v in label2idx.items()},
+                train_support=train_support,
+                bucket_by_class={},
+                family_criterion=None,
+                class_to_family=None,
+                family_eval=False,
+            )
+            sched.step()
+            dt = time.time() - t0
+            val_f1 = float(eval_out.macro_f1)
+            improved = bool(val_f1 > (best_stage_f1 + float(auto_stop_min_delta if auto_stop_enabled else 0.0)))
+            if improved:
+                best_stage_f1 = float(val_f1)
+                best_stage_epoch = int(stage_epoch)
+                epochs_no_improve = 0
+            else:
+                epochs_no_improve += 1
+            history.append(
+                {
+                    "stage_epoch": int(stage_epoch),
+                    "train_loss": float(train_out.loss),
+                    "train_total_loss": float(train_out.total_loss),
+                    "val_loss": float(eval_out.loss),
+                    "val_acc": float(eval_out.acc),
+                    "val_f1": float(val_f1),
+                    "lr": float(optimizer.param_groups[0]["lr"]),
+                    "global_step": int(global_step),
+                    "seconds": float(dt),
+                    "improved": bool(improved),
+                    "epochs_no_improve": int(epochs_no_improve),
+                }
+            )
+            print(
+                f"[Rebalance {stage_epoch:03d}] TL={float(train_out.loss):.4f} | VL={float(eval_out.loss):.4f} | "
+                f"VA={float(eval_out.acc):.3f} | VF1={val_f1:.3f} | lr={optimizer.param_groups[0]['lr']:.2e} | {dt:.1f}s"
+            )
+
+            stage_ckpt = _build_checkpoint(
+                epoch=int(args.epochs + stage_epoch),
+                model=model,
+                optimizer=optimizer,
+                sched=sched,
+                scaler=scaler,
+                ema=None,
+                label2idx=label2idx,
+                ds_cfg_dict=dict(ckpt_payload.get("ds_cfg", {})),
+                best_f1=float(max(best_stage_f1, val_f1)),
+                epochs_no_improve=0,
+                global_step=int(global_step),
+                history=history,
+                analysis_state={},
+                args=args,
+            )
+            torch.save(stage_ckpt, last_stage_ckpt_path)
+            if improved:
+                torch.save(stage_ckpt, best_stage_ckpt_path)
+            if tb_logger is not None and tb_logger.enabled:
+                tb_logger.scalar("rebalance/train_loss", float(train_out.loss), global_step)
+                tb_logger.scalar("rebalance/train_total_loss", float(train_out.total_loss), global_step)
+                tb_logger.scalar("rebalance/val_loss", float(eval_out.loss), global_step)
+                tb_logger.scalar("rebalance/val_acc", float(eval_out.acc), global_step)
+                tb_logger.scalar("rebalance/val_f1_macro", float(val_f1), global_step)
+                tb_logger.scalar("rebalance/lr", float(optimizer.param_groups[0]["lr"]), global_step)
+                tb_logger.scalar("rebalance/epochs_no_improve", float(epochs_no_improve), global_step)
+            summary["epochs_ran"] = int(stage_epoch)
+            if auto_stop_enabled and int(epochs_no_improve) >= int(auto_stop_patience):
+                summary["stopped_early"] = True
+                summary["stop_reason"] = (
+                    f"no val_f1 improvement > {float(auto_stop_min_delta):.6f} "
+                    f"for {int(auto_stop_patience)} consecutive rebalance epochs"
+                )
+                print(f"Head-only rebalance auto-stop triggered at epoch {int(stage_epoch)}.")
+                break
+
+        _write_json(history_path, history)
+        summary.update(
+            {
+                "best_val_f1": float(best_stage_f1 if best_stage_f1 >= 0.0 else 0.0),
+                "best_epoch": int(best_stage_epoch),
+                "history_path": str(history_path.resolve()),
+                "best_ckpt_path": str(best_stage_ckpt_path.resolve()) if best_stage_ckpt_path.exists() else "",
+                "last_ckpt_path": str(last_stage_ckpt_path.resolve()) if last_stage_ckpt_path.exists() else "",
+            }
+        )
+        _write_json(analysis_dir / "head_only_rebalance_summary.json", summary)
+        return summary, int(global_step)
+    finally:
+        _shutdown_loader_workers(train_loader)
+        _shutdown_loader_workers(base_loader)
+
+
 def _resolve_auto_workers(
     *,
     train_ds: MultiStreamGestureDataset,
@@ -942,7 +1220,61 @@ def _resolve_auto_workers(
     return chosen_profile, info
 
 
+def _hydrate_args_from_resume_for_rebalance_only(args):
+    if not bool(getattr(args, "head_only_rebalance_only", False)) or not getattr(args, "resume", ""):
+        return args
+    resume_path = Path(args.resume).expanduser()
+    if not resume_path.exists():
+        return args
+    ckpt = torch.load(resume_path, map_location="cpu", weights_only=False)
+    saved_args = ckpt.get("args")
+    if not isinstance(saved_args, dict):
+        return args
+
+    defaults = _parse_train_args(["--json", str(args.json), "--csv", str(args.csv), "--out", str(args.out)])
+    always_preserve = {
+        "json",
+        "csv",
+        "out",
+        "resume",
+        "logdir",
+        "run_name",
+        "use_family_head",
+        "family_map",
+        "family_loss_weight",
+        "family_warmup_epochs",
+        "family_eval",
+        "num_families",
+        "head_only_rebalance_only",
+        "head_only_rebalance_epochs",
+        "head_only_rebalance_lr",
+        "auto_head_only_rebalance_stop",
+        "head_only_rebalance_use_logit_adjustment",
+        "head_only_rebalance_weighted_sampler",
+        "limit_train_batches",
+        "limit_val_batches",
+    }
+    explicit_override_keys = set(always_preserve)
+    for key, current_value in vars(args).items():
+        if key in always_preserve or not hasattr(defaults, key):
+            continue
+        if current_value != getattr(defaults, key):
+            explicit_override_keys.add(str(key))
+    preserved = {key: getattr(args, key) for key in explicit_override_keys if hasattr(args, key)}
+    for key, value in saved_args.items():
+        if hasattr(args, key):
+            setattr(args, key, value)
+    for key, value in preserved.items():
+        setattr(args, key, value)
+    args.resume_model_only = True
+    print(
+        "Head-only rebalance-only mode: hydrated args from resume checkpoint and kept explicit overrides."
+    )
+    return args
+
+
 def run_training(args) -> None:
+    args = _hydrate_args_from_resume_for_rebalance_only(args)
     set_seed(args.seed)
 
     debug_mode = (args.overfit_batches > 0) or (args.limit_train_batches > 0)
@@ -1057,6 +1389,21 @@ def run_training(args) -> None:
     )
     label2idx = train_ds.label2idx  # single label map from train
     idx2label = {v: k for k, v in label2idx.items()}
+    family_map_info: dict[str, Any] | None = None
+    class_to_family: torch.Tensor | None = None
+    num_families = 0
+    if args.family_map:
+        family_map_info = load_family_map(args.family_map, num_classes=len(label2idx))
+        num_families = int(family_map_info["num_families"])
+        if args.num_families > 0 and int(args.num_families) != num_families:
+            raise ValueError(
+                f"--num_families={int(args.num_families)} does not match family_map num_families={num_families}"
+            )
+        class_to_family = build_class_to_family_tensor(family_map_info, device=device)
+        print(
+            f"Loaded family map: {family_map_info['path']} | "
+            f"num_families={num_families} | use_family_head={int(bool(args.use_family_head))}"
+        )
     val_ds = MultiStreamGestureDataset(
         args.json,
         args.csv,
@@ -1283,6 +1630,8 @@ def run_training(args) -> None:
         cosine_margin=args.cosine_margin,
         cosine_scale=args.cosine_scale,
         cosine_subcenters=args.cosine_subcenters,
+        use_family_head=args.use_family_head,
+        num_families=int(num_families),
     ).to(device)
     if args.channels_last and device.type == "cuda":
         model = model.to(memory_format=torch.channels_last)
@@ -1304,6 +1653,13 @@ def run_training(args) -> None:
     else:
         smoothing = max(0.0, float(args.label_smoothing))
         criterion = nn.CrossEntropyLoss(label_smoothing=smoothing if smoothing > 0 else 0.0)
+    family_criterion = (
+        nn.CrossEntropyLoss(
+            label_smoothing=float(args.family_label_smoothing) if float(args.family_label_smoothing) > 0.0 else 0.0
+        )
+        if args.use_family_head
+        else None
+    )
     supcon_criterion = SupervisedContrastiveLoss(temperature=args.supcon_temp) if args.use_supcon else None
 
     # Optimizer & scheduler
@@ -1356,6 +1712,7 @@ def run_training(args) -> None:
     history = []
     global_step = 0
     start_epoch = 1
+    baseline_best_f1_for_reporting: float | None = None
     analysis_state: dict[str, Any] = {
         "per_class_peak_f1": {},
         "epoch_index": [],
@@ -1389,6 +1746,11 @@ def run_training(args) -> None:
             )
 
         if args.resume_model_only:
+            if bool(args.head_only_rebalance_only):
+                try:
+                    baseline_best_f1_for_reporting = float(ckpt.get("best_f1", -1.0))
+                except Exception:
+                    baseline_best_f1_for_reporting = None
             missing, unexpected = model.load_state_dict(ckpt["model_state"], strict=False)
             if missing or unexpected:
                 print(
@@ -1538,6 +1900,7 @@ def run_training(args) -> None:
             "auto_workers": bool(args.auto_workers),
             "use_supcon": bool(args.use_supcon),
             "use_cosine_head": bool(args.use_cosine_head),
+            "use_family_head": bool(args.use_family_head),
             "supcon_class_balanced_batch": bool(args.supcon_class_balanced_batch),
             "supcon_mixed_batch": bool(args.supcon_mixed_batch),
             "tb_log_all_classes": bool(args.tb_log_all_classes),
@@ -1576,6 +1939,25 @@ def run_training(args) -> None:
             "cosine_margin": float(args.cosine_margin),
             "cosine_scale": float(args.cosine_scale),
             "cosine_subcenters": int(args.cosine_subcenters),
+        },
+        "family": {
+            "enabled": bool(args.use_family_head),
+            "map_path": str(family_map_info["path"]) if family_map_info is not None else "",
+            "num_families": int(num_families),
+            "loss_weight": float(args.family_loss_weight),
+            "warmup_epochs": int(args.family_warmup_epochs),
+            "label_smoothing": float(args.family_label_smoothing),
+            "eval": bool(args.family_eval),
+            "metadata": (family_map_info.get("metadata", {}) if family_map_info is not None else {}),
+        },
+        "head_only_rebalance": {
+            "enabled": bool(args.head_only_rebalance_epochs > 0),
+            "epochs": int(args.head_only_rebalance_epochs),
+            "lr": float(args.head_only_rebalance_lr),
+            "auto_stop": bool(args.auto_head_only_rebalance_stop),
+            "use_logit_adjustment": bool(args.head_only_rebalance_use_logit_adjustment),
+            "weighted_sampler": bool(args.head_only_rebalance_weighted_sampler),
+            "results": {},
         },
         "auto_workers": {
             "enabled": bool(args.auto_workers),
@@ -1628,6 +2010,25 @@ def run_training(args) -> None:
         tb_logger.scalar("meta/supcon_weight", float(args.supcon_weight), 0)
         tb_logger.scalar("meta/supcon_temp", float(args.supcon_temp), 0)
         tb_logger.scalar("meta/supcon_start_epoch", float(supcon_start_epoch), 0)
+        tb_logger.scalar("meta/use_family_head", float(bool(args.use_family_head)), 0)
+        tb_logger.scalar("meta/family_loss_weight", float(args.family_loss_weight), 0)
+        tb_logger.scalar("meta/family_warmup_epochs", float(args.family_warmup_epochs), 0)
+        tb_logger.scalar("meta/num_families", float(num_families), 0)
+        tb_logger.scalar("meta/family_eval", float(bool(args.family_eval)), 0)
+        tb_logger.scalar("meta/head_only_rebalance_enabled", float(bool(args.head_only_rebalance_epochs > 0)), 0)
+        tb_logger.scalar("meta/head_only_rebalance_epochs", float(args.head_only_rebalance_epochs), 0)
+        tb_logger.scalar("meta/head_only_rebalance_lr", float(args.head_only_rebalance_lr), 0)
+        tb_logger.scalar("meta/head_only_rebalance_auto_stop", float(bool(args.auto_head_only_rebalance_stop)), 0)
+        tb_logger.scalar(
+            "meta/head_only_rebalance_use_logit_adjustment",
+            float(bool(args.head_only_rebalance_use_logit_adjustment)),
+            0,
+        )
+        tb_logger.scalar(
+            "meta/head_only_rebalance_weighted_sampler",
+            float(bool(args.head_only_rebalance_weighted_sampler)),
+            0,
+        )
         tb_logger.scalar("meta/supcon_class_balanced_batch", float(bool(args.supcon_class_balanced_batch)), 0)
         tb_logger.scalar("meta/supcon_classes_per_batch", float(args.supcon_classes_per_batch), 0)
         tb_logger.scalar("meta/supcon_samples_per_class", float(args.supcon_samples_per_class), 0)
@@ -1648,564 +2049,623 @@ def run_training(args) -> None:
             f"SupCon auxiliary armed from epoch {supcon_start_epoch} "
             f"(warmup_epochs={warmup_epochs}, requested_start={int(args.supcon_start_epoch)})."
         )
-
-    for epoch in range(start_epoch, args.epochs + 1):
-        t0 = time.time()
-        if train_batch_sampler is not None and hasattr(train_batch_sampler, "set_epoch"):
-            train_batch_sampler.set_epoch(int(epoch))
-        train_out = train_one_epoch(
-            model,
-            train_loader,
-            optimizer,
-            scaler,
-            criterion,
-            device,
-            accum_steps=args.accum,
-            grad_clip=args.grad_clip,
-            A=A,
-            use_channels_last=args.channels_last,
-            use_amp=use_amp,
-            amp_dtype=amp_dtype,
-            max_batches=train_limit,
-            log_interval=args.log_interval,
-            ema=ema,
-            tb_logger=tb_logger,
-            tb_log_every=int(args.log_every_steps),
-            global_step=global_step,
-            supcon_criterion=supcon_criterion,
-            supcon_weight=float(args.supcon_weight),
-            supcon_start_epoch=int(supcon_start_epoch),
-            epoch=int(epoch),
-            log_batch_label_stats=bool(args.supcon_class_balanced_batch or args.supcon_mixed_batch),
-            expected_batch_unique_classes=(int(args.supcon_classes_per_batch) if args.supcon_class_balanced_batch else None),
-            expected_batch_samples_per_class=(int(args.supcon_samples_per_class) if args.supcon_class_balanced_batch else None),
-            expected_mixed_repeated_classes=(int(args.supcon_mixed_repeated_classes) if args.supcon_mixed_batch else None),
-            expected_mixed_repeated_samples=(int(args.supcon_mixed_repeated_samples) if args.supcon_mixed_batch else None),
-            expected_mixed_singleton_classes=(
-                int(args.batch - (args.supcon_mixed_repeated_classes * args.supcon_mixed_repeated_samples))
-                if args.supcon_mixed_batch
-                else None
-            ),
-        )
-        tr_loss = float(train_out.loss)
-        tr_total_loss = float(train_out.total_loss)
-        global_step = int(train_out.global_step)
-        eval_model = ema.module if ema is not None else model
-        collect_examples = bool(
-            tb_logger.enabled and args.tb_log_examples and (epoch % max(1, int(args.tb_examples_every)) == 0)
-        )
-        eval_out = evaluate(
-            eval_model,
-            val_loader,
-            criterion,
-            device,
-            A=A,
-            mirror_idx=mirror_idx,
-            use_channels_last=args.channels_last,
-            use_amp=use_amp,
-            amp_dtype=amp_dtype,
-            max_batches=val_limit,
-            topk=(3, 5),
-            collect_examples=collect_examples,
-            examples_k=int(args.tb_examples_k),
-            epoch=epoch,
-            global_step=global_step,
-            idx2label=idx2label,
-            train_support=train_support,
-            bucket_by_class=bucket_by_class,
-        )
-        if bucket_mode == "difficulty":
-            difficulty_scores = analysis_state.setdefault("difficulty_scores", {})
-            difficulty_frozen = bool(analysis_state.get("difficulty_frozen", False))
-            if not difficulty_frozen:
-                _update_difficulty_scores(
-                    difficulty_scores,
-                    eval_out.per_class,
-                    ema_decay=float(args.tb_difficulty_ema),
-                )
-                if epoch >= int(args.tb_difficulty_freeze_epoch):
-                    difficulty_frozen = True
-                    analysis_state["difficulty_freeze_epoch"] = int(epoch)
-            analysis_state["difficulty_frozen"] = bool(difficulty_frozen)
-            bucket_by_class, bucket_rows = _build_difficulty_bucket_rows(difficulty_scores, train_support, idx2label)
-            watchlist_rows = _build_difficulty_watchlist_rows(
-                difficulty_scores,
-                train_support,
-                idx2label,
-                bucket_by_class,
-                int(args.tb_watchlist_k),
-            )
-            watchlist_ids = [int(row["class_id"]) for row in watchlist_rows]
-            _apply_bucket_annotations(eval_out, idx2label=idx2label, bucket_by_class=bucket_by_class)
-            _write_bucket_artifacts(analysis_dir, bucket_rows, watchlist_rows)
-        sched.step()
-        val_loss = float(eval_out.loss)
-        val_acc = float(eval_out.acc)
-        val_f1 = float(eval_out.macro_f1)
-        topk_acc = eval_out.topk_acc
-        val_preds = eval_out.preds
-        val_labels = eval_out.labels
-        examples = eval_out.examples
-
-        dt = time.time() - t0
+    if args.use_family_head:
         print(
-            f"[Ep {epoch:03d}] TL={tr_loss:.4f} | VL={val_loss:.4f} | VA={val_acc:.3f} | VF1={val_f1:.3f} | "
-            f"lr={optimizer.param_groups[0]['lr']:.2e} | {dt:.1f}s"
+            f"Family auxiliary armed after epoch {int(args.family_warmup_epochs)} "
+            f"(num_families={num_families}, weight={float(args.family_loss_weight):.3f})."
         )
-        print("pred top5:", Counter(val_preds).most_common(5))
 
-        f1_micro = f1_score(val_labels, val_preds, average="micro") if val_labels else 0.0
-        f1_weighted = f1_score(val_labels, val_preds, average="weighted") if val_labels else 0.0
-        p_macro, r_macro, _, _ = (
-            precision_recall_fscore_support(val_labels, val_preds, average="macro", zero_division=0)
-            if val_labels
-            else (0.0, 0.0, 0.0, None)
-        )
-        bucket_metrics = _bucket_aggregates(eval_out.per_class, bucket_by_class, tuple(bucket_spec["bucket_names"]))
-        per_class_dist = _compute_per_class_distribution_metrics(eval_out.per_class)
-        zero_f1_count = int(sum(1 for row in eval_out.per_class.values() if float(row["f1"]) <= 1e-12))
-        nonzero_f1_count = int(len(eval_out.per_class) - zero_f1_count)
-        conf_arr = np.asarray(eval_out.probs_top1, dtype=np.float64) if eval_out.probs_top1 else np.zeros(0, dtype=np.float64)
-        margin_arr = np.asarray(eval_out.margin, dtype=np.float64) if eval_out.margin else np.zeros(0, dtype=np.float64)
-        entropy_arr = np.asarray(eval_out.entropy, dtype=np.float64) if eval_out.entropy else np.zeros(0, dtype=np.float64)
-        correct_arr = np.asarray([int(p == t) for p, t in zip(val_preds, val_labels)], dtype=np.int64) if val_labels else np.zeros(0, dtype=np.int64)
-        high_conf_wrong_mask = (correct_arr == 0) & (conf_arr >= 0.90) if conf_arr.size else np.zeros(0, dtype=bool)
-        high_conf_wrong_count = int(high_conf_wrong_mask.sum()) if high_conf_wrong_mask.size else 0
-        high_conf_wrong_rate = float(high_conf_wrong_count / max(1, len(val_labels))) if val_labels else 0.0
-        confidence_mean = float(conf_arr.mean()) if conf_arr.size else 0.0
-        confidence_correct_mean = float(conf_arr[correct_arr == 1].mean()) if np.any(correct_arr == 1) else 0.0
-        confidence_wrong_mean = float(conf_arr[correct_arr == 0].mean()) if np.any(correct_arr == 0) else 0.0
-        prob_margin_mean = float(margin_arr.mean()) if margin_arr.size else 0.0
-        prob_margin_wrong_mean = float(margin_arr[correct_arr == 0].mean()) if np.any(correct_arr == 0) else 0.0
-        entropy_mean = float(entropy_arr.mean()) if entropy_arr.size else 0.0
-        f1_gain_vs_prev = float(val_f1 - history[-1]["val_f1"]) if history else 0.0
-        loss_gap_train_minus_val = float(tr_loss - val_loss)
-        f1_gap_macro_minus_weighted = float(val_f1 - f1_weighted)
-        es_armed = bool(es_patience > 0 and epoch >= es_start_epoch)
-
-        history.append(
-            dict(
-                epoch=epoch,
-                train_loss=tr_loss,
-                train_total_loss=tr_total_loss,
-                train_supcon_loss=float(train_out.supcon_loss),
-                train_supcon_valid_anchors=int(train_out.supcon_valid_anchors),
-                train_supcon_positive_pairs=int(train_out.supcon_positive_pairs),
-                val_loss=val_loss,
-                val_acc=val_acc,
-                val_f1=val_f1,
-                val_bucket_mode=bucket_mode,
-                val_f1_tail=(float(bucket_metrics.get("f1_tail", 0.0)) if bucket_mode == "support" else None),
-                val_f1_hard=(float(bucket_metrics.get("f1_hard", 0.0)) if bucket_mode == "difficulty" else None),
-                val_ece=float(eval_out.calibration.get("ece_15bin", 0.0)),
-                val_brier=float(eval_out.calibration.get("brier", 0.0)),
-                val_nll=float(eval_out.calibration.get("nll", 0.0)),
+    if bool(args.head_only_rebalance_only):
+        print("Skipping main training loop -> running head-only rebalance only.")
+    else:
+        for epoch in range(start_epoch, args.epochs + 1):
+            t0 = time.time()
+            if train_batch_sampler is not None and hasattr(train_batch_sampler, "set_epoch"):
+                train_batch_sampler.set_epoch(int(epoch))
+            train_out = train_one_epoch(
+                model,
+                train_loader,
+                optimizer,
+                scaler,
+                criterion,
+                device,
+                accum_steps=args.accum,
+                grad_clip=args.grad_clip,
+                A=A,
+                use_channels_last=args.channels_last,
+                use_amp=use_amp,
+                amp_dtype=amp_dtype,
+                max_batches=train_limit,
+                log_interval=args.log_interval,
+                ema=ema,
+                tb_logger=tb_logger,
+                tb_log_every=int(args.log_every_steps),
+                global_step=global_step,
+                supcon_criterion=supcon_criterion,
+                supcon_weight=float(args.supcon_weight),
+                supcon_start_epoch=int(supcon_start_epoch),
+                family_criterion=family_criterion,
+                family_loss_weight=float(args.family_loss_weight),
+                family_warmup_epochs=int(args.family_warmup_epochs),
+                class_to_family=class_to_family,
+                epoch=int(epoch),
+                log_batch_label_stats=bool(args.supcon_class_balanced_batch or args.supcon_mixed_batch),
+                expected_batch_unique_classes=(int(args.supcon_classes_per_batch) if args.supcon_class_balanced_batch else None),
+                expected_batch_samples_per_class=(int(args.supcon_samples_per_class) if args.supcon_class_balanced_batch else None),
+                expected_mixed_repeated_classes=(int(args.supcon_mixed_repeated_classes) if args.supcon_mixed_batch else None),
+                expected_mixed_repeated_samples=(int(args.supcon_mixed_repeated_samples) if args.supcon_mixed_batch else None),
+                expected_mixed_singleton_classes=(
+                    int(args.batch - (args.supcon_mixed_repeated_classes * args.supcon_mixed_repeated_samples))
+                    if args.supcon_mixed_batch
+                    else None
+                ),
             )
-        )
-
-        per_class_rows = []
-        for class_id, row in sorted(eval_out.per_class.items()):
-            row_out = dict(row)
-            row_out["epoch"] = int(epoch)
-            row_out["global_step"] = int(global_step)
-            row_out["bucket_mode"] = bucket_mode
-            per_class_rows.append(row_out)
-        worst_classes_rows = sorted(per_class_rows, key=lambda row: (float(row["f1"]), int(row["support_train"]), int(row["class_id"])))
-        biggest_late_drop_rows = _compute_biggest_late_drops(
-            eval_out.per_class,
-            analysis_state.get("per_class_peak_f1", {}),
-            limit=int(args.tb_tables_k),
-        )
-        prediction_rows = _prediction_csv_rows(eval_out.records, train_support, bucket_by_class)
-        error_rows = [row for row in prediction_rows if int(row["correct"]) == 0]
-        worst_error_rows = _select_error_rows(prediction_rows, bucket_filter=None, limit=int(args.tb_tables_k))
-        focus_error_rows = _select_error_rows(
-            prediction_rows,
-            bucket_filter=str(bucket_spec["focus_bucket"]),
-            limit=int(args.tb_tables_k),
-        )
-        confusion_pairs_top = eval_out.confusion_pairs[: max(1, int(args.tb_tables_k))]
-        confusion_pairs_tail = [
-            row for row in eval_out.confusion_pairs if str(row.get("bucket_true")) == str(bucket_spec["focus_bucket"])
-        ][: max(1, int(args.tb_tables_k))]
-        watchlist_id_set = set(watchlist_ids)
-        confusion_pairs_watchlist = [
-            row for row in eval_out.confusion_pairs if int(row.get("true_id", -1)) in watchlist_id_set
-        ][: max(1, int(args.tb_tables_k))]
-
-        if tb_logger.enabled:
-            tb_logger.scalar("meta/early_stop_armed", float(es_armed), global_step)
-            tb_logger.scalar("val/loss", float(val_loss), global_step)
-            tb_logger.scalar("val/acc", float(val_acc), global_step)
-            tb_logger.scalar("val/f1_macro", float(val_f1), global_step)
-            if 3 in topk_acc:
-                tb_logger.scalar("val/acc_top3", float(topk_acc[3]), global_step)
-            if 5 in topk_acc:
-                tb_logger.scalar("val/acc_top5", float(topk_acc[5]), global_step)
-            if val_labels:
-                tb_logger.scalar("val/f1_micro", float(f1_micro), global_step)
-                tb_logger.scalar("val/f1_weighted", float(f1_weighted), global_step)
-                tb_logger.scalar("val/ece_15bin", float(eval_out.calibration.get("ece_15bin", 0.0)), global_step)
-                tb_logger.scalar("val/brier", float(eval_out.calibration.get("brier", 0.0)), global_step)
-                tb_logger.scalar("val/nll", float(eval_out.calibration.get("nll", 0.0)), global_step)
-                tb_logger.scalar("val/confidence_mean", confidence_mean, global_step)
-                tb_logger.scalar("val/confidence_correct_mean", confidence_correct_mean, global_step)
-                tb_logger.scalar("val/confidence_wrong_mean", confidence_wrong_mean, global_step)
-                tb_logger.scalar("val/prob_margin_mean", prob_margin_mean, global_step)
-                tb_logger.scalar("val/prob_margin_wrong_mean", prob_margin_wrong_mean, global_step)
-                tb_logger.scalar("val/entropy_mean", entropy_mean, global_step)
-                tb_logger.scalar("val/per_class_f1_p10", float(per_class_dist["per_class_f1_p10"]), global_step)
-                tb_logger.scalar("val/per_class_f1_p25", float(per_class_dist["per_class_f1_p25"]), global_step)
-                tb_logger.scalar("val/per_class_f1_median", float(per_class_dist["per_class_f1_median"]), global_step)
-                tb_logger.scalar("val/per_class_recall_p10", float(per_class_dist["per_class_recall_p10"]), global_step)
-                tb_logger.scalar("val/high_conf_wrong_count", float(high_conf_wrong_count), global_step)
-                tb_logger.scalar("val/high_conf_wrong_rate", float(high_conf_wrong_rate), global_step)
-                tb_logger.scalar("val/precision_macro", float(p_macro), global_step)
-                tb_logger.scalar("val/recall_macro", float(r_macro), global_step)
-                tb_logger.scalar("val/zero_f1_count", float(zero_f1_count), global_step)
-                tb_logger.scalar("val/nonzero_f1_count", float(nonzero_f1_count), global_step)
-                tb_logger.scalar("val/f1_gap_macro_minus_weighted", float(f1_gap_macro_minus_weighted), global_step)
-                tb_logger.scalar("val/f1_gain_vs_prev", float(f1_gain_vs_prev), global_step)
-                tb_logger.scalar("val/loss_gap_train_minus_val", float(loss_gap_train_minus_val), global_step)
-                topk_support = int(max(0, args.tb_support_topk))
-                if topk_support > 0:
-                    order = sorted(
-                        (row for row in per_class_rows if int(row["support_val"]) > 0),
-                        key=lambda row: (-int(row["support_val"]), int(row["class_id"])),
+            tr_loss = float(train_out.loss)
+            tr_total_loss = float(train_out.total_loss)
+            tr_family_loss = float(train_out.family_loss)
+            tr_family_acc = float(train_out.family_acc)
+            global_step = int(train_out.global_step)
+            eval_model = ema.module if ema is not None else model
+            collect_examples = bool(
+                tb_logger.enabled and args.tb_log_examples and (epoch % max(1, int(args.tb_examples_every)) == 0)
+            )
+            eval_out = evaluate(
+                eval_model,
+                val_loader,
+                criterion,
+                device,
+                A=A,
+                mirror_idx=mirror_idx,
+                use_channels_last=args.channels_last,
+                use_amp=use_amp,
+                amp_dtype=amp_dtype,
+                max_batches=val_limit,
+                topk=(3, 5),
+                collect_examples=collect_examples,
+                examples_k=int(args.tb_examples_k),
+                epoch=epoch,
+                global_step=global_step,
+                idx2label=idx2label,
+                train_support=train_support,
+                bucket_by_class=bucket_by_class,
+                family_criterion=family_criterion,
+                class_to_family=class_to_family,
+                family_eval=bool(args.family_eval and args.use_family_head),
+            )
+            if bucket_mode == "difficulty":
+                difficulty_scores = analysis_state.setdefault("difficulty_scores", {})
+                difficulty_frozen = bool(analysis_state.get("difficulty_frozen", False))
+                if not difficulty_frozen:
+                    _update_difficulty_scores(
+                        difficulty_scores,
+                        eval_out.per_class,
+                        ema_decay=float(args.tb_difficulty_ema),
                     )
-                    for row in order[: min(topk_support, len(order))]:
-                        idx = int(row["class_id"])
-                        label_name = _sanitize_label(idx2label.get(idx, str(idx)))
-                        tb_logger.scalar(f"val/support/{label_name}", float(row["support_val"]), global_step)
-                        tb_logger.scalar(f"val/p_class/{label_name}", float(row["precision"]), global_step)
-                        tb_logger.scalar(f"val/r_class/{label_name}", float(row["recall"]), global_step)
-                        tb_logger.scalar(f"val/f1_class/{label_name}", float(row["f1"]), global_step)
-                worstk = int(max(0, args.tb_worstk_f1))
-                if worstk > 0:
-                    for row in worst_classes_rows[: min(worstk, len(worst_classes_rows))]:
-                        idx = int(row["class_id"])
-                        label_name = _sanitize_label(idx2label.get(idx, str(idx)))
-                        tb_logger.scalar(f"val/f1_worst/{label_name}", float(row["f1"]), global_step)
-                        tb_logger.scalar(f"val/p_worst/{label_name}", float(row["precision"]), global_step)
-                        tb_logger.scalar(f"val/r_worst/{label_name}", float(row["recall"]), global_step)
-                if args.tb_log_tail_buckets or args.tb_full_logging:
-                    tb_logger.scalar("meta/difficulty_frozen", float(bool(analysis_state.get("difficulty_frozen", False))), global_step)
-                    tb_logger.scalar("meta/bucket_mode_support", float(bucket_mode == "support"), global_step)
-                    tb_logger.scalar("meta/bucket_mode_difficulty", float(bucket_mode == "difficulty"), global_step)
-                    if bucket_mode == "support":
-                        tb_logger.scalar("val_bucket/f1_head", float(bucket_metrics.get("f1_head", 0.0)), global_step)
-                        tb_logger.scalar("val_bucket/f1_mid", float(bucket_metrics.get("f1_mid", 0.0)), global_step)
-                        tb_logger.scalar("val_bucket/f1_tail", float(bucket_metrics.get("f1_tail", 0.0)), global_step)
-                        tb_logger.scalar("val_bucket/p_head", float(bucket_metrics.get("p_head", 0.0)), global_step)
-                        tb_logger.scalar("val_bucket/p_mid", float(bucket_metrics.get("p_mid", 0.0)), global_step)
-                        tb_logger.scalar("val_bucket/p_tail", float(bucket_metrics.get("p_tail", 0.0)), global_step)
-                        tb_logger.scalar("val_bucket/r_head", float(bucket_metrics.get("r_head", 0.0)), global_step)
-                        tb_logger.scalar("val_bucket/r_mid", float(bucket_metrics.get("r_mid", 0.0)), global_step)
-                        tb_logger.scalar("val_bucket/r_tail", float(bucket_metrics.get("r_tail", 0.0)), global_step)
-                        tb_logger.scalar("val_bucket/zero_f1_head_count", float(bucket_metrics.get("zero_f1_head_count", 0.0)), global_step)
-                        tb_logger.scalar("val_bucket/zero_f1_mid_count", float(bucket_metrics.get("zero_f1_mid_count", 0.0)), global_step)
-                        tb_logger.scalar("val_bucket/zero_f1_tail_count", float(bucket_metrics.get("zero_f1_tail_count", 0.0)), global_step)
-                    else:
-                        tb_logger.scalar("val_difficulty/f1_easy", float(bucket_metrics.get("f1_easy", 0.0)), global_step)
-                        tb_logger.scalar("val_difficulty/f1_mid", float(bucket_metrics.get("f1_mid", 0.0)), global_step)
-                        tb_logger.scalar("val_difficulty/f1_hard", float(bucket_metrics.get("f1_hard", 0.0)), global_step)
-                        tb_logger.scalar("val_difficulty/p_easy", float(bucket_metrics.get("p_easy", 0.0)), global_step)
-                        tb_logger.scalar("val_difficulty/p_mid", float(bucket_metrics.get("p_mid", 0.0)), global_step)
-                        tb_logger.scalar("val_difficulty/p_hard", float(bucket_metrics.get("p_hard", 0.0)), global_step)
-                        tb_logger.scalar("val_difficulty/r_easy", float(bucket_metrics.get("r_easy", 0.0)), global_step)
-                        tb_logger.scalar("val_difficulty/r_mid", float(bucket_metrics.get("r_mid", 0.0)), global_step)
-                        tb_logger.scalar("val_difficulty/r_hard", float(bucket_metrics.get("r_hard", 0.0)), global_step)
-                        tb_logger.scalar("val_difficulty/zero_f1_easy_count", float(bucket_metrics.get("zero_f1_easy_count", 0.0)), global_step)
-                        tb_logger.scalar("val_difficulty/zero_f1_mid_count", float(bucket_metrics.get("zero_f1_mid_count", 0.0)), global_step)
-                        tb_logger.scalar("val_difficulty/zero_f1_hard_count", float(bucket_metrics.get("zero_f1_hard_count", 0.0)), global_step)
-                if args.tb_log_all_classes or args.tb_full_logging:
-                    for row in per_class_rows:
-                        class_id = int(row["class_id"])
-                        tb_logger.scalar(f"val_all/f1/{class_id}", float(row["f1"]), global_step)
-                        tb_logger.scalar(f"val_all/p/{class_id}", float(row["precision"]), global_step)
-                        tb_logger.scalar(f"val_all/r/{class_id}", float(row["recall"]), global_step)
-                        tb_logger.scalar(f"val_all/support_val/{class_id}", float(row["support_val"]), global_step)
-                        tb_logger.scalar(f"val_all/support_train/{class_id}", float(row["support_train"]), global_step)
-                        tb_logger.scalar(f"val_all/pred_count/{class_id}", float(row["pred_count"]), global_step)
-                        tb_logger.scalar(f"val_all/true_count/{class_id}", float(row["true_count"]), global_step)
-                        tb_logger.scalar(f"val_all/conf_mean/{class_id}", float(row["conf_mean"]), global_step)
-                        tb_logger.scalar(f"val_all/conf_wrong_mean/{class_id}", float(row["conf_wrong_mean"]), global_step)
-                        tb_logger.scalar(f"val_all/margin_mean/{class_id}", float(row["margin_mean"]), global_step)
-                    for class_id in watchlist_ids:
-                        row = eval_out.per_class.get(int(class_id))
-                        if row is None:
-                            continue
-                        tb_logger.scalar(f"val_watch/f1/{class_id}", float(row["f1"]), global_step)
-                        tb_logger.scalar(f"val_watch/p/{class_id}", float(row["precision"]), global_step)
-                        tb_logger.scalar(f"val_watch/r/{class_id}", float(row["recall"]), global_step)
-                        tb_logger.scalar(f"val_watch/conf_mean/{class_id}", float(row["conf_mean"]), global_step)
-                        tb_logger.scalar(f"val_watch/margin_mean/{class_id}", float(row["margin_mean"]), global_step)
-            log_confusion_now = epoch % max(1, int(args.tb_confusion_every)) == 0
-            if (args.tb_log_confusion or args.tb_full_logging) and val_labels and log_confusion_now:
-                try:
-                    img, _ = build_confusion_image(
-                        val_labels, val_preds, idx2label, topk=int(args.tb_confusion_topk), normalize=True
-                    )
-                    tb_logger.image("val/confusion_topk", img, global_step, dataformats="HWC")
-                    secondary_ids = [
-                        class_id
-                        for class_id, bucket in bucket_by_class.items()
-                        if bucket == str(bucket_spec["secondary_bucket"])
-                    ]
-                    focus_ids = [
-                        class_id
-                        for class_id, bucket in bucket_by_class.items()
-                        if bucket == str(bucket_spec["focus_bucket"])
-                    ]
-                    img_secondary, _ = build_confusion_image(
-                        val_labels,
-                        val_preds,
-                        idx2label,
-                        topk=int(args.tb_confusion_topk),
-                        normalize=True,
-                        class_ids=secondary_ids,
-                    )
-                    tb_logger.image(
-                        f"val/confusion_{bucket_spec['secondary_label']}",
-                        img_secondary,
-                        global_step,
-                        dataformats="HWC",
-                    )
-                    img_focus, _ = build_confusion_image(
-                        val_labels,
-                        val_preds,
-                        idx2label,
-                        topk=int(args.tb_confusion_topk),
-                        normalize=True,
-                        class_ids=focus_ids,
-                    )
-                    tb_logger.image(
-                        f"val/confusion_{bucket_spec['focus_label']}",
-                        img_focus,
-                        global_step,
-                        dataformats="HWC",
-                    )
-                    tb_logger.image("val/confusion_focus", img_focus, global_step, dataformats="HWC")
-                    img_watch, _ = build_confusion_image(
-                        val_labels, val_preds, idx2label, topk=int(args.tb_confusion_topk), normalize=True, class_ids=watchlist_ids
-                    )
-                    tb_logger.image("val/confusion_watchlist", img_watch, global_step, dataformats="HWC")
-                except Exception as exc:
-                    print(f"Warning: failed to log confusion image to TensorBoard: {exc}")
-            if collect_examples and examples:
-                wrong = [ex for ex in examples if int(ex["pred"]) != int(ex["true"])]
-                wrong.sort(key=lambda x: x.get("conf", 1.0))
-                selected = wrong
-                if len(selected) < int(args.tb_examples_k):
-                    rest = [ex for ex in examples if int(ex["pred"]) == int(ex["true"])]
-                    rest.sort(key=lambda x: x.get("conf", 1.0))
-                    selected = selected + rest
-                text = format_examples_text(selected, idx2label, int(args.tb_examples_k))
-                tb_logger.text("val/examples", text, global_step)
-            if args.tb_log_confusion_pairs or args.tb_full_logging:
-                tb_logger.text("tables/confusion_pairs_top", format_confusion_pairs_text(confusion_pairs_top, max_rows=int(args.tb_tables_k)), global_step)
-                tb_logger.text(
-                    "tables/confusion_pairs_focus",
-                    format_confusion_pairs_text(confusion_pairs_tail, max_rows=int(args.tb_tables_k)),
-                    global_step,
+                    if epoch >= int(args.tb_difficulty_freeze_epoch):
+                        difficulty_frozen = True
+                        analysis_state["difficulty_freeze_epoch"] = int(epoch)
+                analysis_state["difficulty_frozen"] = bool(difficulty_frozen)
+                bucket_by_class, bucket_rows = _build_difficulty_bucket_rows(difficulty_scores, train_support, idx2label)
+                watchlist_rows = _build_difficulty_watchlist_rows(
+                    difficulty_scores,
+                    train_support,
+                    idx2label,
+                    bucket_by_class,
+                    int(args.tb_watchlist_k),
                 )
-                if bucket_mode == "support":
+                watchlist_ids = [int(row["class_id"]) for row in watchlist_rows]
+                _apply_bucket_annotations(eval_out, idx2label=idx2label, bucket_by_class=bucket_by_class)
+                _write_bucket_artifacts(analysis_dir, bucket_rows, watchlist_rows)
+            sched.step()
+            val_loss = float(eval_out.loss)
+            val_acc = float(eval_out.acc)
+            val_f1 = float(eval_out.macro_f1)
+            val_family_loss = float(eval_out.family_loss)
+            val_family_acc = float(eval_out.family_acc)
+            topk_acc = eval_out.topk_acc
+            val_preds = eval_out.preds
+            val_labels = eval_out.labels
+            examples = eval_out.examples
+
+            dt = time.time() - t0
+            print(
+                f"[Ep {epoch:03d}] TL={tr_loss:.4f} | VL={val_loss:.4f} | VA={val_acc:.3f} | VF1={val_f1:.3f} | "
+                f"lr={optimizer.param_groups[0]['lr']:.2e} | {dt:.1f}s"
+            )
+            print("pred top5:", Counter(val_preds).most_common(5))
+
+            f1_micro = f1_score(val_labels, val_preds, average="micro") if val_labels else 0.0
+            f1_weighted = f1_score(val_labels, val_preds, average="weighted") if val_labels else 0.0
+            p_macro, r_macro, _, _ = (
+                precision_recall_fscore_support(val_labels, val_preds, average="macro", zero_division=0)
+                if val_labels
+                else (0.0, 0.0, 0.0, None)
+            )
+            bucket_metrics = _bucket_aggregates(eval_out.per_class, bucket_by_class, tuple(bucket_spec["bucket_names"]))
+            per_class_dist = _compute_per_class_distribution_metrics(eval_out.per_class)
+            zero_f1_count = int(sum(1 for row in eval_out.per_class.values() if float(row["f1"]) <= 1e-12))
+            nonzero_f1_count = int(len(eval_out.per_class) - zero_f1_count)
+            conf_arr = np.asarray(eval_out.probs_top1, dtype=np.float64) if eval_out.probs_top1 else np.zeros(0, dtype=np.float64)
+            margin_arr = np.asarray(eval_out.margin, dtype=np.float64) if eval_out.margin else np.zeros(0, dtype=np.float64)
+            entropy_arr = np.asarray(eval_out.entropy, dtype=np.float64) if eval_out.entropy else np.zeros(0, dtype=np.float64)
+            correct_arr = np.asarray([int(p == t) for p, t in zip(val_preds, val_labels)], dtype=np.int64) if val_labels else np.zeros(0, dtype=np.int64)
+            high_conf_wrong_mask = (correct_arr == 0) & (conf_arr >= 0.90) if conf_arr.size else np.zeros(0, dtype=bool)
+            high_conf_wrong_count = int(high_conf_wrong_mask.sum()) if high_conf_wrong_mask.size else 0
+            high_conf_wrong_rate = float(high_conf_wrong_count / max(1, len(val_labels))) if val_labels else 0.0
+            confidence_mean = float(conf_arr.mean()) if conf_arr.size else 0.0
+            confidence_correct_mean = float(conf_arr[correct_arr == 1].mean()) if np.any(correct_arr == 1) else 0.0
+            confidence_wrong_mean = float(conf_arr[correct_arr == 0].mean()) if np.any(correct_arr == 0) else 0.0
+            prob_margin_mean = float(margin_arr.mean()) if margin_arr.size else 0.0
+            prob_margin_wrong_mean = float(margin_arr[correct_arr == 0].mean()) if np.any(correct_arr == 0) else 0.0
+            entropy_mean = float(entropy_arr.mean()) if entropy_arr.size else 0.0
+            f1_gain_vs_prev = float(val_f1 - history[-1]["val_f1"]) if history else 0.0
+            loss_gap_train_minus_val = float(tr_loss - val_loss)
+            f1_gap_macro_minus_weighted = float(val_f1 - f1_weighted)
+            es_armed = bool(es_patience > 0 and epoch >= es_start_epoch)
+
+            history.append(
+                dict(
+                    epoch=epoch,
+                    train_loss=tr_loss,
+                    train_total_loss=tr_total_loss,
+                    train_family_loss=tr_family_loss,
+                    train_family_acc=tr_family_acc,
+                    train_supcon_loss=float(train_out.supcon_loss),
+                    train_supcon_valid_anchors=int(train_out.supcon_valid_anchors),
+                    train_supcon_positive_pairs=int(train_out.supcon_positive_pairs),
+                    val_loss=val_loss,
+                    val_acc=val_acc,
+                    val_f1=val_f1,
+                    val_family_loss=val_family_loss,
+                    val_family_acc=val_family_acc,
+                    val_bucket_mode=bucket_mode,
+                    val_f1_tail=(float(bucket_metrics.get("f1_tail", 0.0)) if bucket_mode == "support" else None),
+                    val_f1_hard=(float(bucket_metrics.get("f1_hard", 0.0)) if bucket_mode == "difficulty" else None),
+                    val_ece=float(eval_out.calibration.get("ece_15bin", 0.0)),
+                    val_brier=float(eval_out.calibration.get("brier", 0.0)),
+                    val_nll=float(eval_out.calibration.get("nll", 0.0)),
+                )
+            )
+
+            per_class_rows = []
+            for class_id, row in sorted(eval_out.per_class.items()):
+                row_out = dict(row)
+                row_out["epoch"] = int(epoch)
+                row_out["global_step"] = int(global_step)
+                row_out["bucket_mode"] = bucket_mode
+                per_class_rows.append(row_out)
+            worst_classes_rows = sorted(per_class_rows, key=lambda row: (float(row["f1"]), int(row["support_train"]), int(row["class_id"])))
+            biggest_late_drop_rows = _compute_biggest_late_drops(
+                eval_out.per_class,
+                analysis_state.get("per_class_peak_f1", {}),
+                limit=int(args.tb_tables_k),
+            )
+            prediction_rows = _prediction_csv_rows(eval_out.records, train_support, bucket_by_class)
+            error_rows = [row for row in prediction_rows if int(row["correct"]) == 0]
+            worst_error_rows = _select_error_rows(prediction_rows, bucket_filter=None, limit=int(args.tb_tables_k))
+            focus_error_rows = _select_error_rows(
+                prediction_rows,
+                bucket_filter=str(bucket_spec["focus_bucket"]),
+                limit=int(args.tb_tables_k),
+            )
+            confusion_pairs_top = eval_out.confusion_pairs[: max(1, int(args.tb_tables_k))]
+            confusion_pairs_tail = [
+                row for row in eval_out.confusion_pairs if str(row.get("bucket_true")) == str(bucket_spec["focus_bucket"])
+            ][: max(1, int(args.tb_tables_k))]
+            watchlist_id_set = set(watchlist_ids)
+            confusion_pairs_watchlist = [
+                row for row in eval_out.confusion_pairs if int(row.get("true_id", -1)) in watchlist_id_set
+            ][: max(1, int(args.tb_tables_k))]
+
+            if tb_logger.enabled:
+                tb_logger.scalar("meta/early_stop_armed", float(es_armed), global_step)
+                tb_logger.scalar("val/loss", float(val_loss), global_step)
+                tb_logger.scalar("val/acc", float(val_acc), global_step)
+                tb_logger.scalar("val/f1_macro", float(val_f1), global_step)
+                tb_logger.scalar("val/family_loss", float(val_family_loss), global_step)
+                tb_logger.scalar("val/family_acc", float(val_family_acc), global_step)
+                if 3 in topk_acc:
+                    tb_logger.scalar("val/acc_top3", float(topk_acc[3]), global_step)
+                if 5 in topk_acc:
+                    tb_logger.scalar("val/acc_top5", float(topk_acc[5]), global_step)
+                if val_labels:
+                    tb_logger.scalar("val/f1_micro", float(f1_micro), global_step)
+                    tb_logger.scalar("val/f1_weighted", float(f1_weighted), global_step)
+                    tb_logger.scalar("val/ece_15bin", float(eval_out.calibration.get("ece_15bin", 0.0)), global_step)
+                    tb_logger.scalar("val/brier", float(eval_out.calibration.get("brier", 0.0)), global_step)
+                    tb_logger.scalar("val/nll", float(eval_out.calibration.get("nll", 0.0)), global_step)
+                    tb_logger.scalar("val/confidence_mean", confidence_mean, global_step)
+                    tb_logger.scalar("val/confidence_correct_mean", confidence_correct_mean, global_step)
+                    tb_logger.scalar("val/confidence_wrong_mean", confidence_wrong_mean, global_step)
+                    tb_logger.scalar("val/prob_margin_mean", prob_margin_mean, global_step)
+                    tb_logger.scalar("val/prob_margin_wrong_mean", prob_margin_wrong_mean, global_step)
+                    tb_logger.scalar("val/entropy_mean", entropy_mean, global_step)
+                    tb_logger.scalar("val/per_class_f1_p10", float(per_class_dist["per_class_f1_p10"]), global_step)
+                    tb_logger.scalar("val/per_class_f1_p25", float(per_class_dist["per_class_f1_p25"]), global_step)
+                    tb_logger.scalar("val/per_class_f1_median", float(per_class_dist["per_class_f1_median"]), global_step)
+                    tb_logger.scalar("val/per_class_recall_p10", float(per_class_dist["per_class_recall_p10"]), global_step)
+                    tb_logger.scalar("val/high_conf_wrong_count", float(high_conf_wrong_count), global_step)
+                    tb_logger.scalar("val/high_conf_wrong_rate", float(high_conf_wrong_rate), global_step)
+                    tb_logger.scalar("val/precision_macro", float(p_macro), global_step)
+                    tb_logger.scalar("val/recall_macro", float(r_macro), global_step)
+                    tb_logger.scalar("val/zero_f1_count", float(zero_f1_count), global_step)
+                    tb_logger.scalar("val/nonzero_f1_count", float(nonzero_f1_count), global_step)
+                    tb_logger.scalar("val/f1_gap_macro_minus_weighted", float(f1_gap_macro_minus_weighted), global_step)
+                    tb_logger.scalar("val/f1_gain_vs_prev", float(f1_gain_vs_prev), global_step)
+                    tb_logger.scalar("val/loss_gap_train_minus_val", float(loss_gap_train_minus_val), global_step)
+                    topk_support = int(max(0, args.tb_support_topk))
+                    if topk_support > 0:
+                        order = sorted(
+                            (row for row in per_class_rows if int(row["support_val"]) > 0),
+                            key=lambda row: (-int(row["support_val"]), int(row["class_id"])),
+                        )
+                        for row in order[: min(topk_support, len(order))]:
+                            idx = int(row["class_id"])
+                            label_name = _sanitize_label(idx2label.get(idx, str(idx)))
+                            tb_logger.scalar(f"val/support/{label_name}", float(row["support_val"]), global_step)
+                            tb_logger.scalar(f"val/p_class/{label_name}", float(row["precision"]), global_step)
+                            tb_logger.scalar(f"val/r_class/{label_name}", float(row["recall"]), global_step)
+                            tb_logger.scalar(f"val/f1_class/{label_name}", float(row["f1"]), global_step)
+                    worstk = int(max(0, args.tb_worstk_f1))
+                    if worstk > 0:
+                        for row in worst_classes_rows[: min(worstk, len(worst_classes_rows))]:
+                            idx = int(row["class_id"])
+                            label_name = _sanitize_label(idx2label.get(idx, str(idx)))
+                            tb_logger.scalar(f"val/f1_worst/{label_name}", float(row["f1"]), global_step)
+                            tb_logger.scalar(f"val/p_worst/{label_name}", float(row["precision"]), global_step)
+                            tb_logger.scalar(f"val/r_worst/{label_name}", float(row["recall"]), global_step)
+                    if args.tb_log_tail_buckets or args.tb_full_logging:
+                        tb_logger.scalar("meta/difficulty_frozen", float(bool(analysis_state.get("difficulty_frozen", False))), global_step)
+                        tb_logger.scalar("meta/bucket_mode_support", float(bucket_mode == "support"), global_step)
+                        tb_logger.scalar("meta/bucket_mode_difficulty", float(bucket_mode == "difficulty"), global_step)
+                        if bucket_mode == "support":
+                            tb_logger.scalar("val_bucket/f1_head", float(bucket_metrics.get("f1_head", 0.0)), global_step)
+                            tb_logger.scalar("val_bucket/f1_mid", float(bucket_metrics.get("f1_mid", 0.0)), global_step)
+                            tb_logger.scalar("val_bucket/f1_tail", float(bucket_metrics.get("f1_tail", 0.0)), global_step)
+                            tb_logger.scalar("val_bucket/p_head", float(bucket_metrics.get("p_head", 0.0)), global_step)
+                            tb_logger.scalar("val_bucket/p_mid", float(bucket_metrics.get("p_mid", 0.0)), global_step)
+                            tb_logger.scalar("val_bucket/p_tail", float(bucket_metrics.get("p_tail", 0.0)), global_step)
+                            tb_logger.scalar("val_bucket/r_head", float(bucket_metrics.get("r_head", 0.0)), global_step)
+                            tb_logger.scalar("val_bucket/r_mid", float(bucket_metrics.get("r_mid", 0.0)), global_step)
+                            tb_logger.scalar("val_bucket/r_tail", float(bucket_metrics.get("r_tail", 0.0)), global_step)
+                            tb_logger.scalar("val_bucket/zero_f1_head_count", float(bucket_metrics.get("zero_f1_head_count", 0.0)), global_step)
+                            tb_logger.scalar("val_bucket/zero_f1_mid_count", float(bucket_metrics.get("zero_f1_mid_count", 0.0)), global_step)
+                            tb_logger.scalar("val_bucket/zero_f1_tail_count", float(bucket_metrics.get("zero_f1_tail_count", 0.0)), global_step)
+                        else:
+                            tb_logger.scalar("val_difficulty/f1_easy", float(bucket_metrics.get("f1_easy", 0.0)), global_step)
+                            tb_logger.scalar("val_difficulty/f1_mid", float(bucket_metrics.get("f1_mid", 0.0)), global_step)
+                            tb_logger.scalar("val_difficulty/f1_hard", float(bucket_metrics.get("f1_hard", 0.0)), global_step)
+                            tb_logger.scalar("val_difficulty/p_easy", float(bucket_metrics.get("p_easy", 0.0)), global_step)
+                            tb_logger.scalar("val_difficulty/p_mid", float(bucket_metrics.get("p_mid", 0.0)), global_step)
+                            tb_logger.scalar("val_difficulty/p_hard", float(bucket_metrics.get("p_hard", 0.0)), global_step)
+                            tb_logger.scalar("val_difficulty/r_easy", float(bucket_metrics.get("r_easy", 0.0)), global_step)
+                            tb_logger.scalar("val_difficulty/r_mid", float(bucket_metrics.get("r_mid", 0.0)), global_step)
+                            tb_logger.scalar("val_difficulty/r_hard", float(bucket_metrics.get("r_hard", 0.0)), global_step)
+                            tb_logger.scalar("val_difficulty/zero_f1_easy_count", float(bucket_metrics.get("zero_f1_easy_count", 0.0)), global_step)
+                            tb_logger.scalar("val_difficulty/zero_f1_mid_count", float(bucket_metrics.get("zero_f1_mid_count", 0.0)), global_step)
+                            tb_logger.scalar("val_difficulty/zero_f1_hard_count", float(bucket_metrics.get("zero_f1_hard_count", 0.0)), global_step)
+                    if args.tb_log_all_classes or args.tb_full_logging:
+                        for row in per_class_rows:
+                            class_id = int(row["class_id"])
+                            tb_logger.scalar(f"val_all/f1/{class_id}", float(row["f1"]), global_step)
+                            tb_logger.scalar(f"val_all/p/{class_id}", float(row["precision"]), global_step)
+                            tb_logger.scalar(f"val_all/r/{class_id}", float(row["recall"]), global_step)
+                            tb_logger.scalar(f"val_all/support_val/{class_id}", float(row["support_val"]), global_step)
+                            tb_logger.scalar(f"val_all/support_train/{class_id}", float(row["support_train"]), global_step)
+                            tb_logger.scalar(f"val_all/pred_count/{class_id}", float(row["pred_count"]), global_step)
+                            tb_logger.scalar(f"val_all/true_count/{class_id}", float(row["true_count"]), global_step)
+                            tb_logger.scalar(f"val_all/conf_mean/{class_id}", float(row["conf_mean"]), global_step)
+                            tb_logger.scalar(f"val_all/conf_wrong_mean/{class_id}", float(row["conf_wrong_mean"]), global_step)
+                            tb_logger.scalar(f"val_all/margin_mean/{class_id}", float(row["margin_mean"]), global_step)
+                        for class_id in watchlist_ids:
+                            row = eval_out.per_class.get(int(class_id))
+                            if row is None:
+                                continue
+                            tb_logger.scalar(f"val_watch/f1/{class_id}", float(row["f1"]), global_step)
+                            tb_logger.scalar(f"val_watch/p/{class_id}", float(row["precision"]), global_step)
+                            tb_logger.scalar(f"val_watch/r/{class_id}", float(row["recall"]), global_step)
+                            tb_logger.scalar(f"val_watch/conf_mean/{class_id}", float(row["conf_mean"]), global_step)
+                            tb_logger.scalar(f"val_watch/margin_mean/{class_id}", float(row["margin_mean"]), global_step)
+                log_confusion_now = epoch % max(1, int(args.tb_confusion_every)) == 0
+                if (args.tb_log_confusion or args.tb_full_logging) and val_labels and log_confusion_now:
+                    try:
+                        img, _ = build_confusion_image(
+                            val_labels, val_preds, idx2label, topk=int(args.tb_confusion_topk), normalize=True
+                        )
+                        tb_logger.image("val/confusion_topk", img, global_step, dataformats="HWC")
+                        secondary_ids = [
+                            class_id
+                            for class_id, bucket in bucket_by_class.items()
+                            if bucket == str(bucket_spec["secondary_bucket"])
+                        ]
+                        focus_ids = [
+                            class_id
+                            for class_id, bucket in bucket_by_class.items()
+                            if bucket == str(bucket_spec["focus_bucket"])
+                        ]
+                        img_secondary, _ = build_confusion_image(
+                            val_labels,
+                            val_preds,
+                            idx2label,
+                            topk=int(args.tb_confusion_topk),
+                            normalize=True,
+                            class_ids=secondary_ids,
+                        )
+                        tb_logger.image(
+                            f"val/confusion_{bucket_spec['secondary_label']}",
+                            img_secondary,
+                            global_step,
+                            dataformats="HWC",
+                        )
+                        img_focus, _ = build_confusion_image(
+                            val_labels,
+                            val_preds,
+                            idx2label,
+                            topk=int(args.tb_confusion_topk),
+                            normalize=True,
+                            class_ids=focus_ids,
+                        )
+                        tb_logger.image(
+                            f"val/confusion_{bucket_spec['focus_label']}",
+                            img_focus,
+                            global_step,
+                            dataformats="HWC",
+                        )
+                        tb_logger.image("val/confusion_focus", img_focus, global_step, dataformats="HWC")
+                        img_watch, _ = build_confusion_image(
+                            val_labels, val_preds, idx2label, topk=int(args.tb_confusion_topk), normalize=True, class_ids=watchlist_ids
+                        )
+                        tb_logger.image("val/confusion_watchlist", img_watch, global_step, dataformats="HWC")
+                    except Exception as exc:
+                        print(f"Warning: failed to log confusion image to TensorBoard: {exc}")
+                if collect_examples and examples:
+                    wrong = [ex for ex in examples if int(ex["pred"]) != int(ex["true"])]
+                    wrong.sort(key=lambda x: x.get("conf", 1.0))
+                    selected = wrong
+                    if len(selected) < int(args.tb_examples_k):
+                        rest = [ex for ex in examples if int(ex["pred"]) == int(ex["true"])]
+                        rest.sort(key=lambda x: x.get("conf", 1.0))
+                        selected = selected + rest
+                    text = format_examples_text(selected, idx2label, int(args.tb_examples_k))
+                    tb_logger.text("val/examples", text, global_step)
+                if args.tb_log_confusion_pairs or args.tb_full_logging:
+                    tb_logger.text("tables/confusion_pairs_top", format_confusion_pairs_text(confusion_pairs_top, max_rows=int(args.tb_tables_k)), global_step)
                     tb_logger.text(
-                        "tables/confusion_pairs_tail",
+                        "tables/confusion_pairs_focus",
                         format_confusion_pairs_text(confusion_pairs_tail, max_rows=int(args.tb_tables_k)),
                         global_step,
                     )
-                tb_logger.text(
-                    "tables/confusion_pairs_watchlist",
-                    format_confusion_pairs_text(confusion_pairs_watchlist, max_rows=int(args.tb_tables_k)),
-                    global_step,
-                )
+                    if bucket_mode == "support":
+                        tb_logger.text(
+                            "tables/confusion_pairs_tail",
+                            format_confusion_pairs_text(confusion_pairs_tail, max_rows=int(args.tb_tables_k)),
+                            global_step,
+                        )
+                    tb_logger.text(
+                        "tables/confusion_pairs_watchlist",
+                        format_confusion_pairs_text(confusion_pairs_watchlist, max_rows=int(args.tb_tables_k)),
+                        global_step,
+                    )
+                if analysis_artifacts_enabled:
+                    tb_logger.text("tables/worst_classes", format_per_class_rows_text(worst_classes_rows, max_rows=int(args.tb_tables_k)), global_step)
+                    tb_logger.text("tables/worst_errors", format_prediction_rows_text(worst_error_rows, max_rows=int(args.tb_tables_k)), global_step)
+                    tb_logger.text("tables/focus_errors", format_prediction_rows_text(focus_error_rows, max_rows=int(args.tb_tables_k)), global_step)
+                    if bucket_mode == "support":
+                        tb_logger.text("tables/tail_errors", format_prediction_rows_text(focus_error_rows, max_rows=int(args.tb_tables_k)), global_step)
+                    tb_logger.text(
+                        "tables/biggest_late_drops",
+                        format_table_text(
+                            biggest_late_drop_rows,
+                            ("class_id", "label", "bucket", "support_train", "support_val", "f1", "peak_f1", "peak_epoch", "delta_vs_peak"),
+                            max_rows=int(args.tb_tables_k),
+                        ),
+                        global_step,
+                    )
+                if args.tb_log_topology or args.tb_full_logging:
+                    topology_scalars = _collect_topology_scalars(eval_model)
+                    if topology_scalars:
+                        tb_logger.scalars(topology_scalars, global_step)
+                for name, param in hist_params:
+                    tb_logger.histogram(f"weights/{name}", param, global_step)
+                    if param.grad is not None:
+                        tb_logger.histogram(f"grads/{name}", param.grad, global_step)
+                tb_logger.flush()
+
+            should_write_predictions = analysis_artifacts_enabled and (epoch % max(1, int(args.tb_predictions_every)) == 0)
+            per_class_csv_path = per_class_dir / f"per_class_ep{epoch:03d}.csv"
+            per_class_json_path = per_class_dir / f"per_class_ep{epoch:03d}.json"
             if analysis_artifacts_enabled:
-                tb_logger.text("tables/worst_classes", format_per_class_rows_text(worst_classes_rows, max_rows=int(args.tb_tables_k)), global_step)
-                tb_logger.text("tables/worst_errors", format_prediction_rows_text(worst_error_rows, max_rows=int(args.tb_tables_k)), global_step)
-                tb_logger.text("tables/focus_errors", format_prediction_rows_text(focus_error_rows, max_rows=int(args.tb_tables_k)), global_step)
-                if bucket_mode == "support":
-                    tb_logger.text("tables/tail_errors", format_prediction_rows_text(focus_error_rows, max_rows=int(args.tb_tables_k)), global_step)
-                tb_logger.text(
-                    "tables/biggest_late_drops",
-                    format_table_text(
-                        biggest_late_drop_rows,
-                        ("class_id", "label", "bucket", "support_train", "support_val", "f1", "peak_f1", "peak_epoch", "delta_vs_peak"),
-                        max_rows=int(args.tb_tables_k),
-                    ),
-                    global_step,
+                _write_csv(
+                    per_class_csv_path,
+                    [
+                        "epoch",
+                        "global_step",
+                        "class_id",
+                        "label",
+                        "bucket",
+                        "bucket_mode",
+                        "support_train",
+                        "support_val",
+                        "precision",
+                        "recall",
+                        "f1",
+                        "pred_count",
+                        "true_count",
+                        "conf_mean",
+                        "conf_wrong_mean",
+                        "margin_mean",
+                    ],
+                    per_class_rows,
                 )
-            if args.tb_log_topology or args.tb_full_logging:
-                topology_scalars = _collect_topology_scalars(eval_model)
-                if topology_scalars:
-                    tb_logger.scalars(topology_scalars, global_step)
-            for name, param in hist_params:
-                tb_logger.histogram(f"weights/{name}", param, global_step)
-                if param.grad is not None:
-                    tb_logger.histogram(f"grads/{name}", param.grad, global_step)
-            tb_logger.flush()
+                _write_json(per_class_json_path, per_class_rows)
+            predictions_csv_path = predictions_dir / f"predictions_ep{epoch:03d}.csv"
+            errors_csv_path = errors_dir / f"errors_ep{epoch:03d}.csv"
+            if should_write_predictions and (args.tb_log_predictions_csv or args.tb_full_logging):
+                _write_csv(
+                    predictions_csv_path,
+                    [
+                        "epoch",
+                        "global_step",
+                        "video",
+                        "t0",
+                        "t1",
+                        "true_id",
+                        "pred_id",
+                        "true_label",
+                        "pred_label",
+                        "correct",
+                        "conf",
+                        "margin",
+                        "entropy",
+                        "top5_ids",
+                        "top5_labels",
+                        "top5_probs",
+                        "support_train_true",
+                        "bucket_true",
+                    ],
+                    prediction_rows,
+                )
+            if should_write_predictions and (args.tb_log_errors_csv or args.tb_full_logging):
+                _write_csv(
+                    errors_csv_path,
+                    [
+                        "epoch",
+                        "global_step",
+                        "video",
+                        "t0",
+                        "t1",
+                        "true_id",
+                        "pred_id",
+                        "true_label",
+                        "pred_label",
+                        "correct",
+                        "conf",
+                        "margin",
+                        "entropy",
+                        "top5_ids",
+                        "top5_labels",
+                        "top5_probs",
+                        "support_train_true",
+                        "bucket_true",
+                    ],
+                    error_rows,
+                )
+            confusion_csv_path = confusion_dir / f"confusion_pairs_ep{epoch:03d}.csv"
+            confusion_json_path = confusion_dir / f"confusion_pairs_ep{epoch:03d}.json"
+            if analysis_artifacts_enabled and (args.tb_log_confusion_pairs or args.tb_full_logging):
+                _write_csv(
+                    confusion_csv_path,
+                    ["true_id", "pred_id", "true_label", "pred_label", "count", "rate_within_true", "support_true", "bucket_true", "bucket_pred"],
+                    eval_out.confusion_pairs,
+                )
+                _write_json(confusion_json_path, eval_out.confusion_pairs)
 
-        should_write_predictions = analysis_artifacts_enabled and (epoch % max(1, int(args.tb_predictions_every)) == 0)
-        per_class_csv_path = per_class_dir / f"per_class_ep{epoch:03d}.csv"
-        per_class_json_path = per_class_dir / f"per_class_ep{epoch:03d}.json"
-        if analysis_artifacts_enabled:
-            _write_csv(
-                per_class_csv_path,
-                [
-                    "epoch",
-                    "global_step",
-                    "class_id",
-                    "label",
-                    "bucket",
-                    "bucket_mode",
-                    "support_train",
-                    "support_val",
-                    "precision",
-                    "recall",
-                    "f1",
-                    "pred_count",
-                    "true_count",
-                    "conf_mean",
-                    "conf_wrong_mean",
-                    "margin_mean",
-                ],
-                per_class_rows,
-            )
-            _write_json(per_class_json_path, per_class_rows)
-        predictions_csv_path = predictions_dir / f"predictions_ep{epoch:03d}.csv"
-        errors_csv_path = errors_dir / f"errors_ep{epoch:03d}.csv"
-        if should_write_predictions and (args.tb_log_predictions_csv or args.tb_full_logging):
-            _write_csv(
-                predictions_csv_path,
-                [
-                    "epoch",
-                    "global_step",
-                    "video",
-                    "t0",
-                    "t1",
-                    "true_id",
-                    "pred_id",
-                    "true_label",
-                    "pred_label",
-                    "correct",
-                    "conf",
-                    "margin",
-                    "entropy",
-                    "top5_ids",
-                    "top5_labels",
-                    "top5_probs",
-                    "support_train_true",
-                    "bucket_true",
-                ],
-                prediction_rows,
-            )
-        if should_write_predictions and (args.tb_log_errors_csv or args.tb_full_logging):
-            _write_csv(
-                errors_csv_path,
-                [
-                    "epoch",
-                    "global_step",
-                    "video",
-                    "t0",
-                    "t1",
-                    "true_id",
-                    "pred_id",
-                    "true_label",
-                    "pred_label",
-                    "correct",
-                    "conf",
-                    "margin",
-                    "entropy",
-                    "top5_ids",
-                    "top5_labels",
-                    "top5_probs",
-                    "support_train_true",
-                    "bucket_true",
-                ],
-                error_rows,
-            )
-        confusion_csv_path = confusion_dir / f"confusion_pairs_ep{epoch:03d}.csv"
-        confusion_json_path = confusion_dir / f"confusion_pairs_ep{epoch:03d}.json"
-        if analysis_artifacts_enabled and (args.tb_log_confusion_pairs or args.tb_full_logging):
-            _write_csv(
-                confusion_csv_path,
-                ["true_id", "pred_id", "true_label", "pred_label", "count", "rate_within_true", "support_true", "bucket_true", "bucket_pred"],
-                eval_out.confusion_pairs,
-            )
-            _write_json(confusion_json_path, eval_out.confusion_pairs)
+            _update_peak_state(analysis_state.setdefault("per_class_peak_f1", {}), eval_out.per_class, epoch)
 
-        _update_peak_state(analysis_state.setdefault("per_class_peak_f1", {}), eval_out.per_class, epoch)
-
-        improved = val_f1 > (best_f1 + es_min_delta)
-        if improved:
-            best_f1 = val_f1
-            epochs_no_improve = 0
-        else:
-            if es_armed:
-                epochs_no_improve += 1
-            else:
+            improved = val_f1 > (best_f1 + es_min_delta)
+            if improved:
+                best_f1 = val_f1
                 epochs_no_improve = 0
+            else:
+                if es_armed:
+                    epochs_no_improve += 1
+                else:
+                    epochs_no_improve = 0
 
-        if analysis_artifacts_enabled:
-            epoch_index_rows = analysis_state.setdefault("epoch_index", [])
-            epoch_index_rows.append(
-                {
-                    "epoch": int(epoch),
-                    "global_step": int(global_step),
-                    "best_f1_so_far": float(best_f1),
-                    "event_log_dir": tb_path,
-                    "bucket_mode": bucket_mode,
-                }
-            )
-            _write_csv(
-                analysis_dir / "epoch_index.csv",
-                ["epoch", "global_step", "best_f1_so_far", "event_log_dir", "bucket_mode"],
-                epoch_index_rows,
-            )
-
-        ckpt_payload = _build_checkpoint(
-            epoch=epoch,
-            model=model,
-            optimizer=optimizer,
-            sched=sched,
-            scaler=scaler,
-            ema=ema,
-            label2idx=label2idx,
-            ds_cfg_dict=ds_cfg_dict,
-            best_f1=best_f1,
-            epochs_no_improve=epochs_no_improve,
-            global_step=global_step,
-            history=history,
-            analysis_state=analysis_state,
-            args=args,
-        )
-        torch.save(ckpt_payload, out_dir / "last.ckpt")
-        if improved:
-            torch.save(ckpt_payload, out_dir / "best.ckpt")
             if analysis_artifacts_enabled:
-                _copy_if_exists(per_class_dir / f"per_class_ep{epoch:03d}.csv", analysis_dir / "best_per_class.csv")
-                _copy_if_exists(per_class_dir / f"per_class_ep{epoch:03d}.json", analysis_dir / "best_per_class.json")
-                _copy_if_exists(predictions_dir / f"predictions_ep{epoch:03d}.csv", analysis_dir / "best_predictions.csv")
-                _copy_if_exists(errors_dir / f"errors_ep{epoch:03d}.csv", analysis_dir / "best_errors.csv")
-                _copy_if_exists(confusion_dir / f"confusion_pairs_ep{epoch:03d}.csv", analysis_dir / "best_confusion_pairs.csv")
-                _copy_if_exists(confusion_dir / f"confusion_pairs_ep{epoch:03d}.json", analysis_dir / "best_confusion_pairs.json")
-            print(f"  -> new best macro-F1 = {best_f1:.4f} (checkpoint saved)")
+                epoch_index_rows = analysis_state.setdefault("epoch_index", [])
+                epoch_index_rows.append(
+                    {
+                        "epoch": int(epoch),
+                        "global_step": int(global_step),
+                        "best_f1_so_far": float(best_f1),
+                        "event_log_dir": tb_path,
+                        "bucket_mode": bucket_mode,
+                    }
+                )
+                _write_csv(
+                    analysis_dir / "epoch_index.csv",
+                    ["epoch", "global_step", "best_f1_so_far", "event_log_dir", "bucket_mode"],
+                    epoch_index_rows,
+                )
 
-        # Per-class F1 (every 5 epochs)
-        if epoch % 5 == 0:
-            report = classification_report(val_labels, val_preds, output_dict=True, zero_division=0)
-            with (out_dir / f"report_ep{epoch:03d}.json").open("w", encoding="utf-8") as f:
-                json.dump(report, f, ensure_ascii=False, indent=2)
+            ckpt_payload = _build_checkpoint(
+                epoch=epoch,
+                model=model,
+                optimizer=optimizer,
+                sched=sched,
+                scaler=scaler,
+                ema=ema,
+                label2idx=label2idx,
+                ds_cfg_dict=ds_cfg_dict,
+                best_f1=best_f1,
+                epochs_no_improve=epochs_no_improve,
+                global_step=global_step,
+                history=history,
+                analysis_state=analysis_state,
+                args=args,
+            )
+            torch.save(ckpt_payload, out_dir / "last.ckpt")
+            if improved:
+                torch.save(ckpt_payload, out_dir / "best.ckpt")
+                if analysis_artifacts_enabled:
+                    _copy_if_exists(per_class_dir / f"per_class_ep{epoch:03d}.csv", analysis_dir / "best_per_class.csv")
+                    _copy_if_exists(per_class_dir / f"per_class_ep{epoch:03d}.json", analysis_dir / "best_per_class.json")
+                    _copy_if_exists(predictions_dir / f"predictions_ep{epoch:03d}.csv", analysis_dir / "best_predictions.csv")
+                    _copy_if_exists(errors_dir / f"errors_ep{epoch:03d}.csv", analysis_dir / "best_errors.csv")
+                    _copy_if_exists(confusion_dir / f"confusion_pairs_ep{epoch:03d}.csv", analysis_dir / "best_confusion_pairs.csv")
+                    _copy_if_exists(confusion_dir / f"confusion_pairs_ep{epoch:03d}.json", analysis_dir / "best_confusion_pairs.json")
+                print(f"  -> new best macro-F1 = {best_f1:.4f} (checkpoint saved)")
 
-        # Save history
-        with (out_dir / "history.json").open("w", encoding="utf-8") as f:
-            json.dump(history, f, ensure_ascii=False, indent=2)
+            # Per-class F1 (every 5 epochs)
+            if epoch % 5 == 0:
+                report = classification_report(val_labels, val_preds, output_dict=True, zero_division=0)
+                with (out_dir / f"report_ep{epoch:03d}.json").open("w", encoding="utf-8") as f:
+                    json.dump(report, f, ensure_ascii=False, indent=2)
 
-        if es_armed and epochs_no_improve >= es_patience:
-            print(f"Early stopping: no val_f1 improvement for {es_patience} epochs. Best_f1={best_f1:.4f}")
-            break
+            # Save history
+            with (out_dir / "history.json").open("w", encoding="utf-8") as f:
+                json.dump(history, f, ensure_ascii=False, indent=2)
 
-    print(f"Done. Best macro-F1 = {best_f1:.4f}")
+            if es_armed and epochs_no_improve >= es_patience:
+                print(f"Early stopping: no val_f1 improvement for {es_patience} epochs. Best_f1={best_f1:.4f}")
+                break
+
+    rebalance_summary, global_step = _run_head_only_rebalance_stage(
+        model=model,
+        out_dir=out_dir,
+        analysis_dir=analysis_dir,
+        train_ds=train_ds,
+        val_loader=val_loader,
+        label2idx=label2idx,
+        weights_tensor=weights_tensor,
+        args=args,
+        profile=effective_profile,
+        device=device,
+        A=A,
+        mirror_idx=mirror_idx,
+        train_support=train_support,
+        global_step=global_step,
+        use_amp=use_amp,
+        amp_dtype=amp_dtype,
+        tb_logger=tb_logger,
+    )
+    run_manifest["head_only_rebalance"]["results"] = rebalance_summary
+    _write_json(analysis_dir / "run_manifest.json", run_manifest)
+
+    reported_best_f1 = float(best_f1)
+    if reported_best_f1 < 0.0 and baseline_best_f1_for_reporting is not None:
+        reported_best_f1 = float(baseline_best_f1_for_reporting)
+    print(f"Done. Best macro-F1 = {reported_best_f1:.4f}")
+    if rebalance_summary.get("enabled"):
+        if rebalance_summary.get("skipped_reason"):
+            print(f"Head-only rebalance skipped: {rebalance_summary['skipped_reason']}")
+        else:
+            print(
+                "Head-only rebalance done. "
+                f"Best macro-F1 = {float(rebalance_summary.get('best_val_f1', 0.0)):.4f} "
+                f"(epoch {int(rebalance_summary.get('best_epoch', 0))})."
+            )
     if tb_logger.enabled:
         tb_logger.hparams(
             {
@@ -2218,6 +2678,14 @@ def run_training(args) -> None:
                 "use_logit_adjustment": bool(args.use_logit_adjustment),
                 "use_cosine_head": bool(args.use_cosine_head),
                 "cosine_subcenters": int(args.cosine_subcenters),
+                "use_family_head": bool(args.use_family_head),
+                "family_loss_weight": float(args.family_loss_weight),
+                "num_families": int(num_families),
+                "head_only_rebalance_epochs": int(args.head_only_rebalance_epochs),
+                "head_only_rebalance_lr": float(args.head_only_rebalance_lr),
+                "auto_head_only_rebalance_stop": bool(args.auto_head_only_rebalance_stop),
+                "head_only_rebalance_use_logit_adjustment": bool(args.head_only_rebalance_use_logit_adjustment),
+                "head_only_rebalance_weighted_sampler": bool(args.head_only_rebalance_weighted_sampler),
                 "use_ctr_hand_refine": bool(args.use_ctr_hand_refine),
                 "ctr_in_stream_encoder": bool(args.ctr_in_stream_encoder),
                 "use_packed_skeleton_cache": bool(args.use_packed_skeleton_cache),
@@ -2230,6 +2698,9 @@ def run_training(args) -> None:
                 "early_stop_min_delta_effective": float(es_min_delta),
                 "early_stop_start_epoch_effective": int(es_start_epoch),
             },
-            {"best_val_f1": float(best_f1)},
+            {
+                "best_val_f1": float(best_f1),
+                "best_rebalance_val_f1": float(rebalance_summary.get("best_val_f1", 0.0)),
+            },
         )
         tb_logger.close()

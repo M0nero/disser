@@ -361,8 +361,8 @@ class BioTagger(nn.Module):
             state.mask_buf[:, idx] = mask
             state.n += 1
         else:
-            state.pts_buf[:, :-1] = state.pts_buf[:, 1:]
-            state.mask_buf[:, :-1] = state.mask_buf[:, 1:]
+            state.pts_buf[:, :-1] = state.pts_buf[:, 1:].clone()
+            state.mask_buf[:, :-1] = state.mask_buf[:, 1:].clone()
             state.pts_buf[:, -1] = pt
             state.mask_buf[:, -1] = mask
 

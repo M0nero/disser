@@ -62,6 +62,33 @@ python scripts/extract_keypoints.py `
 - Optional `_pp.json` (post-processed)
 - Eval report JSON (if `--eval-report` is set)
 
+## Extract Keypoints For Manifest Segments
+
+Use this for IPNHand `D0X` background chunks or any other pre-cut segments manifest:
+
+```bash
+python scripts/extract_keypoints.py \
+  --in-dir datasets/ipnhand/videos \
+  --segments-manifest outputs/ipnhand/manifests/ipn_d0x_manifest.jsonl \
+  --out-dir datasets/skeletons/ipnhand \
+  --eval-report outputs/ipnhand/eval_report.json \
+  --image-coords \
+  --stride 1 \
+  --pose-every 1 \
+  --keep-pose-indices 0,9,10,11,12,13,14,15,16,23,24 \
+  --postprocess \
+  --jobs 8 \
+  --skip-existing
+```
+
+Notes:
+
+- In `--segments-manifest` mode the script matches rows by `video_id`, cuts `[start,end)` from the source video, and writes one output file per `seg_uid`.
+- Outputs are JSON / `_pp.json` segment files; `bio ipn-prelabel` can now consume those directly, so an extra JSON->NPZ converter is no longer required.
+- The intended next step is to run `bio ipn-prelabel` separately for `--split train` and `--split val`, consuming `datasets/skeletons/ipnhand` and producing `outputs/ipnhand/prelabels_train` and `outputs/ipnhand/prelabels_val`.
+- If you are rebuilding the full BIO dataset, the canonical next step is `python -m bio build-dataset`, which will reuse these IPN pools and write `outputs/bio_out_v2/...`.
+- For IPNHand `D0X`, generate the manifest first with `python -m bio ipn-make-manifest --config bio/configs/ipn_default.json`.
+
 ## Notes
 
 - Export writes both raw and `_pp` JSON files; downstream training (msagcn/bio) prefers `_pp` by default.

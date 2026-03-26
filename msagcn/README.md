@@ -287,6 +287,125 @@ When enabled:
 - `--supcon_mixed_repeated_samples` must be at least `2`
 - `--supcon_mixed_repeated_classes * --supcon_mixed_repeated_samples <= --batch`
 
+## Auxiliary Family Head
+
+`msagcn` can optionally add a train-time auxiliary family-classification head on top of the same
+pooled feature used by the main class head.
+
+- the main prediction target remains the original class label
+- inference still uses the usual skeleton-only inputs
+- the family head uses the pooled embedding and does not change inference inputs
+- the family map must be supplied explicitly via `--family_map`
+- this is intended for train-only family supervision; the family map should be built from train-only data
+
+Expected `family_map.json` shape:
+
+```json
+{
+  "version": 1,
+  "num_classes": 1000,
+  "num_families": 128,
+  "class_to_family": {
+    "0": 17,
+    "1": 4,
+    "2": 4
+  },
+  "metadata": {
+    "method": "manual_or_train_only"
+  }
+}
+```
+
+Example:
+
+```
+python -m msagcn.train --json datasets/skeletons --csv datasets/data/annotations.csv --out outputs/runs/agcn_family \
+  --use_family_head --family_map outputs/families/family_map.json --family_loss_weight 0.25 --family_eval
+```
+
+Notes:
+- `--use_family_head` requires `--family_map`
+- family ids must be contiguous `[0, num_families - 1]`
+- when adding the family head on top of an older single-head checkpoint, prefer `--resume_model_only`
+- the current implementation only adds auxiliary supervision; class-level inference remains unchanged
+
+## Train-Only OOF Family Pipeline
+
+For a leakage-safe family map, build it from train-only OOF artifacts instead of validation confusion.
+
+Stage 1: build an OOF cache from the original training split only:
+
+```
+python tools/build_oof_cache.py --json datasets/skeletons --csv datasets/data/annotations.csv \
+  --ckpt outputs/runs/agcn_best/best.ckpt --out outputs/families/oof_cache --folds 5 --fold_epochs 6
+```
+
+By default the OOF cache now writes:
+- `oof_predictions.csv`
+- `oof_predictions.parquet` when a parquet engine is available
+- sharded arrays under:
+  - `oof_features_shards/`
+  - `oof_kinematics_shards/`
+  - optional `oof_logits_shards/`
+- legacy monolithic `.npy` files are still written for backward compatibility
+
+Stage 2: build `family_map.json` from the OOF cache:
+
+```
+python tools/build_family_map.py --oof_dir outputs/families/oof_cache \
+  --out outputs/families/family_map.json --num_families 128
+```
+
+Or let the builder choose `num_families` automatically from train-only OOF diagnostics:
+
+```
+python tools/build_family_map.py --oof_dir outputs/families/oof_cache \
+  --out outputs/families/family_map.json --auto_num_families
+```
+
+Then fine-tune with auxiliary family supervision:
+
+```
+python -m msagcn.train --json datasets/skeletons --csv datasets/data/annotations.csv --out outputs/runs/agcn_family \
+  --resume outputs/runs/agcn_best/best.ckpt --resume_model_only \
+  --use_family_head --family_map outputs/families/family_map.json --family_loss_weight 0.25
+```
+
+An additional lightweight classifier-only second stage is also available:
+
+```
+python -m msagcn.train ... --use_family_head --family_map outputs/families/family_map.json \
+  --head_only_rebalance_epochs 5 --head_only_rebalance_lr 1e-4 --head_only_rebalance_use_logit_adjustment
+```
+
+You can make that second stage stop early automatically while keeping `--head_only_rebalance_epochs`
+as a hard cap:
+
+```
+python -m msagcn.train ... --use_family_head --family_map outputs/families/family_map.json \
+  --head_only_rebalance_epochs 5 --auto_head_only_rebalance_stop \
+  --head_only_rebalance_lr 1e-4 --head_only_rebalance_use_logit_adjustment
+```
+
+See [docs/oof_family_pipeline.md](/mnt/c/Users/Damir/Desktop/Disser/docs/oof_family_pipeline.md) for the full sequence and artifact names.
+
+For a one-command orchestration pass:
+
+```
+python tools/run_oof_family_pipeline.py \
+  --json datasets/skeletons \
+  --csv datasets/data/annotations.csv \
+  --ckpt outputs/runs/agcn_best/best.ckpt \
+  --out_root outputs/families/run_001 \
+  --folds 5 \
+  --fold_epochs 6 \
+  --auto_num_families \
+  --family_loss_weight 0.25 \
+  --family_eval \
+  --head_only_rebalance_epochs 5 \
+  --auto_head_only_rebalance_stop
+```
+
 ## Notes
 
 - When `--json` points to a per-video directory, training prefers `*_pp.json` if present.

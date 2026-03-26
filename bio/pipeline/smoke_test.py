@@ -10,13 +10,13 @@ Usage:
     --split train
 
 What it checks:
-  - Step1 runs and produces index.json + at least one non-empty sample.
+  - Step1 runs and produces canonical index.json/index.csv rows with split + dataset metadata.
   - For a sign sample: exactly one B and some I.
   - If there is any no_event with frames: B==0 and I==0.
-  - Step2 runs (only if no_event with frames exists) and produces shards with B present in many samples.
+  - Step2 runs (using native tails/no_event negatives) and produces shards with B present in many samples.
 
 Notes:
-  - Current Step2 implementation hard-requires no_event clips with frames; otherwise it raises.
+  - Current Step2 implementation still needs some O-source frames, but they may come from sign tails as well.
 """
 
 from __future__ import annotations
@@ -284,6 +284,10 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     index_rows = load_index(prelabel_dir)
     print(f"Step1 produced {len(index_rows)} index rows")
+    required_fields = {"vid", "label_str", "path_to_npz", "T_total", "start_idx", "end_idx", "is_no_event", "split", "dataset", "source_group"}
+    missing_fields = required_fields - set(index_rows[0].keys())
+    if missing_fields:
+        raise RuntimeError(f"Step1 index rows are missing canonical fields: {sorted(missing_fields)}")
 
     sign_row = pick_sample(index_rows, want_no_event=False)
     if sign_row is None:
@@ -346,7 +350,10 @@ def main(argv: Optional[List[str]] = None) -> None:
     stats_path = synth_dir / "stats.json"
     stats = json.loads(stats_path.read_text(encoding="utf-8"))
     gen = stats.get("generated", {})
-    print("Step2 stats:", json.dumps(gen, ensure_ascii=False, indent=2))
+    print("Step2 stats:", json.dumps(gen, ensure_ascii=True, indent=2))
+    for key in ("no_event_source_counts", "gap_stats", "pad_stats", "tail_len_stats"):
+        if key not in gen:
+            raise RuntimeError(f"Step2 stats.json is missing generated.{key}")
 
     frac = float(gen.get("samples_with_B_frac", 0.0))
     if frac < 0.5:
@@ -378,7 +385,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     except Exception as e:
         print("[WARN] ShardDataset/sampler test skipped/failed:", e)
 
-    print("\n✅ Smoke test PASSED (Step1+Step2).")
+    print("\nSmoke test PASSED (Step1+Step2).")
 
 
 if __name__ == "__main__":

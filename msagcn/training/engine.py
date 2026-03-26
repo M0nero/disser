@@ -15,10 +15,24 @@ from .utils import move_to_device
 from utils.tensorboard_logger import TensorboardLogger
 
 
+def _unwrap_model(model: nn.Module) -> nn.Module:
+    return model._orig_mod if hasattr(model, "_orig_mod") else model
+
+
+def _set_backbone_eval_mode(model: nn.Module) -> None:
+    base = _unwrap_model(model)
+    for name in ("stems", "fuse", "node_attn", "stream_encoder", "pre_fuse_norm", "blocks", "pool", "embed_norm"):
+        module = getattr(base, name, None)
+        if module is not None:
+            module.eval()
+
+
 @dataclass
 class TrainOutputs:
     loss: float
     total_loss: float
+    family_loss: float
+    family_acc: float
     supcon_loss: float
     supcon_valid_anchors: int
     supcon_positive_pairs: int
@@ -32,6 +46,8 @@ class EvalOutputs:
     loss: float
     acc: float
     macro_f1: float
+    family_loss: float
+    family_acc: float
     topk_acc: Dict[int, float]
     labels: List[int]
     preds: List[int]
@@ -69,6 +85,10 @@ def train_one_epoch(
     supcon_criterion=None,
     supcon_weight: float = 0.0,
     supcon_start_epoch: int = 0,
+    family_criterion=None,
+    family_loss_weight: float = 0.0,
+    family_warmup_epochs: int = 0,
+    class_to_family: torch.Tensor | None = None,
     epoch: int = 0,
     log_batch_label_stats: bool = False,
     expected_batch_unique_classes: int | None = None,
@@ -76,8 +96,11 @@ def train_one_epoch(
     expected_mixed_repeated_classes: int | None = None,
     expected_mixed_repeated_samples: int | None = None,
     expected_mixed_singleton_classes: int | None = None,
+    freeze_feature_extractor: bool = False,
 ):
     model.train()
+    if freeze_feature_extractor:
+        _set_backbone_eval_mode(model)
     optimizer.zero_grad(set_to_none=True)
 
     epoch_start = time.time()
@@ -89,12 +112,21 @@ def train_one_epoch(
     steps = 0
     nonfinite_batches = 0
     skipped_updates = 0
+    family_loss_sum = 0.0
+    family_correct = 0
+    family_total = 0
     supcon_loss_sum = 0.0
     supcon_valid_anchor_sum = 0
     supcon_positive_pair_sum = 0
     max_batches = max_batches if max_batches and max_batches > 0 else None
     tb_enabled = tb_logger is not None and tb_logger.enabled and tb_log_every > 0
     supcon_active = bool(supcon_criterion is not None and float(supcon_weight) > 0.0 and int(epoch) >= int(supcon_start_epoch))
+    family_active = bool(
+        family_criterion is not None
+        and class_to_family is not None
+        and float(family_loss_weight) > 0.0
+        and int(epoch) > int(family_warmup_epochs)
+    )
 
     for step, (X, y, metas) in enumerate(loader, start=1):
         if max_batches is not None and step > max_batches:
@@ -176,19 +208,32 @@ def train_one_epoch(
             dtype=amp_dtype,
             enabled=use_amp,
         ):
-            if supcon_active:
-                logits, features = model(x_streams, mask=mask, A=A, y=y, return_features=True)
-                features = torch.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+            if supcon_active or family_active:
+                outputs = model(x_streams, mask=mask, A=A, y=y, return_dict=True)
+                logits = outputs["logits"]
+                features = torch.nan_to_num(outputs["features"], nan=0.0, posinf=0.0, neginf=0.0)
+                family_logits = outputs.get("family_logits")
             else:
                 logits = model(x_streams, mask=mask, A=A, y=y)
+                family_logits = None
             logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0)
             cls_loss = criterion(logits, y)
+            if family_active:
+                family_y = class_to_family[y]
+                if family_logits is None:
+                    raise RuntimeError("family supervision is active, but model did not return family_logits")
+                fam_loss = family_criterion(family_logits, family_y)
+            else:
+                family_y = None
+                fam_loss = cls_loss.new_zeros(())
             if supcon_active:
                 supcon_loss = supcon_criterion(features, y).to(dtype=cls_loss.dtype)
                 total_batch_loss = cls_loss + float(supcon_weight) * supcon_loss
             else:
                 supcon_loss = cls_loss.new_zeros(())
                 total_batch_loss = cls_loss
+            if family_active:
+                total_batch_loss = total_batch_loss + float(family_loss_weight) * fam_loss
             loss = total_batch_loss / accum_steps
         t_fwd_sum += time.time() - t1
 
@@ -205,6 +250,7 @@ def train_one_epoch(
             supcon_stats = getattr(supcon_criterion, "last_stats", {}) if supcon_active else {}
             tb_logger.scalar("train/loss", float(cls_loss.item()), global_step)
             tb_logger.scalar("train/total_loss", float(total_batch_loss.item()), global_step)
+            tb_logger.scalar("train/family_loss", float(fam_loss.item()), global_step)
             tb_logger.scalar("train/supcon_loss", float(supcon_loss.item()), global_step)
             tb_logger.scalar(
                 "train/supcon_valid_anchors",
@@ -220,6 +266,11 @@ def train_one_epoch(
             tb_logger.scalar("train/amp_scale", float(scaler.get_scale()) if hasattr(scaler, "get_scale") else 1.0, global_step)
             tb_logger.scalar("train/nonfinite_batches", float(nonfinite_batches), global_step)
             tb_logger.scalar("train/skipped_updates", float(skipped_updates), global_step)
+            if family_active and family_y is not None:
+                family_preds = family_logits.detach().argmax(dim=1)
+                tb_logger.scalar("train/family_acc", float((family_preds == family_y).float().mean().item()), global_step)
+            else:
+                tb_logger.scalar("train/family_acc", 0.0, global_step)
             if log_batch_label_stats:
                 _, label_counts = torch.unique(y.detach(), return_counts=True)
                 repeated_counts = label_counts[label_counts > 1]
@@ -260,6 +311,11 @@ def train_one_epoch(
         total_objective += float(total_batch_loss.item()) * bs
         total_n += bs
         steps += 1
+        family_loss_sum += float(fam_loss.item()) * bs
+        if family_active and family_y is not None:
+            family_preds = family_logits.detach().argmax(dim=1)
+            family_correct += int((family_preds == family_y).sum().item())
+            family_total += int(family_y.numel())
         supcon_loss_sum += float(supcon_loss.item()) * bs
         if supcon_active:
             supcon_stats = getattr(supcon_criterion, "last_stats", {})
@@ -301,6 +357,8 @@ def train_one_epoch(
     return TrainOutputs(
         loss=(total_loss / max(1, total_n)),
         total_loss=(total_objective / max(1, total_n)),
+        family_loss=(family_loss_sum / max(1, total_n)),
+        family_acc=(float(family_correct) / max(1, family_total)),
         supcon_loss=(supcon_loss_sum / max(1, total_n)),
         supcon_valid_anchors=int(supcon_valid_anchor_sum),
         supcon_positive_pairs=int(supcon_positive_pair_sum),
@@ -331,10 +389,16 @@ def evaluate(
     idx2label: Mapping[int, str] | None = None,
     train_support: np.ndarray | None = None,
     bucket_by_class: Mapping[int, str] | None = None,
+    family_criterion=None,
+    class_to_family: torch.Tensor | None = None,
+    family_eval: bool = False,
 ) -> EvalOutputs:
     model.eval()
     total_loss = 0.0
+    total_family_loss = 0.0
     total_n = 0
+    total_family_correct = 0
+    total_family_n = 0
     all_preds: List[int] = []
     all_labels: List[int] = []
     all_conf: List[float] = []
@@ -373,6 +437,7 @@ def evaluate(
             dtype=amp_dtype,
             enabled=use_amp,
         ):
+            family_logits = None
             if mirror_idx is not None:
                 # compile/cudagraph-safe TTA: one forward on concatenated batch
                 B0 = y.size(0)
@@ -386,12 +451,32 @@ def evaluate(
                     torch.compiler.cudagraph_mark_step_begin()
                 except Exception:
                     pass
-                logits_cat = model(x_cat, mask=m_cat, A=A)
-                logits = 0.5 * (logits_cat[:B0] + logits_cat[B0:])
+                if family_eval and family_criterion is not None and class_to_family is not None:
+                    outputs_cat = model(x_cat, mask=m_cat, A=A, return_dict=True)
+                    logits_cat = outputs_cat["logits"]
+                    family_logits_cat = outputs_cat.get("family_logits")
+                    logits = 0.5 * (logits_cat[:B0] + logits_cat[B0:])
+                    if family_logits_cat is not None:
+                        family_logits = 0.5 * (family_logits_cat[:B0] + family_logits_cat[B0:])
+                else:
+                    logits_cat = model(x_cat, mask=m_cat, A=A)
+                    logits = 0.5 * (logits_cat[:B0] + logits_cat[B0:])
             else:
-                logits = model(x_streams, mask=mask, A=A)
+                if family_eval and family_criterion is not None and class_to_family is not None:
+                    outputs = model(x_streams, mask=mask, A=A, return_dict=True)
+                    logits = outputs["logits"]
+                    family_logits = outputs.get("family_logits")
+                else:
+                    logits = model(x_streams, mask=mask, A=A)
             logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0)
             loss = criterion(logits, y)
+            if family_logits is not None:
+                family_y = class_to_family[y]
+                fam_loss = family_criterion(family_logits, family_y)
+                family_preds = family_logits.argmax(dim=1)
+                total_family_loss += float(fam_loss.item()) * y.size(0)
+                total_family_correct += int((family_preds == family_y).sum().item())
+                total_family_n += int(family_y.numel())
 
         total_loss += float(loss.item()) * y.size(0)
         total_n += y.size(0)
@@ -515,6 +600,8 @@ def evaluate(
         loss=(total_loss / max(1, total_n)),
         acc=float(acc),
         macro_f1=float(macro_f1),
+        family_loss=(total_family_loss / max(1, total_family_n)),
+        family_acc=(float(total_family_correct) / max(1, total_family_n)),
         topk_acc=topk_acc,
         labels=all_labels,
         preds=all_preds,
