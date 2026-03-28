@@ -15,14 +15,14 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from bio.core.config_utils import write_dataset_manifest, write_run_config
-from bio.ipn import prelabel as ipn_prelabel
+from bio.pipeline import continuous_stats
 from bio.pipeline import prelabel as slovo_prelabel
 from bio.pipeline import synth_build
 
 STRICT_SPLIT_POLICY = {
     "mode": "strict_source_group_separation",
-    "description": "The same raw video/source_group must not appear in multiple splits. Any overlap blocks the build.",
-    "enforced_on": ["slovo_sign", "slovo_no_event", "slovo_union", "ipn_hand"],
+    "description": "The same raw Slovo video/source_group must not appear in multiple splits. Any overlap blocks the build.",
+    "enforced_on": ["slovo_sign", "slovo_no_event", "slovo_union"],
 }
 
 
@@ -132,7 +132,7 @@ def _promote_many_transactional(pairs: Sequence[Tuple[Path, Path]]) -> None:
 def build_overlap_report(
     slovo_csv: Path,
     slovo_no_event_csv: Path,
-    ipn_manifest: Path,
+    ipn_manifest: Path | None = None,
 ) -> Dict[str, Any]:
     sign_train = slovo_prelabel.parse_csv(slovo_csv, "train")
     sign_val = slovo_prelabel.parse_csv(slovo_csv, "val")
@@ -155,18 +155,17 @@ def build_overlap_report(
         source_name="slovo_union",
     )
 
-    manifest_rows = _read_manifest(ipn_manifest)
-    ipn_train_ids = [str(r.get("video_id") or "") for r in manifest_rows if _norm_split(r.get("split")) == "train"]
-    ipn_val_ids = [str(r.get("video_id") or "") for r in manifest_rows if _norm_split(r.get("split")) == "val"]
-    ipn_report = _audit_overlap(ipn_train_ids, ipn_val_ids, source_name="ipn_hand")
-
     report = {
         "split_policy": dict(STRICT_SPLIT_POLICY),
         "slovo_sign": slovo_sign_report,
         "slovo_no_event": slovo_noev_report,
         "slovo_union": slovo_union_report,
-        "ipn_hand": ipn_report,
     }
+    if ipn_manifest is not None and Path(ipn_manifest).exists():
+        manifest_rows = _read_manifest(Path(ipn_manifest))
+        ipn_train_ids = [str(r.get("video_id") or "") for r in manifest_rows if _norm_split(r.get("split")) == "train"]
+        ipn_val_ids = [str(r.get("video_id") or "") for r in manifest_rows if _norm_split(r.get("split")) == "val"]
+        report["ipn_hand"] = _audit_overlap(ipn_train_ids, ipn_val_ids, source_name="ipn_hand")
     report["ok"] = all(
         int(item.get("overlap_count", 0)) == 0
         for key, item in report.items()
@@ -176,24 +175,24 @@ def build_overlap_report(
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="Canonical BIO v2 dataset rebuild.")
+    ap = argparse.ArgumentParser(description="Canonical BIO Slovo-only trimmed rebuild.")
     ap.add_argument("--out_root", type=str, default="outputs/bio_out_v2", help="Root directory for rebuilt BIO artifacts.")
-    ap.add_argument("--ipn_out_root", type=str, default="outputs/ipnhand", help="Root directory for IPN Step1 pools.")
     ap.add_argument("--slovo_skeletons", type=str, default="datasets/skeletons/Slovo")
     ap.add_argument("--slovo_csv", type=str, default="datasets/data/annotations.csv")
     ap.add_argument("--slovo_no_event_csv", type=str, default="datasets/data/annotations_no_event.csv")
-    ap.add_argument("--ipn_manifest", type=str, default="outputs/ipnhand/manifests/ipn_d0x_manifest.jsonl")
-    ap.add_argument("--ipn_segments_dir", type=str, default="datasets/skeletons/ipnhand")
 
     ap.add_argument("--slovo_prelabel_config", type=str, default="bio/configs/bio_default.json")
     ap.add_argument("--synth_train_config", type=str, default="bio/configs/bio_default.json")
     ap.add_argument("--synth_val_config", type=str, default="bio/configs/bio_val.json")
-    ap.add_argument("--ipn_train_config", type=str, default="bio/configs/ipn_default.json")
-    ap.add_argument("--ipn_val_config", type=str, default="bio/configs/ipn_val.json")
 
     ap.add_argument("--slovo_num_workers", type=int, default=8)
+    ap.add_argument("--synth_workers", type=int, default=0, help="Optional override for synth-build worker processes. 0 = use synth auto-workers.")
     ap.add_argument("--train_num_samples", type=int, default=100000)
     ap.add_argument("--val_num_samples", type=int, default=10000)
+    ap.add_argument("--warmup_train_num_samples", type=int, default=50000)
+    ap.add_argument("--warmup_val_num_samples", type=int, default=5000)
+    ap.add_argument("--stress_train_num_samples", type=int, default=20000)
+    ap.add_argument("--stress_val_num_samples", type=int, default=2000)
     ap.add_argument("--seq_len", type=int, default=256)
     ap.add_argument("--shard_size", type=int, default=256)
     ap.add_argument("--seed", type=int, default=1337)
@@ -207,15 +206,21 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     ap.add_argument("--no_include_sign_tails_as_noev", dest="include_sign_tails_as_noev", action="store_false")
     ap.add_argument("--prefer_pp", dest="prefer_pp", action="store_true", default=True)
     ap.add_argument("--no_prefer_pp", dest="prefer_pp", action="store_false")
+    ap.add_argument("--emit_warmup_dataset", dest="emit_warmup_dataset", action="store_true", default=False)
+    ap.add_argument("--no_emit_warmup_dataset", dest="emit_warmup_dataset", action="store_false")
+    ap.add_argument("--dense_signer_min_clips", type=int, default=8)
+    ap.add_argument("--real_session_dir", action="append", default=[], help="Review session directory used to extract runtime empirical continuous_stats.")
+    ap.add_argument("--emit_stress_dataset", dest="emit_stress_dataset", action="store_true", default=False)
+    ap.add_argument("--no_emit_stress_dataset", dest="emit_stress_dataset", action="store_false")
+    ap.add_argument("--allow_prelabel_empirical_fallback", action="store_true", default=False)
     return ap.parse_args(argv)
 
 
 def main(argv: Optional[List[str]] = None) -> None:
     args = parse_args(argv)
+    real_session_dirs = list(dict.fromkeys(Path(x).resolve() for x in (args.real_session_dir or []) if str(x).strip()))
     out_root = Path(args.out_root).resolve()
-    ipn_out_root = Path(args.ipn_out_root).resolve()
     out_root.parent.mkdir(parents=True, exist_ok=True)
-    ipn_out_root.parent.mkdir(parents=True, exist_ok=True)
 
     stage_root = Path(
         tempfile.mkdtemp(
@@ -223,16 +228,15 @@ def main(argv: Optional[List[str]] = None) -> None:
             dir=str(out_root.parent),
         )
     )
+    build_succeeded = False
     try:
         stage_out_root = stage_root / out_root.name
         stage_out_root.mkdir(parents=True, exist_ok=True)
-        stage_ipn_root = stage_root / "__ipnhand_stage__"
         write_run_config(stage_out_root, args, section="build_dataset")
 
         overlap_report = build_overlap_report(
             Path(args.slovo_csv),
             Path(args.slovo_no_event_csv),
-            Path(args.ipn_manifest),
         )
         overlap_path = stage_out_root / "overlap_report.json"
         overlap_path.write_text(json.dumps(overlap_report, ensure_ascii=True, indent=2), encoding="utf-8")
@@ -243,10 +247,13 @@ def main(argv: Optional[List[str]] = None) -> None:
         slovo_val_dir = stage_out_root / "prelabels_slovo_val"
         slovo_noev_train_dir = stage_out_root / "prelabels_slovo_noev_train"
         slovo_noev_val_dir = stage_out_root / "prelabels_slovo_noev_val"
-        ipn_train_dir = stage_ipn_root / "prelabels_train"
-        ipn_val_dir = stage_ipn_root / "prelabels_val"
+        synth_train_warmup_dir = stage_out_root / "synth_train_warmup"
+        synth_val_warmup_dir = stage_out_root / "synth_val_warmup"
         synth_train_dir = stage_out_root / "synth_train"
         synth_val_dir = stage_out_root / "synth_val"
+        synth_train_stress_dir = stage_out_root / "synth_train_stress"
+        synth_val_stress_dir = stage_out_root / "synth_val_stress"
+        continuous_stats_dir = stage_out_root / "continuous_stats"
 
         print(f"[build-dataset] step1 slovo train -> {slovo_train_dir}", flush=True)
         slovo_prelabel.main(
@@ -293,26 +300,23 @@ def main(argv: Optional[List[str]] = None) -> None:
             ] + (["--prefer_pp"] if args.prefer_pp else ["--no_prefer_pp"])
         )
 
-        print(f"[build-dataset] step1 ipn train -> {ipn_train_dir}", flush=True)
-        ipn_prelabel.main(
-            [
-                "--config", args.ipn_train_config,
-                "--manifest", args.ipn_manifest,
-                "--segments_dir", args.ipn_segments_dir,
-                "--out_dir", str(ipn_train_dir),
-                "--split", "train",
-            ] + (["--prefer_pp"] if args.prefer_pp else ["--no_prefer_pp"])
-        )
-        print(f"[build-dataset] step1 ipn val -> {ipn_val_dir}", flush=True)
-        ipn_prelabel.main(
-            [
-                "--config", args.ipn_val_config,
-                "--manifest", args.ipn_manifest,
-                "--segments_dir", args.ipn_segments_dir,
-                "--out_dir", str(ipn_val_dir),
-                "--split", "val",
-            ] + (["--prefer_pp"] if args.prefer_pp else ["--no_prefer_pp"])
-        )
+        continuous_stats_summary: Dict[str, Any] = {}
+        synth_sampling_profile = "runtime_empirical"
+        synth_continuous_stats_dir = continuous_stats_dir
+        if real_session_dirs:
+            print(f"[build-dataset] empirical continuous stats -> {continuous_stats_dir}", flush=True)
+            continuous_stats_dir.mkdir(parents=True, exist_ok=True)
+            payload = continuous_stats.build_continuous_stats(
+                session_dirs=real_session_dirs,
+                prelabel_dirs=[],
+                motion_epsilon=0.01,
+            )
+            continuous_stats_path = continuous_stats_dir / "continuous_stats.json"
+            continuous_stats_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            continuous_stats_summary = payload
+        else:
+            synth_sampling_profile = "prelabel_empirical"
+            synth_continuous_stats_dir = None
 
         synth_common = [
             "--seq_len", str(args.seq_len),
@@ -323,9 +327,60 @@ def main(argv: Optional[List[str]] = None) -> None:
             "--primary_noev_prob", str(args.primary_noev_prob),
             "--source_sampling", args.source_sampling,
             "--sign_sampling", args.sign_sampling,
+            "--dataset_profile", "main_continuous",
+            "--dense_signer_min_clips", str(args.dense_signer_min_clips),
+            "--sampling_profile", synth_sampling_profile,
             "--stitch_noev_chunks" if args.stitch_noev_chunks else "--no_stitch_noev_chunks",
             "--overlap_report", str(overlap_path),
         ]
+        if synth_continuous_stats_dir is not None:
+            synth_common.extend(["--continuous_stats_dir", str(synth_continuous_stats_dir)])
+        if int(args.synth_workers) > 0:
+            synth_common.extend(["--workers", str(args.synth_workers), "--no_auto_workers"])
+        else:
+            synth_common.append("--auto_workers")
+
+        if bool(args.emit_warmup_dataset):
+            warmup_common = [
+                "--seq_len", str(args.seq_len),
+                "--shard_size", str(args.shard_size),
+                "--seed", str(args.seed),
+                "--include_sign_tails_as_noev" if args.include_sign_tails_as_noev else "--no_include_sign_tails_as_noev",
+                "--min_tail_len", str(args.min_tail_len),
+                "--primary_noev_prob", str(args.primary_noev_prob),
+                "--source_sampling", args.source_sampling,
+                "--sign_sampling", args.sign_sampling,
+                "--dataset_profile", "warmup_single_sign",
+                "--dense_signer_min_clips", str(args.dense_signer_min_clips),
+                "--sampling_profile", "prelabel_empirical",
+                "--stitch_noev_chunks" if args.stitch_noev_chunks else "--no_stitch_noev_chunks",
+                "--overlap_report", str(overlap_path),
+            ]
+            if int(args.synth_workers) > 0:
+                warmup_common.extend(["--workers", str(args.synth_workers), "--no_auto_workers"])
+            else:
+                warmup_common.append("--auto_workers")
+
+            print(f"[build-dataset] step2 synth train warmup -> {synth_train_warmup_dir}", flush=True)
+            synth_build.main(
+                [
+                    "--config", args.synth_train_config,
+                    "--prelabel_dir", str(slovo_train_dir),
+                    "--preferred_noev_prelabel_dir", str(slovo_noev_train_dir),
+                    "--out_dir", str(synth_train_warmup_dir),
+                    "--num_samples", str(args.warmup_train_num_samples),
+                ] + warmup_common
+            )
+            print(f"[build-dataset] step2 synth val warmup -> {synth_val_warmup_dir}", flush=True)
+            synth_build.main(
+                [
+                    "--config", args.synth_val_config,
+                    "--prelabel_dir", str(slovo_val_dir),
+                    "--preferred_noev_prelabel_dir", str(slovo_noev_val_dir),
+                    "--out_dir", str(synth_val_warmup_dir),
+                    "--num_samples", str(args.warmup_val_num_samples),
+                ] + warmup_common
+            )
 
         print(f"[build-dataset] step2 synth train -> {synth_train_dir}", flush=True)
         synth_build.main(
@@ -333,7 +388,6 @@ def main(argv: Optional[List[str]] = None) -> None:
                 "--config", args.synth_train_config,
                 "--prelabel_dir", str(slovo_train_dir),
                 "--preferred_noev_prelabel_dir", str(slovo_noev_train_dir),
-                "--extra_noev_prelabel_dir", str(ipn_train_dir),
                 "--out_dir", str(synth_train_dir),
                 "--num_samples", str(args.train_num_samples),
             ]
@@ -345,30 +399,85 @@ def main(argv: Optional[List[str]] = None) -> None:
                 "--config", args.synth_val_config,
                 "--prelabel_dir", str(slovo_val_dir),
                 "--preferred_noev_prelabel_dir", str(slovo_noev_val_dir),
-                "--extra_noev_prelabel_dir", str(ipn_val_dir),
                 "--out_dir", str(synth_val_dir),
                 "--num_samples", str(args.val_num_samples),
             ]
             + synth_common
         )
 
+        if bool(args.emit_stress_dataset):
+            stress_common = [
+                "--seq_len", str(args.seq_len),
+                "--shard_size", str(args.shard_size),
+                "--seed", str(args.seed),
+                "--include_sign_tails_as_noev" if args.include_sign_tails_as_noev else "--no_include_sign_tails_as_noev",
+                "--min_tail_len", str(args.min_tail_len),
+                "--primary_noev_prob", str(args.primary_noev_prob),
+                "--source_sampling", args.source_sampling,
+                "--sign_sampling", args.sign_sampling,
+                "--dataset_profile", "stress",
+                "--sampling_profile", synth_sampling_profile,
+                "--stitch_noev_chunks" if args.stitch_noev_chunks else "--no_stitch_noev_chunks",
+                "--overlap_report", str(overlap_path),
+            ]
+            if synth_continuous_stats_dir is not None:
+                stress_common.extend(["--continuous_stats_dir", str(synth_continuous_stats_dir)])
+            if int(args.synth_workers) > 0:
+                stress_common.extend(["--workers", str(args.synth_workers), "--no_auto_workers"])
+            else:
+                stress_common.append("--auto_workers")
+
+            print(f"[build-dataset] step2 synth train stress -> {synth_train_stress_dir}", flush=True)
+            synth_build.main(
+                [
+                    "--config", args.synth_train_config,
+                    "--prelabel_dir", str(slovo_train_dir),
+                    "--preferred_noev_prelabel_dir", str(slovo_noev_train_dir),
+                    "--out_dir", str(synth_train_stress_dir),
+                    "--num_samples", str(args.stress_train_num_samples),
+                ]
+                + stress_common
+            )
+            print(f"[build-dataset] step2 synth val stress -> {synth_val_stress_dir}", flush=True)
+            synth_build.main(
+                [
+                    "--config", args.synth_val_config,
+                    "--prelabel_dir", str(slovo_val_dir),
+                    "--preferred_noev_prelabel_dir", str(slovo_noev_val_dir),
+                    "--out_dir", str(synth_val_stress_dir),
+                    "--num_samples", str(args.stress_val_num_samples),
+                ]
+                + stress_common
+            )
+
         summary = {
             "out_root": str(out_root),
-            "ipn_out_root": str(ipn_out_root),
+            "dataset_scope": "slovo_only",
             "staged_transactionally": True,
             "split_policy": dict(STRICT_SPLIT_POLICY),
             "overlap_report": overlap_report,
+            "main_dataset_profile": "main_continuous",
+            "warmup_dataset_emitted": bool(args.emit_warmup_dataset),
+            "stress_dataset_emitted": bool(args.emit_stress_dataset),
+            "sampling_profile": synth_sampling_profile,
+            "real_session_dirs": [str(x) for x in real_session_dirs],
+            "allow_prelabel_empirical_fallback": bool(args.allow_prelabel_empirical_fallback),
             "artifacts": {
                 "prelabels_slovo_train": _load_summary(slovo_train_dir / "summary.json"),
                 "prelabels_slovo_val": _load_summary(slovo_val_dir / "summary.json"),
                 "prelabels_slovo_noev_train": _load_summary(slovo_noev_train_dir / "summary.json"),
                 "prelabels_slovo_noev_val": _load_summary(slovo_noev_val_dir / "summary.json"),
-                "ipn_prelabels_train": _load_summary(ipn_train_dir / "summary.json"),
-                "ipn_prelabels_val": _load_summary(ipn_val_dir / "summary.json"),
+                "continuous_stats": continuous_stats_summary,
                 "synth_train": _load_summary(synth_train_dir / "stats.json"),
                 "synth_val": _load_summary(synth_val_dir / "stats.json"),
             },
         }
+        if bool(args.emit_warmup_dataset):
+            summary["artifacts"]["synth_train_warmup"] = _load_summary(synth_train_warmup_dir / "stats.json")
+            summary["artifacts"]["synth_val_warmup"] = _load_summary(synth_val_warmup_dir / "stats.json")
+        if bool(args.emit_stress_dataset):
+            summary["artifacts"]["synth_train_stress"] = _load_summary(synth_train_stress_dir / "stats.json")
+            summary["artifacts"]["synth_val_stress"] = _load_summary(synth_val_stress_dir / "stats.json")
         summary_path = stage_out_root / "build_summary.json"
         summary_path.write_text(json.dumps(summary, ensure_ascii=True, indent=2), encoding="utf-8")
         write_dataset_manifest(
@@ -380,8 +489,6 @@ def main(argv: Optional[List[str]] = None) -> None:
                 "slovo_skeletons": str(Path(args.slovo_skeletons).resolve()),
                 "slovo_csv": str(Path(args.slovo_csv).resolve()),
                 "slovo_no_event_csv": str(Path(args.slovo_no_event_csv).resolve()),
-                "ipn_manifest": str(Path(args.ipn_manifest).resolve()),
-                "ipn_segments_dir": str(Path(args.ipn_segments_dir).resolve()),
             },
             counts={
                 "strict_overlap_ok": bool(overlap_report.get("ok", False)),
@@ -399,9 +506,23 @@ def main(argv: Optional[List[str]] = None) -> None:
             slovo_noev_val_dir / "index.json",
             synth_train_dir / "stats.json",
             synth_val_dir / "stats.json",
-            ipn_train_dir / "index.json",
-            ipn_val_dir / "index.json",
         ]
+        if bool(args.emit_warmup_dataset):
+            required_paths.extend(
+                [
+                    synth_train_warmup_dir / "stats.json",
+                    synth_val_warmup_dir / "stats.json",
+                ]
+            )
+        if real_session_dirs:
+            required_paths.append(continuous_stats_dir / "continuous_stats.json")
+        if bool(args.emit_stress_dataset):
+            required_paths.extend(
+                [
+                    synth_train_stress_dir / "stats.json",
+                    synth_val_stress_dir / "stats.json",
+                ]
+            )
         missing_paths = [str(p) for p in required_paths if not p.exists()]
         if missing_paths:
             raise RuntimeError(f"Atomic build validation failed. Missing artifacts: {missing_paths}")
@@ -409,14 +530,17 @@ def main(argv: Optional[List[str]] = None) -> None:
         print(f"[build-dataset] promote -> {out_root}", flush=True)
         _promote_many_transactional(
             [
-                (ipn_train_dir, ipn_out_root / "prelabels_train"),
-                (ipn_val_dir, ipn_out_root / "prelabels_val"),
                 (stage_out_root, out_root),
             ]
         )
+        build_succeeded = True
         print(json.dumps(summary, ensure_ascii=True, indent=2))
+    except Exception:
+        print(f"[build-dataset] failed; preserving stage_root={stage_root}", flush=True)
+        raise
     finally:
-        shutil.rmtree(stage_root, ignore_errors=True)
+        if build_succeeded:
+            shutil.rmtree(stage_root, ignore_errors=True)
 
 
 if __name__ == "__main__":

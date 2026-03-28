@@ -93,3 +93,54 @@ Notes:
 
 - Export writes both raw and `_pp` JSON files; downstream training (msagcn/bio) prefers `_pp` by default.
 - For Windows, use PowerShell backticks or convert to a single-line command.
+
+## BIO Rebuild + Train (PowerShell)
+
+For the canonical BIO dataset rebuild followed by training:
+
+```powershell
+.\scripts\run_bio_rebuild_and_train.ps1
+```
+
+Useful modes:
+
+```powershell
+# Full Step1 + Step2 rebuild, then train
+.\scripts\run_bio_rebuild_and_train.ps1 `
+  -OutRoot outputs\bio_out_v4 `
+  -RunDir outputs\runs\bio_v4_run
+
+# Faster path: reuse existing Step1 prelabels, rebuild only Step2 synth shards, then train
+.\scripts\run_bio_rebuild_and_train.ps1 `
+  -Step2Only `
+  -OutRoot outputs\bio_out_v4 `
+  -RunDir outputs\runs\bio_v4_run
+
+# Faster debug retrain: smaller offline synth + train
+.\scripts\run_bio_rebuild_and_train.ps1 `
+  -Step2Only `
+  -FastDebug `
+  -OutRoot outputs\bio_out_v4 `
+  -RunDir outputs\runs\bio_v4_run
+
+# Explicit sample counts with synth auto-workers
+.\scripts\run_bio_rebuild_and_train.ps1 `
+  -Step2Only `
+  -TrainSynthSamples 30000 `
+  -ValSynthSamples 3000 `
+  -OutRoot outputs\bio_out_v4 `
+  -RunDir outputs\runs\bio_v4_run
+
+# Force a manual synth worker count instead of auto-workers
+.\scripts\run_bio_rebuild_and_train.ps1 `
+  -Step2Only `
+  -SynthWorkers 8 `
+  -OutRoot outputs\bio_out_v4 `
+  -RunDir outputs\runs\bio_v4_run
+```
+
+The `-Step2Only` mode is usually much faster than `python -m bio build-dataset`
+because it skips the full Step1 prelabel rebuild and only regenerates
+`synth_train` / `synth_val` before training.
+The script now uses synth auto-workers by default. Use `-SynthWorkers <N>` only
+when you want to force a manual shard-generation process count.

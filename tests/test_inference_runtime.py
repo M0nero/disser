@@ -14,7 +14,16 @@ import numpy as np
 import torch
 
 from bio.core.model import BioModelConfig, BioTagger
+from bio.core.preprocessing import (
+    BIO_PREPROCESSING_VERSION_V2,
+    BIO_PREPROCESSING_VERSION_V3,
+    BioPreprocessConfig,
+    init_bio_preprocess_state,
+    preprocess_frame_v3,
+    preprocess_sequence,
+)
 from bio.runtime import BioDecoderConfig, BioSegmentDecoder, BioSegmenter, export_bio_runtime_bundle
+from bio.pipeline.prelabel import PrelabelConfig, prepare_model_pts
 from bio import runtime_commands as bio_runtime_commands
 from msagcn.data.config import DSConfig
 from msagcn.data.dataset import MultiStreamGestureDataset
@@ -322,6 +331,182 @@ class InferenceRuntimeTests(unittest.TestCase):
         )
         self.assertAlmostEqual(decoder._continue_threshold(), 0.72, places=6)
 
+    def test_bio_decoder_guard_blocks_start_without_visible_hands(self) -> None:
+        decoder = BioSegmentDecoder(
+            BioDecoderConfig(
+                start_threshold=0.8,
+                cooldown_frames=0,
+                require_hand_presence_to_start=True,
+                min_visible_hand_frames_to_start=2,
+                min_valid_hand_joints_to_start=8,
+                allow_one_hand_to_start=True,
+            )
+        )
+        out0 = decoder.step([0.1, 0.9, 0.0], ts_ms=0.0, left_valid_joints=0, right_valid_joints=0)
+        out1 = decoder.step([0.1, 0.88, 0.02], ts_ms=33.0, left_valid_joints=0, right_valid_joints=0)
+        self.assertEqual(out0, [])
+        self.assertEqual(out1, [])
+        self.assertIsNone(decoder._active)
+        self.assertTrue(decoder.last_step_debug["start_blocked_by_hand_guard"])
+        self.assertFalse(decoder.last_step_debug["hand_presence_ok"])
+
+    def test_bio_decoder_guard_allows_start_after_stable_hand_presence(self) -> None:
+        decoder = BioSegmentDecoder(
+            BioDecoderConfig(
+                start_threshold=0.8,
+                cooldown_frames=0,
+                require_hand_presence_to_start=True,
+                min_visible_hand_frames_to_start=2,
+                min_valid_hand_joints_to_start=8,
+                allow_one_hand_to_start=True,
+            )
+        )
+        decoder.step([0.95, 0.02, 0.03], ts_ms=0.0, left_valid_joints=0, right_valid_joints=10)
+        decoder.step([0.1, 0.85, 0.05], ts_ms=33.0, left_valid_joints=0, right_valid_joints=10)
+        self.assertIsNotNone(decoder._active)
+        self.assertTrue(decoder.last_step_debug["hand_presence_ok"])
+        self.assertFalse(decoder.last_step_debug["start_blocked_by_hand_guard"])
+
+    def test_bio_decoder_guard_disabled_preserves_existing_start_behavior(self) -> None:
+        decoder = BioSegmentDecoder(
+            BioDecoderConfig(
+                start_threshold=0.8,
+                cooldown_frames=0,
+                require_hand_presence_to_start=False,
+            )
+        )
+        decoder.step([0.1, 0.9, 0.0], ts_ms=0.0, left_valid_joints=0, right_valid_joints=0)
+        self.assertIsNotNone(decoder._active)
+
+    def test_bio_decoder_signness_gate_blocks_low_active_start(self) -> None:
+        decoder = BioSegmentDecoder(
+            BioDecoderConfig(
+                start_threshold=0.8,
+                cooldown_frames=0,
+                use_signness_gate=True,
+                signness_start_threshold=0.55,
+            )
+        )
+        decoder.step([0.1, 0.9, 0.0], ts_ms=0.0, active_prob=0.20, left_valid_joints=10, right_valid_joints=0)
+        self.assertIsNone(decoder._active)
+        self.assertFalse(decoder.last_step_debug["signness_gate_ok"])
+
+    def test_bio_decoder_signness_gate_allows_start_when_active_is_high(self) -> None:
+        decoder = BioSegmentDecoder(
+            BioDecoderConfig(
+                start_threshold=0.8,
+                cooldown_frames=0,
+                use_signness_gate=True,
+                signness_start_threshold=0.55,
+            )
+        )
+        decoder.step([0.1, 0.9, 0.0], ts_ms=0.0, active_prob=0.80, left_valid_joints=10, right_valid_joints=0)
+        self.assertIsNotNone(decoder._active)
+        self.assertTrue(decoder.last_step_debug["signness_gate_ok"])
+
+    def test_bio_decoder_onset_gate_allows_start_when_pb_is_low(self) -> None:
+        decoder = BioSegmentDecoder(
+            BioDecoderConfig(
+                start_threshold=0.8,
+                cooldown_frames=0,
+                use_signness_gate=True,
+                use_onset_gate=True,
+                active_start_threshold=0.25,
+                onset_start_threshold=0.45,
+            )
+        )
+        decoder.step(
+            [0.2, 0.3, 0.5],
+            ts_ms=0.0,
+            active_prob=0.80,
+            onset_prob=0.90,
+            left_valid_joints=10,
+            right_valid_joints=0,
+        )
+        self.assertIsNotNone(decoder._active)
+        self.assertAlmostEqual(float(decoder.last_step_debug["p_onset"]), 0.90, places=6)
+        self.assertTrue(bool(decoder.last_step_debug["clip_hit_candidate"]))
+
+    def test_bio_segmenter_step_exposes_hand_guard_debug_fields(self) -> None:
+        model = BioTagger(BioModelConfig()).eval()
+        segmenter = BioSegmenter.from_model(
+            model,
+            threshold=0.8,
+            decoder_cfg=BioDecoderConfig(
+                require_hand_presence_to_start=True,
+                min_visible_hand_frames_to_start=2,
+                min_valid_hand_joints_to_start=8,
+            ),
+            device="cpu",
+        )
+        out = segmenter.step(
+            np.zeros((42, 3), dtype=np.float32),
+            np.zeros((42, 1), dtype=np.float32),
+            ts_ms=0.0,
+        )
+        self.assertIn("left_valid_joints", out)
+        self.assertIn("right_valid_joints", out)
+        self.assertIn("total_valid_hand_joints", out)
+        self.assertIn("hand_presence_ok", out)
+        self.assertIn("start_blocked_by_hand_guard", out)
+        self.assertEqual(int(out["total_valid_hand_joints"]), 0)
+
+    def test_bio_segmenter_with_aux_head_emits_p_active(self) -> None:
+        model = BioTagger(BioModelConfig(use_signness_head=True)).eval()
+        segmenter = BioSegmenter.from_model(
+            model,
+            threshold=0.8,
+            decoder_cfg=BioDecoderConfig(),
+            device="cpu",
+        )
+        out = segmenter.step(
+            np.zeros((42, 3), dtype=np.float32),
+            np.ones((42, 1), dtype=np.float32),
+            ts_ms=0.0,
+        )
+        self.assertIn("p_active", out)
+        self.assertIsNotNone(out["p_active"])
+        self.assertIn("signness_gate_ok", out)
+
+    def test_bio_segmenter_with_onset_head_emits_p_onset(self) -> None:
+        model = BioTagger(BioModelConfig(use_signness_head=True, use_onset_head=True)).eval()
+        segmenter = BioSegmenter.from_model(
+            model,
+            threshold=0.8,
+            decoder_cfg=BioDecoderConfig(use_onset_gate=True),
+            device="cpu",
+        )
+        out = segmenter.step(
+            np.zeros((42, 3), dtype=np.float32),
+            np.ones((42, 1), dtype=np.float32),
+            ts_ms=0.0,
+        )
+        self.assertIn("p_onset", out)
+        self.assertIsNotNone(out["p_onset"])
+        self.assertIn("clip_hit_candidate", out)
+
+    def test_bio_forward_with_aux_returns_expected_shapes(self) -> None:
+        model = BioTagger(BioModelConfig(use_signness_head=True)).eval()
+        pts = torch.zeros((2, 5, 42, 3), dtype=torch.float32)
+        mask = torch.ones((2, 5, 42, 1), dtype=torch.float32)
+        logits, signness_logits, hN = model.forward_with_aux(pts, mask)
+        self.assertEqual(tuple(logits.shape), (2, 5, 3))
+        self.assertIsNotNone(signness_logits)
+        self.assertEqual(tuple(signness_logits.shape), (2, 5, 1))
+        self.assertEqual(int(hN.shape[1]), 2)
+
+    def test_bio_forward_with_heads_returns_expected_shapes(self) -> None:
+        model = BioTagger(BioModelConfig(use_signness_head=True, use_onset_head=True)).eval()
+        pts = torch.zeros((2, 5, 42, 3), dtype=torch.float32)
+        mask = torch.ones((2, 5, 42, 1), dtype=torch.float32)
+        logits, signness_logits, onset_logits, hN = model.forward_with_heads(pts, mask)
+        self.assertEqual(tuple(logits.shape), (2, 5, 3))
+        self.assertIsNotNone(signness_logits)
+        self.assertEqual(tuple(signness_logits.shape), (2, 5, 1))
+        self.assertIsNotNone(onset_logits)
+        self.assertEqual(tuple(onset_logits.shape), (2, 5, 1))
+        self.assertEqual(int(hN.shape[1]), 2)
+
     def test_bio_forward_matches_streaming_logits(self) -> None:
         torch.manual_seed(0)
         cfg = BioModelConfig(conv_layers=2, conv_kernel=5)
@@ -338,6 +523,60 @@ class InferenceRuntimeTests(unittest.TestCase):
         forward_logits = segmenter.forward_logits(seq)
         stream_logits = segmenter.stream_logits(seq)
         self.assertTrue(np.allclose(forward_logits, stream_logits, atol=1e-5))
+
+    def test_bio_preprocess_v3_offline_matches_streaming(self) -> None:
+        pts = np.zeros((5, 42, 3), dtype=np.float32)
+        mask = np.zeros((5, 42, 1), dtype=np.float32)
+        for t, base in enumerate((0.10, 0.15, None, None, 0.20)):
+            if base is None:
+                continue
+            for j in range(21):
+                pts[t, 21 + j, 0] = float(base + 0.01 * j)
+                pts[t, 21 + j, 1] = float(0.2 + 0.005 * j)
+                mask[t, 21 + j, 0] = 1.0
+        cfg = BioPreprocessConfig(version=BIO_PREPROCESSING_VERSION_V3)
+        offline, _debug = preprocess_sequence(pts, mask, cfg=cfg)
+        state = init_bio_preprocess_state(dtype=torch.float32)
+        rows = []
+        for idx in range(pts.shape[0]):
+            frame, state, _step_debug = preprocess_frame_v3(pts[idx], mask[idx], state, cfg=cfg)
+            rows.append(frame.detach().cpu().numpy())
+        streaming = np.stack(rows, axis=0)
+        self.assertTrue(np.allclose(np.asarray(offline), streaming, atol=1e-6))
+
+    def test_bio_preprocess_v3_no_hand_gap_keeps_state(self) -> None:
+        pts = np.zeros((42, 3), dtype=np.float32)
+        mask = np.zeros((42, 1), dtype=np.float32)
+        for j in range(21):
+            pts[21 + j, 0] = float(0.3 + 0.01 * j)
+            pts[21 + j, 1] = float(0.4 + 0.02 * j)
+            mask[21 + j, 0] = 1.0
+        cfg = BioPreprocessConfig(version=BIO_PREPROCESSING_VERSION_V3)
+        state = init_bio_preprocess_state(dtype=torch.float32)
+        _frame0, state, debug0 = preprocess_frame_v3(pts, mask, state, cfg=cfg)
+        center0 = state.center.clone()
+        scale0 = state.scale.clone()
+        no_hand_pts = np.zeros((42, 3), dtype=np.float32)
+        no_hand_mask = np.zeros((42, 1), dtype=np.float32)
+        frame1, state, debug1 = preprocess_frame_v3(no_hand_pts, no_hand_mask, state, cfg=cfg)
+        self.assertFalse(debug1["updated_center"])
+        self.assertFalse(debug1["updated_scale"])
+        self.assertTrue(torch.allclose(center0, state.center))
+        self.assertTrue(torch.allclose(scale0, state.scale))
+        self.assertEqual(float(frame1.abs().sum().item()), 0.0)
+
+    def test_prepare_model_pts_v3_matches_shared_preprocess(self) -> None:
+        pts = np.zeros((4, 42, 3), dtype=np.float32)
+        mask = np.zeros((4, 42, 1), dtype=np.float32)
+        for t in range(4):
+            for j in range(21):
+                pts[t, 21 + j, 0] = float(0.2 + 0.01 * (t + j))
+                pts[t, 21 + j, 1] = float(0.3 + 0.005 * j)
+                mask[t, 21 + j, 0] = 1.0
+        prelabel_cfg = PrelabelConfig(preprocessing_version=BIO_PREPROCESSING_VERSION_V3)
+        prepared = prepare_model_pts(pts, mask, np.arange(4, dtype=np.float32), prelabel_cfg)
+        shared, _debug = preprocess_sequence(pts, mask, cfg=BioPreprocessConfig(version=BIO_PREPROCESSING_VERSION_V3))
+        self.assertTrue(np.allclose(prepared, np.asarray(shared), atol=1e-6))
 
     def test_msagcn_runtime_feature_builder_matches_dataset(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

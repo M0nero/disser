@@ -117,25 +117,33 @@ Recommended outcome:
 
 ```bash
 python -m bio build-dataset \
-  --out_root outputs/bio_out_v2 \
-  --ipn_out_root outputs/ipnhand
+  --out_root outputs/bio_out_v2
 ```
 
 This command runs:
 
-1. overlap audit for SLOVO + IPN splits
+1. overlap audit for SLOVO sign / SLOVO no_event
 2. Step1 SLOVO sign prelabels
 3. Step1 SLOVO `no_event` pools
-4. Step1 IPNHand `D0X` pools
-5. Step2 synth train/val rebuild with v2 defaults
+4. Step2 main `main_continuous` synth train/val rebuild with trimmed Slovo defaults
+5. optional separate stress dataset when `--emit_stress_dataset` is enabled
 
-Key v2 defaults:
+Key runtime-first v3 defaults:
 
+- Step1 `trimmed_mode = true`
+- Step1 `source_group = user_id` when the CSV provides signer identity
+- If the original Slovo CSV is not signer-disjoint, first run:
+  `python -m bio signer-split --csv datasets/data/annotations.csv --csv datasets/data/annotations_no_event.csv --out_dir datasets/data/slovo_signer_split`
 - `min_tail_len = 4`
 - `primary_noev_prob = 0.90`
 - `source_sampling = uniform_source`
 - `sign_sampling = uniform_label_source`
 - `stitch_noev_chunks = true`
+- `dataset_profile = main_continuous`
+- `same_source_sequence_prob = 1.0`
+- `cross_source_boundary_prob = 0.0`
+- `sampling_profile = prelabel_empirical`
+- synthetic mix defaults: `continuous=85%`, `hard_negative=15%`, `stress=0%` in the main dataset
 
 Artifacts written by the orchestration step:
 
@@ -148,6 +156,9 @@ Artifacts written by the orchestration step:
 
 The rebuild is staged into temporary directories and promoted only after
 overlap checks and artifact validation pass.
+
+The default rebuild is now Slovo-only. No external IPN no-event pool is used in
+the main train set.
 
 ## Stage 1. Step1 Prelabels
 
@@ -244,6 +255,55 @@ This uses:
 - secondary external `O/no_event` pool from:
   - `outputs/ipnhand/prelabels_train`
 
+Step2 defaults are now intentionally biased away from "sign starts at frame 0":
+
+- `pad_mode = both_no_event`
+- `leading_noev_prob = 0.65`
+- `leading_noev_min = 12`
+- `leading_noev_max = 96`
+- `all_noev_prob = 0.15`
+
+This means train/val synth now contains:
+
+- explicit leading `O` prefixes before the first sign
+- fully negative `all-O` sequences
+- the usual inter-sign gaps and end padding
+
+`stats.json` / `summary.json` now exposes startup-negative diagnostics:
+
+- fraction of samples with a leading `O` prefix
+- fraction of `all-O` samples
+- `first_B_frame` stats/distribution
+- how often `first_B_frame == 0`
+
+Step2 now also assembles sequences in raw canonical coordinate space:
+
+- Step1 contributes `pts_raw` runtime-like skeletons
+- the next chunk is aligned to the previous tail by wrist-center and scale
+- transitions can be inserted for all boundary types
+- only after assembly/corruption the shared `canonical_hands42_v3`
+  preprocessing is applied
+
+Step2 also applies post-assembly runtime-like corruption so synth better matches
+real detector failures:
+
+- single-hand dropout spans
+- both-hands dropout spans
+- short mask flicker spans
+- visible-joint coordinate jitter
+
+`stats.json` / `summary.json` also tracks:
+
+- fraction of samples with hand corruption
+- startup-prefix frames that remain fully no-hand after corruption
+- longest no-hand span stats
+- corruption counts by type
+- seam realism:
+  - boundary/internal center jump ratio
+  - boundary/internal scale jump ratio
+  - wrist and valid-joint deltas at seams
+  - same-source vs cross-source boundary breakdown
+
 ### Val synth
 
 ```bash
@@ -280,6 +340,52 @@ python -m bio train \
   --logdir runs \
   --run_name bio_gru_v2
 ```
+
+Current train defaults also enable an auxiliary `signness` head (`O` vs `B/I`)
+plus startup-aware losses/selection. Important config knobs:
+
+- `use_signness_head`
+- `signness_head_dropout`
+- `loss_lambda_signness`
+- `loss_lambda_startup_nohand`
+- `startup_visible_joint_threshold`
+- `startup_visible_hand_frames`
+- `balanced_lambda_startup_false_start`
+- `balanced_lambda_startup_nohand_active`
+
+The val/eval path now logs startup diagnostics such as:
+
+- `startup_false_start_rate`
+- `startup_segment_before_first_hand_rate`
+- `startup_nohand_pred_B_rate`
+- `startup_nohand_pred_active_rate`
+
+## Runtime Startup Guard
+
+The runtime decoder now supports a hand-presence startup guard for inference.
+Use it when long silent / no-hands prefixes cause false `B/I` at frame 0.
+
+Relevant `bio infer-*` options:
+
+- `--require_hand_presence_to_start`
+- `--min_visible_hand_frames_to_start`
+- `--min_valid_hand_joints_to_start`
+- `--allow_one_hand_to_start`
+- `--require_both_hands_to_start`
+
+The guard:
+
+- blocks only the start of a new segment
+- does not interfere with an already open segment
+- uses hand mask validity only
+- does not depend on pose
+
+When the checkpoint includes the auxiliary signness head, runtime can also gate
+starts/continuation with:
+
+- `--use_signness_gate`
+- `--signness_start_threshold`
+- `--signness_continue_threshold`
 
 ## Minimal Artifact Layout
 

@@ -64,6 +64,17 @@ def _decoder_cfg_from_args(args: argparse.Namespace, *, threshold: float | None 
         "emit_partial_segments": bool(getattr(args, "emit_partial_segments", False)),
         "eos_policy": str(getattr(args, "eos_policy", "") or "drop_partial_on_eos"),
         "stream_window": int(getattr(args, "stream_window", 16)),
+        "require_hand_presence_to_start": bool(getattr(args, "require_hand_presence_to_start", False)),
+        "min_visible_hand_frames_to_start": int(getattr(args, "min_visible_hand_frames_to_start", 2)),
+        "min_valid_hand_joints_to_start": int(getattr(args, "min_valid_hand_joints_to_start", 8)),
+        "allow_one_hand_to_start": bool(getattr(args, "allow_one_hand_to_start", True)),
+        "use_signness_gate": bool(getattr(args, "use_signness_gate", True)),
+        "signness_start_threshold": float(getattr(args, "signness_start_threshold", 0.55)),
+        "signness_continue_threshold": float(getattr(args, "signness_continue_threshold", 0.50)),
+        "use_onset_gate": bool(getattr(args, "use_onset_gate", True)),
+        "onset_start_threshold": float(getattr(args, "onset_start_threshold", 0.45)),
+        "active_start_threshold": float(getattr(args, "active_start_threshold", 0.25)),
+        "active_continue_threshold": float(getattr(args, "active_continue_threshold", 0.20)),
     }
     payload.update(kwargs)
     if threshold is not None:
@@ -84,6 +95,20 @@ def _add_decoder_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--emit_partial_segments", action="store_true")
     parser.add_argument("--eos_policy", default="", choices=["", "drop_partial_on_eos", "close_open_segment_on_eos"], help="Optional EOS policy override")
     parser.add_argument("--stream_window", type=int, default=16)
+    parser.add_argument("--require_hand_presence_to_start", action="store_true", help="Block new segment starts until hand presence is stable")
+    parser.add_argument("--min_visible_hand_frames_to_start", type=int, default=2, help="How many consecutive hand-visible frames are required before a start is allowed")
+    parser.add_argument("--min_valid_hand_joints_to_start", type=int, default=8, help="Minimum valid joints per visible hand frame for the startup guard")
+    parser.add_argument("--allow_one_hand_to_start", dest="allow_one_hand_to_start", action="store_true", default=True, help="Allow one visible hand to satisfy the startup guard")
+    parser.add_argument("--require_both_hands_to_start", dest="allow_one_hand_to_start", action="store_false", help="Require both hands to satisfy the startup guard")
+    parser.add_argument("--use_signness_gate", dest="use_signness_gate", action="store_true", default=True, help="Use auxiliary signness probability as an additional start/continue gate when available")
+    parser.add_argument("--no_use_signness_gate", dest="use_signness_gate", action="store_false")
+    parser.add_argument("--signness_start_threshold", type=float, default=0.55, help="Minimum p_active required to open a segment when signness head is available")
+    parser.add_argument("--signness_continue_threshold", type=float, default=0.50, help="Minimum p_active used to keep a segment active when signness head is available")
+    parser.add_argument("--use_onset_gate", dest="use_onset_gate", action="store_true", default=True, help="Allow onset probability to open a segment even when pB is still below the raw BIO threshold")
+    parser.add_argument("--no_use_onset_gate", dest="use_onset_gate", action="store_false")
+    parser.add_argument("--onset_start_threshold", type=float, default=0.45, help="Minimum p_onset required to open a segment when the onset head is available")
+    parser.add_argument("--active_start_threshold", type=float, default=0.25, help="Minimum p_active required before a new segment start is allowed")
+    parser.add_argument("--active_continue_threshold", type=float, default=0.20, help="Minimum p_active used to keep a segment active")
     parser.add_argument("--force_final_flush", action="store_true", help="Emit final partial segment on EOS even when decoder config disables it")
 
 
@@ -169,7 +194,7 @@ def _runtime_summary(segmenter: BioSegmenter, *, extractor_mode: str, extractor:
     return {
         "config_source": str(segmenter.metadata.get("config_resolution_source", "checkpoint")),
         "selected_threshold": float(segmenter.threshold),
-        "decoder_version": str(segmenter.metadata.get("decoder_version", "bio_segment_decoder_v1")),
+        "decoder_version": str(segmenter.metadata.get("decoder_version", "bio_segment_decoder_v2")),
         "decoder_config": asdict(segmenter.decoder.cfg),
         "preprocessing_version": str(segmenter.metadata.get("preprocessing_version", "")),
         "extractor_mode": str(extractor_mode),
@@ -183,7 +208,7 @@ def main_infer_skeletons(argv: List[str]) -> None:
     p.add_argument("--bundle", default="", help="BIO runtime bundle dir")
     p.add_argument("--checkpoint", default="", help="BIO checkpoint file or run dir")
     p.add_argument("--run_dir", default="", help="Alias for checkpoint run dir")
-    p.add_argument("--selection", default="best_balanced", choices=["best_balanced", "best_boundary", "last"])
+    p.add_argument("--selection", default="best_recall_safe", choices=["best_balanced", "best_boundary", "best_recall_safe", "last"])
     p.add_argument("--device", default="")
     p.add_argument("--out_json", default="")
     p.add_argument("--include_frame_outputs", action="store_true")
@@ -213,7 +238,7 @@ def main_infer_video(argv: List[str]) -> None:
     p.add_argument("--bundle", default="", help="BIO runtime bundle dir")
     p.add_argument("--checkpoint", default="", help="BIO checkpoint file or run dir")
     p.add_argument("--run_dir", default="", help="Alias for checkpoint run dir")
-    p.add_argument("--selection", default="best_balanced", choices=["best_balanced", "best_boundary", "last"])
+    p.add_argument("--selection", default="best_recall_safe", choices=["best_balanced", "best_boundary", "best_recall_safe", "last"])
     p.add_argument("--device", default="")
     p.add_argument("--out_json", default="")
     p.add_argument("--include_frame_outputs", action="store_true")
@@ -254,7 +279,7 @@ def main_infer_stream(argv: List[str]) -> None:
     p.add_argument("--bundle", default="", help="BIO runtime bundle dir")
     p.add_argument("--checkpoint", default="", help="BIO checkpoint file or run dir")
     p.add_argument("--run_dir", default="", help="Alias for checkpoint run dir")
-    p.add_argument("--selection", default="best_balanced", choices=["best_balanced", "best_boundary", "last"])
+    p.add_argument("--selection", default="best_recall_safe", choices=["best_balanced", "best_boundary", "best_recall_safe", "last"])
     p.add_argument("--device", default="")
     p.add_argument("--max_frames", type=int, default=0)
     p.add_argument("--display", action="store_true")
@@ -318,7 +343,7 @@ def main_export_runtime_bundle(argv: List[str]) -> None:
     p = argparse.ArgumentParser("python -m bio export-runtime-bundle")
     p.add_argument("--checkpoint", required=True, help="BIO checkpoint file or run dir")
     p.add_argument("--out_dir", required=True)
-    p.add_argument("--selection", default="best_balanced", choices=["best_balanced", "best_boundary", "last"])
+    p.add_argument("--selection", default="best_recall_safe", choices=["best_balanced", "best_boundary", "best_recall_safe", "last"])
     _add_decoder_args(p)
     args = p.parse_args(argv)
     manifest = export_bio_runtime_bundle(

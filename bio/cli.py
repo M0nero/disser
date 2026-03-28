@@ -12,8 +12,11 @@ def _print_help() -> None:
     print("")
     print("Commands:")
     print("  prelabel         Step1: build BIO prelabels from skeletons + CSV")
+    print("  signer-split     Rewrite Slovo CSVs into signer-disjoint splits by user_id")
     print("  synth-build      Step2: build synthetic continuous dataset (offline)")
+    print("  continuous-stats Extract empirical stats from real continuous sequences")
     print("  train            Train BIO tagger on synthetic dataset")
+    print("  train-curriculum Two-stage BIO training: warmup_single_sign -> main_continuous")
     print("  build-dataset    Canonical v2 rebuild: Step1 + overlap audit + Step2")
     print("  smoke-test       Quick Step1+Step2 sanity check")
     print("  infer-stream     Runtime BIO segmentation from live camera/video stream")
@@ -37,8 +40,11 @@ def main(argv: List[str] | None = None) -> None:
 
     dispatch: Dict[str, Callable[[List[str]], None]] = {
         "prelabel": _run_prelabel,
+        "signer-split": _run_signer_split,
         "synth-build": _run_synth_build,
+        "continuous-stats": _run_continuous_stats,
         "train": _run_train,
+        "train-curriculum": _run_train_curriculum,
         "build-dataset": _run_build_dataset,
         "smoke-test": _run_smoke_test,
         "infer-stream": _run_infer_stream,
@@ -62,16 +68,34 @@ def _run_prelabel(args: List[str]) -> None:
     prelabel.main(args)
 
 
+def _run_signer_split(args: List[str]) -> None:
+    from bio.pipeline import signer_split
+
+    signer_split.main(args)
+
+
 def _run_synth_build(args: List[str]) -> None:
     from bio.pipeline import synth_build
 
     synth_build.main(args)
 
 
+def _run_continuous_stats(args: List[str]) -> None:
+    from bio.pipeline import continuous_stats
+
+    continuous_stats.main(args)
+
+
 def _run_train(args: List[str]) -> None:
     from bio.pipeline import train
 
     train.main(args)
+
+
+def _run_train_curriculum(args: List[str]) -> None:
+    from bio.pipeline import train_curriculum
+
+    train_curriculum.main(args)
 
 
 def _run_build_dataset(args: List[str]) -> None:

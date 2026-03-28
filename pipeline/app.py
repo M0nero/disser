@@ -30,7 +30,7 @@ from runtime.skeleton import CanonicalSkeletonSequence, save_skeleton_sequence_n
 class InferencePipelineConfig:
     bio_bundle: str = ""
     bio_checkpoint: str = ""
-    bio_selection: str = "best_balanced"
+    bio_selection: str = "best_recall_safe"
     bio_decoder_config_json: str = ""
     bio_threshold: float | None = None
     msagcn_bundle: str = ""
@@ -170,7 +170,7 @@ class InferencePipeline:
         decoder_cfg = _load_decoder_cfg_json(cfg.bio_decoder_config_json)
         return BioSegmenter.from_checkpoint(
             cfg.bio_checkpoint,
-            selection=str(cfg.bio_selection or "best_balanced"),
+            selection=str(cfg.bio_selection or "best_recall_safe"),
             device=device,
             decoder_cfg=decoder_cfg,
             threshold=cfg.bio_threshold,
@@ -443,7 +443,15 @@ def _frame_segment_ids(frame_count: int, segments: List[Dict[str, Any]]) -> List
     return out
 
 
-def _frame_warning_flags(*, left_valid_frac: float, right_valid_frac: float, pose_valid_frac: float, pose_enabled: bool) -> List[str]:
+def _frame_warning_flags(
+    *,
+    left_valid_frac: float,
+    right_valid_frac: float,
+    pose_valid_frac: float,
+    pose_enabled: bool,
+    start_blocked_by_hand_guard: bool = False,
+    startup_false_start_candidate: bool = False,
+) -> List[str]:
     flags: List[str] = []
     if left_valid_frac <= 0.05:
         flags.append("left_hand_missing")
@@ -451,6 +459,10 @@ def _frame_warning_flags(*, left_valid_frac: float, right_valid_frac: float, pos
         flags.append("right_hand_missing")
     if pose_enabled and pose_valid_frac <= 0.25:
         flags.append("pose_unreliable")
+    if bool(start_blocked_by_hand_guard):
+        flags.append("start_blocked_by_hand_guard")
+    if bool(startup_false_start_candidate):
+        flags.append("startup_false_start_candidate")
     return flags
 
 
@@ -491,6 +503,8 @@ def _build_frame_debug_rows(
                 "pB": float(probs[1]),
                 "pI": float(probs[2]),
                 "threshold": float(out.get("threshold", threshold)),
+                "p_active": (None if out.get("p_active", None) is None else float(out.get("p_active", 0.0))),
+                "p_onset": (None if out.get("p_onset", None) is None else float(out.get("p_onset", 0.0))),
                 "active_segment_id": (None if seg_id is None else int(seg_id)),
                 "predicted_label": str(pred.get("label", "")),
                 "predicted_confidence": float(pred.get("confidence", 0.0) or 0.0),
@@ -500,15 +514,23 @@ def _build_frame_debug_rows(
                 "sentence_decision_reason": str(decision.get("reason", "")),
                 "left_valid_joints": left_valid_joints,
                 "right_valid_joints": right_valid_joints,
+                "total_valid_hand_joints": int(out.get("total_valid_hand_joints", left_valid_joints + right_valid_joints)),
                 "left_valid_frac": left_valid_frac,
                 "right_valid_frac": right_valid_frac,
                 "pose_valid_joints": pose_valid_joints,
                 "pose_valid_frac": pose_valid_frac,
+                "hand_presence_ok": bool(out.get("hand_presence_ok", True)),
+                "start_blocked_by_hand_guard": bool(out.get("start_blocked_by_hand_guard", False)),
+                "signness_gate_ok": bool(out.get("signness_gate_ok", True)),
+                "clip_hit_candidate": bool(out.get("clip_hit_candidate", False)),
+                "startup_false_start_candidate": bool(out.get("startup_false_start_candidate", False)),
                 "warnings": _frame_warning_flags(
                     left_valid_frac=left_valid_frac,
                     right_valid_frac=right_valid_frac,
                     pose_valid_frac=pose_valid_frac,
                     pose_enabled=pose_enabled,
+                    start_blocked_by_hand_guard=bool(out.get("start_blocked_by_hand_guard", False)),
+                    startup_false_start_candidate=bool(out.get("startup_false_start_candidate", False)),
                 ),
             }
         )
@@ -1077,7 +1099,7 @@ def build_review_session(
             "bio": {
                 "mode": ("bundle" if cfg.bio_bundle else "checkpoint"),
                 "source": str(cfg.bio_bundle or cfg.bio_checkpoint),
-                "selection": str(cfg.bio_selection or "best_balanced"),
+                "selection": str(cfg.bio_selection or "best_recall_safe"),
             },
             "msagcn": {
                 "mode": ("bundle" if cfg.msagcn_bundle else "checkpoint"),

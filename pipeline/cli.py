@@ -72,7 +72,7 @@ def main(argv: List[str] | None = None) -> None:
 def _add_common_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--bio_bundle", default="", help="BIO runtime bundle directory")
     p.add_argument("--bio_checkpoint", default="", help="BIO checkpoint file or run dir")
-    p.add_argument("--bio_selection", default="best_balanced", choices=["best_balanced", "best_boundary", "last"])
+    p.add_argument("--bio_selection", default="best_recall_safe", choices=["best_balanced", "best_boundary", "best_recall_safe", "last"])
     p.add_argument("--bio_threshold", type=float, default=None)
     p.add_argument("--bio_decoder_config_json", default="", help="Optional BIO decoder config JSON for raw checkpoint mode")
     p.add_argument("--msagcn_bundle", default="", help="MSAGCN runtime bundle directory")
@@ -104,7 +104,7 @@ def _cfg_from_args(args: argparse.Namespace) -> InferencePipelineConfig:
     return InferencePipelineConfig(
         bio_bundle=str(args.bio_bundle or ""),
         bio_checkpoint=str(args.bio_checkpoint or ""),
-        bio_selection=str(args.bio_selection or "best_balanced"),
+        bio_selection=str(args.bio_selection or "best_recall_safe"),
         bio_decoder_config_json=str(args.bio_decoder_config_json or ""),
         bio_threshold=(None if args.bio_threshold is None else float(args.bio_threshold)),
         msagcn_bundle=str(args.msagcn_bundle or ""),

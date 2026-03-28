@@ -31,6 +31,8 @@ class BioModelConfig:
     gru_dropout: float = 0.0  # only used if gru_layers > 1
 
     head_dropout: float = 0.10
+    signness_head_dropout: float = 0.10
+    onset_head_dropout: float = 0.10
 
     # Feature toggles
     use_vel: bool = True
@@ -40,6 +42,8 @@ class BioModelConfig:
 
     # Hands layout: first 21 = left, next 21 = right (MediaPipe Hands default)
     assume_two_hands_21: bool = True
+    use_signness_head: bool = False
+    use_onset_head: bool = False
 
 
 @dataclass
@@ -132,6 +136,22 @@ class BioTagger(nn.Module):
         self.head = nn.Sequential(
             nn.Dropout(cfg.head_dropout),
             nn.Linear(cfg.gru_hidden, self.num_classes),
+        )
+        self.signness_head = (
+            nn.Sequential(
+                nn.Dropout(cfg.signness_head_dropout),
+                nn.Linear(cfg.gru_hidden, 1),
+            )
+            if bool(cfg.use_signness_head)
+            else None
+        )
+        self.onset_head = (
+            nn.Sequential(
+                nn.Dropout(cfg.onset_head_dropout),
+                nn.Linear(cfg.gru_hidden, 1),
+            )
+            if bool(cfg.use_onset_head)
+            else None
         )
 
     @staticmethod
@@ -379,6 +399,116 @@ class BioTagger(nn.Module):
         state.h = hN
         return logits[:, 0, :], state
 
+    @torch.no_grad()
+    def stream_step_with_aux(
+        self,
+        pt: torch.Tensor,
+        mask: Optional[torch.Tensor],
+        state: BioStreamState,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], BioStreamState]:
+        if pt.dim() == 2:
+            pt = pt.unsqueeze(0)
+        if pt.dim() != 3:
+            raise ValueError(f"pt must be (B,V,3) or (V,3), got {tuple(pt.shape)}")
+
+        if mask is None:
+            mask = torch.ones((pt.shape[0], pt.shape[1], 1), device=pt.device, dtype=pt.dtype)
+        elif mask.dim() == 2:
+            mask = mask.unsqueeze(0)
+        if mask.dim() != 3:
+            raise ValueError(f"mask must be (B,V,1) or (V,1), got {tuple(mask.shape)}")
+
+        if pt.shape[0] != state.pts_buf.shape[0]:
+            raise ValueError(f"batch mismatch: pt B={pt.shape[0]} vs state B={state.pts_buf.shape[0]}")
+        if pt.shape[1] != state.pts_buf.shape[2]:
+            raise ValueError(f"V mismatch: pt V={pt.shape[1]} vs state V={state.pts_buf.shape[2]}")
+
+        if pt.device != state.pts_buf.device or mask.device != state.mask_buf.device:
+            raise ValueError("pt/mask device must match stream state device")
+        if pt.dtype != state.pts_buf.dtype or mask.dtype != state.mask_buf.dtype:
+            raise ValueError("pt/mask dtype must match stream state dtype")
+
+        if state.n < state.pts_buf.shape[1]:
+            idx = state.n
+            state.pts_buf[:, idx] = pt
+            state.mask_buf[:, idx] = mask
+            state.n += 1
+        else:
+            state.pts_buf[:, :-1] = state.pts_buf[:, 1:].clone()
+            state.mask_buf[:, :-1] = state.mask_buf[:, 1:].clone()
+            state.pts_buf[:, -1] = pt
+            state.mask_buf[:, -1] = mask
+
+        pts_w = state.pts_buf[:, : state.n]
+        mask_w = state.mask_buf[:, : state.n]
+        feats = self._build_features(pts_w, mask_w)
+        emb = self.embed(feats)
+        conv = self.conv_front(emb.transpose(1, 2)).transpose(1, 2)
+        conv_last = conv[:, -1, :]
+        y1, hN = self.gru(conv_last.unsqueeze(1), state.h)
+        logits = self.head(y1)
+        signness_logits = self.signness_head(y1) if self.signness_head is not None else None
+        state.h = hN
+        return logits[:, 0, :], (signness_logits[:, 0, :] if signness_logits is not None else None), state
+
+    @torch.no_grad()
+    def stream_step_with_heads(
+        self,
+        pt: torch.Tensor,
+        mask: Optional[torch.Tensor],
+        state: BioStreamState,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], BioStreamState]:
+        if pt.dim() == 2:
+            pt = pt.unsqueeze(0)
+        if pt.dim() != 3:
+            raise ValueError(f"pt must be (B,V,3) or (V,3), got {tuple(pt.shape)}")
+
+        if mask is None:
+            mask = torch.ones((pt.shape[0], pt.shape[1], 1), device=pt.device, dtype=pt.dtype)
+        elif mask.dim() == 2:
+            mask = mask.unsqueeze(0)
+        if mask.dim() != 3:
+            raise ValueError(f"mask must be (B,V,1) or (V,1), got {tuple(mask.shape)}")
+
+        if pt.shape[0] != state.pts_buf.shape[0]:
+            raise ValueError(f"batch mismatch: pt B={pt.shape[0]} vs state B={state.pts_buf.shape[0]}")
+        if pt.shape[1] != state.pts_buf.shape[2]:
+            raise ValueError(f"V mismatch: pt V={pt.shape[1]} vs state V={state.pts_buf.shape[2]}")
+
+        if pt.device != state.pts_buf.device or mask.device != state.mask_buf.device:
+            raise ValueError("pt/mask device must match stream state device")
+        if pt.dtype != state.pts_buf.dtype or mask.dtype != state.mask_buf.dtype:
+            raise ValueError("pt/mask dtype must match stream state dtype")
+
+        if state.n < state.pts_buf.shape[1]:
+            idx = state.n
+            state.pts_buf[:, idx] = pt
+            state.mask_buf[:, idx] = mask
+            state.n += 1
+        else:
+            state.pts_buf[:, :-1] = state.pts_buf[:, 1:].clone()
+            state.mask_buf[:, :-1] = state.mask_buf[:, 1:].clone()
+            state.pts_buf[:, -1] = pt
+            state.mask_buf[:, -1] = mask
+
+        pts_w = state.pts_buf[:, : state.n]
+        mask_w = state.mask_buf[:, : state.n]
+        feats = self._build_features(pts_w, mask_w)
+        emb = self.embed(feats)
+        conv = self.conv_front(emb.transpose(1, 2)).transpose(1, 2)
+        conv_last = conv[:, -1, :]
+        y1, hN = self.gru(conv_last.unsqueeze(1), state.h)
+        logits = self.head(y1)
+        signness_logits = self.signness_head(y1) if self.signness_head is not None else None
+        onset_logits = self.onset_head(y1) if self.onset_head is not None else None
+        state.h = hN
+        return (
+            logits[:, 0, :],
+            (signness_logits[:, 0, :] if signness_logits is not None else None),
+            (onset_logits[:, 0, :] if onset_logits is not None else None),
+            state,
+        )
+
     def forward(self, pts: torch.Tensor, mask: Optional[torch.Tensor] = None, h0: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         pts:  (B, T, V, 3)
@@ -388,17 +518,41 @@ class BioTagger(nn.Module):
           logits: (B, T, 3)
           hN:     (num_layers, B, H)
         """
-        x = self._build_features(pts, mask)  # (B,T,D)
-        x = self.embed(x)  # (B,T,E)
-
-        # conv expects (B, E, T)
-        y = x.transpose(1, 2)  # (B,E,T)
-        y = self.conv_front(y)  # (B,E,T)
-        y = y.transpose(1, 2)  # (B,T,E)
-
-        y, hN = self.gru(y, h0)  # (B,T,H)
-        logits = self.head(y)  # (B,T,3)
+        logits, _, hN = self.forward_with_aux(pts, mask, h0=h0)
         return logits, hN
+
+    def forward_with_aux(
+        self,
+        pts: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        h0: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+        x = self._build_features(pts, mask)
+        x = self.embed(x)
+        y = x.transpose(1, 2)
+        y = self.conv_front(y)
+        y = y.transpose(1, 2)
+        y, hN = self.gru(y, h0)
+        logits = self.head(y)
+        signness_logits = self.signness_head(y) if self.signness_head is not None else None
+        return logits, signness_logits, hN
+
+    def forward_with_heads(
+        self,
+        pts: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        h0: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], torch.Tensor]:
+        x = self._build_features(pts, mask)
+        x = self.embed(x)
+        y = x.transpose(1, 2)
+        y = self.conv_front(y)
+        y = y.transpose(1, 2)
+        y, hN = self.gru(y, h0)
+        logits = self.head(y)
+        signness_logits = self.signness_head(y) if self.signness_head is not None else None
+        onset_logits = self.onset_head(y) if self.onset_head is not None else None
+        return logits, signness_logits, onset_logits, hN
 
 
 if __name__ == "__main__":

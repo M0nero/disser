@@ -19,6 +19,12 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from bio.core.config_utils import load_config_section, write_dataset_manifest, write_run_config
+from bio.core.preprocessing import (
+    BIO_PREPROCESSING_VERSION_V2,
+    BIO_PREPROCESSING_VERSION_V3,
+    BioPreprocessConfig,
+    preprocess_sequence,
+)
 
 NUM_HAND_JOINTS = 21
 NUM_HAND_NODES = 42
@@ -76,6 +82,12 @@ class PrelabelConfig:
     min_valid_frames: int = 8
     file_cache_size: int = 0
     prefer_pp: bool = True
+    trimmed_mode: bool = False
+    preprocessing_version: str = BIO_PREPROCESSING_VERSION_V3
+    preprocessing_center_alpha: float = 0.2
+    preprocessing_scale_alpha: float = 0.1
+    preprocessing_min_scale: float = 1e-3
+    preprocessing_min_visible_joints_for_scale: int = 4
 
 
 @dataclass(frozen=True)
@@ -86,6 +98,7 @@ class CsvSample:
     end: int
     split: str
     dataset: str
+    signer_id: str
     source_group: str
     sample_id: str
     row_num: int
@@ -360,6 +373,15 @@ def parse_csv(csv_path: Path, split: str) -> CsvParseResult:
                     }
                 )
                 continue
+            signer_id = str(
+                row.get("user_id")
+                or row.get("signer_id")
+                or row.get("user")
+                or row.get("signer")
+                or ""
+            ).strip()
+            if not signer_id:
+                signer_id = vid
 
             sample_id = _stable_sample_id(vid, label, begin, end)
             if sample_id in seen_sample_ids:
@@ -385,7 +407,8 @@ def parse_csv(csv_path: Path, split: str) -> CsvParseResult:
                     end=end,
                     split=split,
                     dataset="slovo",
-                    source_group=vid,
+                    signer_id=signer_id,
+                    source_group=signer_id,
                     sample_id=sample_id,
                     row_num=int(row_num),
                 )
@@ -510,7 +533,7 @@ def choose_thr_for_video(frames: Sequence[Dict[str, Any]], cfg: PrelabelConfig) 
     return best_thr, best_cov
 
 
-def frames_to_arrays(
+def frames_to_raw_arrays(
     frames: Sequence[Dict[str, Any]],
     cfg: PrelabelConfig,
     thr: float,
@@ -616,12 +639,38 @@ def frames_to_arrays(
             pts = pts[:, mirror_idx, :]
             mask = mask[:, mirror_idx, :]
 
-    pts_t = torch.from_numpy(pts)
-    mask_t = torch.from_numpy(mask)
-    pts_t = torch.nan_to_num(pts_t, nan=0.0, posinf=0.0, neginf=0.0)
-    pts_t = center_norm(pts_t, mask_t, cfg)
-    pts = pts_t.numpy()
     return pts, mask, ts
+
+
+def _shared_preprocess_cfg(cfg: PrelabelConfig) -> BioPreprocessConfig:
+    return BioPreprocessConfig(
+        version=str(cfg.preprocessing_version or BIO_PREPROCESSING_VERSION_V3),
+        center_alpha=float(cfg.preprocessing_center_alpha),
+        scale_alpha=float(cfg.preprocessing_scale_alpha),
+        min_scale=float(cfg.preprocessing_min_scale),
+        min_visible_joints_for_scale=int(cfg.preprocessing_min_visible_joints_for_scale),
+    )
+
+
+def prepare_model_pts(
+    pts_raw: np.ndarray,
+    mask: np.ndarray,
+    ts: np.ndarray,
+    cfg: PrelabelConfig,
+) -> np.ndarray:
+    version = str(cfg.preprocessing_version or BIO_PREPROCESSING_VERSION_V3)
+    if version == BIO_PREPROCESSING_VERSION_V2:
+        pts_t = torch.from_numpy(pts_raw)
+        mask_t = torch.from_numpy(mask)
+        pts_t = torch.nan_to_num(pts_t, nan=0.0, posinf=0.0, neginf=0.0)
+        return center_norm(pts_t, mask_t, cfg).numpy()
+    pts_v3, _debug = preprocess_sequence(
+        pts_raw,
+        mask,
+        cfg=_shared_preprocess_cfg(cfg),
+        dtype=torch.float32,
+    )
+    return np.asarray(pts_v3, dtype=np.float32)
 
 
 def center_norm(pts: torch.Tensor, mask: torch.Tensor, cfg: PrelabelConfig) -> torch.Tensor:
@@ -795,6 +844,28 @@ def make_bio_labels(
     return bio, start_idx, end_idx, stats
 
 
+def make_trimmed_gold_bio(
+    label_str: str,
+    *,
+    total_frames: int,
+    begin_hint: int,
+    end_hint: int,
+) -> Tuple[np.ndarray, int, int, Dict[str, Any]]:
+    bio = np.zeros((max(0, int(total_frames)),), dtype=np.uint8)
+    if int(total_frames) <= 0:
+        return bio, -1, -1, {"used_fallback": False, "label_source": "trimmed_csv", "end_semantics": "half_open"}
+    is_no_event = str(label_str or "").strip().lower() == "no_event"
+    if is_no_event:
+        return bio, -1, -1, {"used_fallback": False, "label_source": "trimmed_csv", "end_semantics": "half_open"}
+    start_idx = int(np.clip(int(begin_hint), 0, int(total_frames) - 1))
+    end_exclusive = int(np.clip(int(end_hint), start_idx + 1, int(total_frames)))
+    end_idx = int(end_exclusive - 1)
+    bio[start_idx] = 1
+    if end_idx > start_idx:
+        bio[start_idx + 1 : end_idx + 1] = 2
+    return bio, start_idx, end_idx, {"used_fallback": False, "label_source": "trimmed_csv", "end_semantics": "half_open"}
+
+
 def save_npz(
     out_path: Path,
     pts: np.ndarray,
@@ -806,20 +877,25 @@ def save_npz(
     start_idx: int,
     end_idx: int,
     meta: Dict[str, Any],
+    extra_arrays: Optional[Dict[str, np.ndarray]] = None,
 ) -> None:
     meta_json = json.dumps(meta, ensure_ascii=True)
-    np.savez(
-        out_path,
-        pts=pts.astype(np.float32, copy=False),
-        mask=mask.astype(np.float32, copy=False),
-        ts=ts.astype(np.float32, copy=False),
-        bio=bio.astype(np.uint8, copy=False),
-        label_str=np.array(label_str, dtype=np.unicode_),
-        is_no_event=np.array(bool(is_no_event)),
-        start_idx=np.array(int(start_idx), dtype=np.int64),
-        end_idx=np.array(int(end_idx), dtype=np.int64),
-        meta=np.array(meta_json, dtype=np.unicode_),
-    )
+    payload: Dict[str, Any] = {
+        "pts": pts.astype(np.float32, copy=False),
+        "mask": mask.astype(np.float32, copy=False),
+        "ts": ts.astype(np.float32, copy=False),
+        "bio": bio.astype(np.uint8, copy=False),
+        "label_str": np.array(label_str, dtype=np.unicode_),
+        "is_no_event": np.array(bool(is_no_event)),
+        "start_idx": np.array(int(start_idx), dtype=np.int64),
+        "end_idx": np.array(int(end_idx), dtype=np.int64),
+        "meta": np.array(meta_json, dtype=np.unicode_),
+    }
+    for key, value in dict(extra_arrays or {}).items():
+        if value is None:
+            continue
+        payload[str(key)] = np.asarray(value)
+    np.savez(out_path, **payload)
 
 
 def save_debug_log(out_dir: Path, sample_id: str, payload: Dict[str, Any]) -> None:
@@ -873,12 +949,14 @@ def process_sample(
     split = str(task.get("split", ""))
     dataset = str(task.get("dataset", "slovo"))
     source_group = str(task.get("source_group", vid))
+    signer_id = str(task.get("signer_id", source_group or vid))
 
     frames, meta = store.get_frames(vid)
     if not frames:
         P = len(cfg.pose_keep) if cfg.include_pose else 0
         V = NUM_HAND_NODES + P
         pts = np.zeros((0, V, 3), dtype=np.float32)
+        pts_raw = np.zeros((0, V, 3), dtype=np.float32)
         mask = np.zeros((0, V, 1), dtype=np.float32)
         ts = np.zeros((0,), dtype=np.float32)
         bio = np.zeros((0,), dtype=np.uint8)
@@ -889,10 +967,26 @@ def process_sample(
             "split": split,
             "dataset": dataset,
             "source_group": source_group,
+            "signer_id": signer_id,
             "begin_hint": begin_hint,
             "end_hint": end_hint,
+            "preprocessing_version": str(cfg.preprocessing_version),
+            "preprocessing_config": asdict(_shared_preprocess_cfg(cfg)),
+            "coords": "image",
         }
-        save_npz(out_path, pts, mask, ts, bio, label_str, label_str.lower() == "no_event", -1, -1, meta_out)
+        save_npz(
+            out_path,
+            pts,
+            mask,
+            ts,
+            bio,
+            label_str,
+            label_str.lower() == "no_event",
+            -1,
+            -1,
+            meta_out,
+            extra_arrays={"pts_raw": pts_raw},
+        )
         return {
             "index": {
                 "vid": sample_id,
@@ -905,6 +999,7 @@ def process_sample(
                 "split": split,
                 "dataset": dataset,
                 "source_group": source_group,
+                "signer_id": signer_id,
             },
             "stats": {
                 "segment_len": 0,
@@ -916,14 +1011,20 @@ def process_sample(
         }
 
     total_frames = len(frames)
-    begin = max(0, begin_hint)
-    end = end_hint if end_hint > begin else total_frames
-    end = min(end, total_frames)
-    seg = frames[begin:end] if end > begin else frames
+    if bool(cfg.trimmed_mode):
+        begin = 0
+        end = total_frames
+        seg = frames
+    else:
+        begin = max(0, begin_hint)
+        end = end_hint if end_hint > begin else total_frames
+        end = min(end, total_frames)
+        seg = frames[begin:end] if end > begin else frames
     T_total = len(seg)
 
     thr_used, coverage_pre = choose_thr_for_video(seg, cfg)
-    pts, mask, ts = frames_to_arrays(seg, cfg, thr_used, meta, mirror_idx)
+    pts_raw, mask, ts = frames_to_raw_arrays(seg, cfg, thr_used, meta, mirror_idx)
+    pts = prepare_model_pts(pts_raw, mask, ts, cfg)
 
     valid_frames = int(np.any(mask[:, :NUM_HAND_NODES, 0] > 0.0, axis=1).sum()) if T_total > 0 else 0
     coverage_post = valid_frames / float(T_total) if T_total > 0 else 0.0
@@ -932,9 +1033,18 @@ def process_sample(
     motion = smooth_motion(motion_raw, cfg.smooth_win)
     valid_mask = (valid_counts > 0) if valid_counts.size == motion.size else None
 
-    bio, start_idx, end_idx, debug_stats = make_bio_labels(
-        label_str, motion, valid_frames, valid_mask, cfg
-    )
+    motion_start_idx = -1
+    motion_end_idx = -1
+    bio, start_idx, end_idx, debug_stats = make_bio_labels(label_str, motion, valid_frames, valid_mask, cfg)
+    if bool(cfg.trimmed_mode):
+        motion_start_idx = int(start_idx)
+        motion_end_idx = int(end_idx)
+        bio, start_idx, end_idx, debug_stats = make_trimmed_gold_bio(
+            label_str,
+            total_frames=T_total,
+            begin_hint=begin_hint,
+            end_hint=end_hint,
+        )
 
     is_no_event = label_str.strip().lower() == "no_event"
     seg_len = int(end_idx - start_idx + 1) if start_idx >= 0 else 0
@@ -965,17 +1075,30 @@ def process_sample(
         "end_hint": int(end_hint),
         "clip_begin": int(begin),
         "clip_end": int(end),
+        "trimmed_mode": bool(cfg.trimmed_mode),
+        "label_source": str(debug_stats.get("label_source", "motion")),
+        "annotation_end_semantics": str(debug_stats.get("end_semantics", "unknown")),
+        "motion_start_idx": int(motion_start_idx),
+        "motion_end_idx": int(motion_end_idx),
         "split": split,
         "dataset": dataset,
         "source_group": source_group,
+        "signer_id": signer_id,
         "coords": meta.get("coords", ""),
         "include_pose": bool(cfg.include_pose),
         "pose_keep": list(cfg.pose_keep),
+        "preprocessing_version": str(cfg.preprocessing_version),
+        "preprocessing_config": asdict(_shared_preprocess_cfg(cfg)),
+        "raw_pts_key": "pts_raw",
+        "preview_pts_key": "pts",
     }
     if sample_id != vid:
         meta_out["orig_vid"] = vid
 
-    save_npz(out_path, pts, mask, ts, bio, label_str, is_no_event, start_idx, end_idx, meta_out)
+    extra_arrays: Dict[str, np.ndarray] = {"pts_raw": pts_raw}
+    if str(cfg.preprocessing_version) == BIO_PREPROCESSING_VERSION_V3:
+        extra_arrays["pts_preview_v3"] = pts
+    save_npz(out_path, pts, mask, ts, bio, label_str, is_no_event, start_idx, end_idx, meta_out, extra_arrays=extra_arrays)
 
     if task.get("debug"):
         debug_payload = {
@@ -991,6 +1114,8 @@ def process_sample(
             "valid_frames": int(valid_frames),
             "motion_valid_frames": int(valid_mask.sum()) if valid_mask is not None else 0,
             "used_fallback": bool(debug_stats.get("used_fallback", False)),
+            "label_source": str(debug_stats.get("label_source", "motion")),
+            "trimmed_mode": bool(cfg.trimmed_mode),
             "motion_stats": {
                 "max": motion_max,
                 "mean": motion_mean,
@@ -1018,6 +1143,7 @@ def process_sample(
             "split": split,
             "dataset": dataset,
             "source_group": source_group,
+            "signer_id": signer_id,
         },
         "stats": {
             "segment_len": seg_len,
@@ -1056,7 +1182,7 @@ def write_index_files(out_dir: Path, rows: List[Dict[str, Any]]) -> None:
 
     index_csv = out_dir / "index.csv"
     if rows:
-        fields = ["vid", "label_str", "path_to_npz", "T_total", "start_idx", "end_idx", "is_no_event", "split", "dataset", "source_group"]
+        fields = ["vid", "label_str", "path_to_npz", "T_total", "start_idx", "end_idx", "is_no_event", "split", "dataset", "source_group", "signer_id"]
         with index_csv.open("w", encoding="utf-8", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fields)
             writer.writeheader()
@@ -1186,6 +1312,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Prefer *_pp.json when using per-video skeletons (fallback to raw .json).",
     )
     p.add_argument("--no_prefer_pp", dest="prefer_pp", action="store_false")
+    trimmed_mode_default = _bool_or_default(defaults.get("trimmed_mode"), False)
+    p.add_argument("--trimmed_mode", dest="trimmed_mode", action="store_true", default=trimmed_mode_default)
+    p.add_argument("--no_trimmed_mode", dest="trimmed_mode", action="store_false")
     center_default = _bool_or_default(defaults.get("center"), True)
     p.add_argument("--center", dest="center", action="store_true", default=center_default)
     p.add_argument("--no_center", dest="center", action="store_false")
@@ -1195,6 +1324,20 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--no_normalize", dest="normalize", action="store_false")
     p.add_argument("--norm_method", type=str, default=defaults.get("norm_method", "p95"), choices=["p95", "mad", "max"])
     p.add_argument("--norm_scale", type=float, default=float(defaults.get("norm_scale", 1.0)))
+    p.add_argument(
+        "--preprocessing_version",
+        type=str,
+        default=str(defaults.get("preprocessing_version", BIO_PREPROCESSING_VERSION_V3)),
+        choices=[BIO_PREPROCESSING_VERSION_V2, BIO_PREPROCESSING_VERSION_V3],
+    )
+    p.add_argument("--preprocessing_center_alpha", type=float, default=float(defaults.get("preprocessing_center_alpha", 0.2)))
+    p.add_argument("--preprocessing_scale_alpha", type=float, default=float(defaults.get("preprocessing_scale_alpha", 0.1)))
+    p.add_argument("--preprocessing_min_scale", type=float, default=float(defaults.get("preprocessing_min_scale", 1e-3)))
+    p.add_argument(
+        "--preprocessing_min_visible_joints_for_scale",
+        type=int,
+        default=int(defaults.get("preprocessing_min_visible_joints_for_scale", 4)),
+    )
     p.add_argument("--log_every", type=int, default=int(defaults.get("log_every", 50)))
     return p.parse_args(argv)
 
@@ -1238,11 +1381,17 @@ def main(argv: Optional[List[str]] = None) -> None:
         min_valid_frames=args.min_valid_frames if args.min_valid_frames > 0 else min_len,
         file_cache_size=args.file_cache,
         prefer_pp=args.prefer_pp,
+        trimmed_mode=args.trimmed_mode,
+        preprocessing_version=str(args.preprocessing_version),
+        preprocessing_center_alpha=float(args.preprocessing_center_alpha),
+        preprocessing_scale_alpha=float(args.preprocessing_scale_alpha),
+        preprocessing_min_scale=float(args.preprocessing_min_scale),
+        preprocessing_min_visible_joints_for_scale=int(args.preprocessing_min_visible_joints_for_scale),
     )
 
     parsed = parse_csv(csv_path, split)
     if args.debug_vid:
-        debug_rows = [s for s in parsed.rows if s.vid == args.debug_vid or s.source_group == args.debug_vid]
+        debug_rows = [s for s in parsed.rows if s.vid == args.debug_vid or s.source_group == args.debug_vid or s.signer_id == args.debug_vid]
         if not debug_rows:
             raise RuntimeError(f"No samples found for debug_vid={args.debug_vid}")
         parsed = CsvParseResult(
@@ -1290,6 +1439,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                 "end": end,
                 "split": sample.split,
                 "dataset": sample.dataset,
+                "signer_id": sample.signer_id,
                 "source_group": sample.source_group,
                 "out_path": str(out_path),
                 "debug": bool(args.debug_vid),

@@ -1047,6 +1047,7 @@ class ReviewWindow(QMainWindow):
                 ("bio_label", "State"),
                 ("bio_probs", "pO / pB / pI"),
                 ("threshold", "Threshold"),
+                ("hand_guard", "Hand guard"),
                 ("warnings", "Warnings"),
             ],
         )
@@ -1055,6 +1056,7 @@ class ReviewWindow(QMainWindow):
             [
                 ("left_valid", "Left valid joints"),
                 ("right_valid", "Right valid joints"),
+                ("total_valid", "Total valid hand joints"),
                 ("pose_valid", "Pose valid"),
                 ("slot_layout", "Slot layout"),
                 ("left_wrist", "Left wrist"),
@@ -1528,11 +1530,16 @@ class ReviewWindow(QMainWindow):
                 f"{float(row.get('pI', 0.0)):.2f}"
             ),
             "threshold": f"{float(row.get('threshold', 0.0)):.2f}",
+            "hand_guard": (
+                f"ok={bool(row.get('hand_presence_ok', True))} • "
+                f"blocked={bool(row.get('start_blocked_by_hand_guard', False))}"
+            ),
             "warnings": ", ".join(str(flag) for flag in list(row.get("warnings", []) or [])) or "none",
         }
         tracking = {
             "left_valid": f"{int(row.get('left_valid_joints', 0))}/21 ({_format_ratio(float(row.get('left_valid_frac', 0.0)))})",
             "right_valid": f"{int(row.get('right_valid_joints', 0))}/21 ({_format_ratio(float(row.get('right_valid_frac', 0.0)))})",
+            "total_valid": str(int(row.get("total_valid_hand_joints", 0))),
             "pose_valid": _format_ratio(float(row.get("pose_valid_frac", 0.0))),
             "slot_layout": "left 0:21 • right 21:42",
             "left_wrist": _format_xyz(seq.pts[frame_index, 0]),

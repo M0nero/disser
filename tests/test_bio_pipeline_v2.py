@@ -7,6 +7,7 @@ import json
 import tempfile
 import unittest
 import warnings
+from collections import Counter
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
@@ -14,10 +15,14 @@ from unittest import mock
 import numpy as np
 import torch
 
+from bio.pipeline import build_dataset as build_dataset_mod
 from bio.pipeline.build_dataset import _promote_many_transactional, build_overlap_report
-from bio.pipeline.prelabel import parse_csv
+from bio.pipeline.prelabel import PrelabelConfig, VideoStore, build_mirror_idx, parse_csv, process_sample
+from bio.pipeline import signer_split as signer_split_mod
 from bio.pipeline import synth_build
 from bio.pipeline import train as train_mod
+from bio.pipeline import train_curriculum as train_curriculum_mod
+from bio.pipeline.synth_build import evaluate_realism_gate
 from bio.core.datasets.shard_dataset import ShardedBiosDataset, make_shard_aware_boundary_batch_sampler
 from bio.pipeline.train import (
     _batch_prepare_fn,
@@ -29,10 +34,12 @@ from bio.pipeline.train import (
     _lr_for_epoch,
     _make_schedule_state,
     _make_runtime_summary,
+    _raise_if_bad_synth_realism,
     _restore_history_from_checkpoint,
     _should_write_prediction_artifacts,
     _resolve_auto_workers,
     _set_optimizer_lr,
+    _startup_prefix_mask_torch,
     _update_threshold_sweep_state,
     _threshold_sweep,
     _update_early_stop_counter,
@@ -51,6 +58,13 @@ def _write_csv(path: Path, rows: list[dict[str, object]]) -> None:
         writer = csv.DictWriter(f, fieldnames=["attachment_id", "text", "begin", "end", "split"])
         writer.writeheader()
         writer.writerows(rows)
+
+
+def _hand_points(base: float) -> list[dict[str, float]]:
+    return [
+        {"x": float(base + 0.01 * idx), "y": float(base + 0.02 * idx), "z": float(-0.005 * idx)}
+        for idx in range(21)
+    ]
 
 
 def _write_tiny_synth_dir(root: Path, *, bios: list[np.ndarray]) -> Path:
@@ -216,8 +230,195 @@ class BioPipelineV2Tests(unittest.TestCase):
                     model_signature={"model": "dummy", "num_params": 20},
                 )
             self.assertEqual(profile.workers, 0)
-            self.assertIn("5%", info["selection_reason"])
-            self.assertEqual(len(info["candidates"]), 4)
+
+    def test_evaluate_realism_gate_prefers_semantic_metrics(self) -> None:
+        generated = {
+            "dataset_profile": "main_continuous",
+            "semantic_seam_realism": {
+                "targets": {
+                    "boundary_internal_center_jump_ratio_max": 2.0,
+                    "boundary_internal_scale_jump_ratio_max": 2.5,
+                    "cross_source_boundary_frac_max": 0.01,
+                },
+                "boundary_internal_center_jump_ratio": 1.5,
+                "boundary_internal_scale_jump_ratio": 2.0,
+                "cross_source_boundary_frac": 0.0,
+            },
+            "expanded_seam_realism": {
+                "targets": {
+                    "boundary_internal_center_jump_ratio_max": 2.0,
+                    "boundary_internal_scale_jump_ratio_max": 2.5,
+                    "cross_source_boundary_frac_max": 0.01,
+                },
+                "boundary_internal_center_jump_ratio": 9.0,
+                "boundary_internal_scale_jump_ratio": 9.0,
+                "cross_source_boundary_frac": 0.9,
+            },
+            "first_B_frame_eq0_frac_over_total": 0.0,
+            "samples_with_leading_o_prefix_frac": 0.9,
+            "all_o_samples_frac": 0.15,
+        }
+        acceptance = evaluate_realism_gate(generated)
+        self.assertEqual(acceptance["profile"], "main_continuous")
+        self.assertTrue(bool(acceptance["passed"]))
+
+    def test_evaluate_realism_gate_warmup_profile_only_blocks_cross_source(self) -> None:
+        generated = {
+            "dataset_profile": "warmup_single_sign",
+            "semantic_seam_realism": {
+                "targets": {
+                    "boundary_internal_center_jump_ratio_max": 2.2,
+                    "boundary_internal_scale_jump_ratio_max": 2.5,
+                    "cross_source_boundary_frac_max": 0.0,
+                },
+                "boundary_internal_center_jump_ratio": 9.0,
+                "boundary_internal_scale_jump_ratio": 9.0,
+                "cross_source_boundary_frac": 0.0,
+            },
+            "first_B_frame_eq0_frac_over_total": 0.0,
+            "samples_with_leading_o_prefix_frac": 0.3,
+            "all_o_samples_frac": 0.1,
+        }
+        acceptance = evaluate_realism_gate(generated)
+        self.assertEqual(acceptance["profile"], "warmup_single_sign")
+        self.assertTrue(bool(acceptance["passed"]))
+
+    def test_process_sample_trimmed_mode_keeps_full_clip_and_uses_csv_gold(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            frames = []
+            for idx in range(8):
+                row = {"ts": float(idx * 33.3)}
+                if 2 <= idx <= 5:
+                    row["hand 1"] = _hand_points(0.1 + 0.01 * idx)
+                    row["hand 1_score"] = 0.99
+                frames.append(row)
+            (root / "clip_a.json").write_text(json.dumps({"frames": frames, "meta": {"coords": "image"}}, ensure_ascii=False), encoding="utf-8")
+            out_dir = root / "out"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            cfg = PrelabelConfig(trimmed_mode=True, include_pose=False, preprocessing_version="canonical_hands42_v3")
+            store = VideoStore(root, cache_size=0, prefer_pp=True)
+            result = process_sample(
+                {
+                    "vid": "clip_a",
+                    "sample_id": "clip_a__2_6",
+                    "label_str": "hello",
+                    "begin": 2,
+                    "end": 6,
+                    "split": "train",
+                    "dataset": "slovo",
+                    "source_group": "clip_a",
+                    "out_path": str(out_dir / "sample.npz"),
+                    "debug": False,
+                },
+                cfg,
+                store,
+                build_mirror_idx(cfg.include_pose, cfg.pose_keep),
+                out_dir,
+            )
+            self.assertEqual(int(result["index"]["T_total"]), 8)
+            self.assertEqual(int(result["index"]["start_idx"]), 2)
+            self.assertEqual(int(result["index"]["end_idx"]), 5)
+            with np.load(out_dir / "sample.npz", allow_pickle=False) as z:
+                bio = z["bio"].tolist()
+                meta = json.loads(str(z["meta"].item()))
+            self.assertEqual(bio, [0, 0, 1, 2, 2, 2, 0, 0])
+            self.assertTrue(bool(meta.get("trimmed_mode", False)))
+            self.assertEqual(str(meta.get("label_source", "")), "trimmed_csv")
+
+    def test_build_overlap_report_is_slovo_only_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            slovo_csv = root / "annotations.csv"
+            slovo_noev_csv = root / "annotations_no_event.csv"
+            _write_csv(
+                slovo_csv,
+                [
+                    {"attachment_id": "video_a.mp4", "text": "A", "begin": 0, "end": 10, "split": "train"},
+                    {"attachment_id": "video_a.mp4", "text": "A", "begin": 10, "end": 20, "split": "val"},
+                ],
+            )
+            _write_csv(
+                slovo_noev_csv,
+                [
+                    {"attachment_id": "video_b.mp4", "text": "no_event", "begin": 0, "end": 10, "split": "train"},
+                    {"attachment_id": "video_b.mp4", "text": "no_event", "begin": 10, "end": 20, "split": "val"},
+                ],
+            )
+            report = build_overlap_report(slovo_csv, slovo_noev_csv)
+            self.assertFalse(report["ok"])
+            self.assertEqual(report["slovo_sign"]["overlap_count"], 1)
+            self.assertEqual(report["slovo_no_event"]["overlap_count"], 1)
+            self.assertNotIn("ipn_hand", report)
+
+    def test_build_overlap_report_uses_user_id_not_clip_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            slovo_csv = root / "annotations.tsv"
+            slovo_noev_csv = root / "annotations_no_event.tsv"
+            slovo_csv.write_text(
+                "attachment_id\ttext\tuser_id\tbegin\tend\tsplit\n"
+                "video_a.mp4\tHELLO\tuser_1\t0\t10\ttrain\n"
+                "video_b.mp4\tHELLO\tuser_1\t0\t10\tval\n",
+                encoding="utf-8",
+            )
+            slovo_noev_csv.write_text(
+                "attachment_id\ttext\tuser_id\tbegin\tend\tsplit\n"
+                "video_c.mp4\tno_event\tuser_2\t0\t10\ttrain\n"
+                "video_d.mp4\tno_event\tuser_3\t0\t10\tval\n",
+                encoding="utf-8",
+            )
+            report = build_overlap_report(slovo_csv, slovo_noev_csv)
+            self.assertFalse(report["ok"])
+            self.assertEqual(report["slovo_sign"]["overlap_count"], 1)
+
+    def test_train_curriculum_runs_warmup_then_finetune(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            warmup_dir = root / "warmup_ds"
+            main_dir = root / "main_ds"
+            for path in (warmup_dir, main_dir):
+                path.mkdir(parents=True, exist_ok=True)
+            calls: list[list[str]] = []
+
+            def fake_train_main(argv: list[str]) -> None:
+                calls.append(list(argv))
+                out_dir = Path(argv[argv.index("--out_dir") + 1])
+                out_dir.mkdir(parents=True, exist_ok=True)
+                (out_dir / "best_recall_safe.pt").write_text("stub", encoding="utf-8")
+
+            with mock.patch("bio.pipeline.train_curriculum.train.main", side_effect=fake_train_main):
+                train_curriculum_mod.main(
+                    [
+                        "--train_warmup_dir", str(warmup_dir),
+                        "--val_warmup_dir", str(warmup_dir),
+                        "--train_dir", str(main_dir),
+                        "--val_dir", str(main_dir),
+                        "--out_dir", str(root / "curriculum"),
+                        "--config", "bio/configs/bio_default.json",
+                    ]
+                )
+
+            self.assertEqual(len(calls), 2)
+            self.assertNotIn("--resume", calls[0])
+            self.assertIn("--resume", calls[1])
+            self.assertIn("--resume_model_only", calls[1])
+
+    def test_train_rejects_bad_synth_realism_stats(self) -> None:
+        stats = {
+            "generated": {
+                "acceptance": {
+                    "passed": False,
+                    "failures": [
+                        "cross_source_boundary_frac=0.6600 > 0.1000",
+                    ],
+                }
+            }
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(RuntimeError):
+                _raise_if_bad_synth_realism(Path(tmp), stats, allow_bad_synth_stats=False)
+            _raise_if_bad_synth_realism(Path(tmp), stats, allow_bad_synth_stats=True)
 
     def test_shard_aware_batch_sampler_keeps_batch_locality(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -271,6 +472,151 @@ class BioPipelineV2Tests(unittest.TestCase):
             self.assertEqual(len(parsed.rows), 1)
             self.assertEqual(parsed.rows[0].vid, "video_a")
 
+    def test_parse_csv_uses_user_id_as_source_group_when_present(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path = Path(tmp) / "annotations.tsv"
+            csv_path.write_text(
+                "attachment_id\ttext\tuser_id\tbegin\tend\tsplit\n"
+                "video_a.mp4\tHELLO\tuser_42\t0\t10\ttrain\n",
+                encoding="utf-8",
+            )
+            parsed = parse_csv(csv_path, "train")
+            self.assertEqual(len(parsed.rows), 1)
+            self.assertEqual(parsed.rows[0].vid, "video_a")
+            self.assertEqual(parsed.rows[0].signer_id, "user_42")
+            self.assertEqual(parsed.rows[0].source_group, "user_42")
+
+    def test_signer_split_rewrites_csvs_to_signer_disjoint_splits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sign_csv = root / "annotations.tsv"
+            noev_csv = root / "annotations_no_event.tsv"
+            sign_csv.write_text(
+                (
+                    "attachment_id\ttext\tuser_id\tbegin\tend\tsplit\n"
+                    "clip_a.mp4\tA\tuser_1\t0\t10\ttrain\n"
+                    "clip_b.mp4\tB\tuser_1\t0\t10\tval\n"
+                    "clip_c.mp4\tC\tuser_2\t0\t10\ttrain\n"
+                    "clip_d.mp4\tD\tuser_3\t0\t10\tval\n"
+                ),
+                encoding="utf-8",
+            )
+            noev_csv.write_text(
+                (
+                    "attachment_id\ttext\tuser_id\tbegin\tend\tsplit\n"
+                    "clip_e.mp4\tno_event\tuser_1\t0\t10\tval\n"
+                    "clip_f.mp4\tno_event\tuser_2\t0\t10\ttrain\n"
+                    "clip_g.mp4\tno_event\tuser_3\t0\t10\tval\n"
+                ),
+                encoding="utf-8",
+            )
+            out_dir = root / "signer_split"
+            signer_split_mod.main(
+                [
+                    "--csv",
+                    str(sign_csv),
+                    "--csv",
+                    str(noev_csv),
+                    "--out_dir",
+                    str(out_dir),
+                ]
+            )
+            report = build_overlap_report(out_dir / sign_csv.name, out_dir / noev_csv.name)
+            self.assertTrue(report["ok"])
+            summary = json.loads((out_dir / "signer_split_summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(int(summary["after_overlap_signer_count"]), 0)
+            mapping = json.loads((out_dir / "signer_assignments.json").read_text(encoding="utf-8"))
+            self.assertIn(mapping["user_1"], {"train", "val"})
+
+    def test_signer_split_preserves_nontrivial_train_share(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sign_csv = root / "annotations.tsv"
+            noev_csv = root / "annotations_no_event.tsv"
+            sign_csv.write_text(
+                (
+                    "attachment_id\ttext\tuser_id\tbegin\tend\ttrain\n"
+                    "a1.mp4\tA\tuser_1\t0\t10\tTrue\n"
+                    "a2.mp4\tA\tuser_1\t0\t10\tTrue\n"
+                    "a3.mp4\tA\tuser_1\t0\t10\tFalse\n"
+                    "b1.mp4\tB\tuser_2\t0\t10\tTrue\n"
+                    "b2.mp4\tB\tuser_2\t0\t10\tTrue\n"
+                    "c1.mp4\tC\tuser_3\t0\t10\tTrue\n"
+                    "d1.mp4\tD\tuser_4\t0\t10\tFalse\n"
+                    "d2.mp4\tD\tuser_4\t0\t10\tFalse\n"
+                ),
+                encoding="utf-8",
+            )
+            noev_csv.write_text(
+                (
+                    "attachment_id\ttext\tuser_id\tbegin\tend\ttrain\n"
+                    "n1.mp4\tno_event\tuser_1\t0\t10\tTrue\n"
+                    "n2.mp4\tno_event\tuser_2\t0\t10\tTrue\n"
+                    "n3.mp4\tno_event\tuser_3\t0\t10\tTrue\n"
+                    "n4.mp4\tno_event\tuser_4\t0\t10\tFalse\n"
+                ),
+                encoding="utf-8",
+            )
+            out_dir = root / "signer_split"
+            signer_split_mod.main(
+                [
+                    "--csv",
+                    str(sign_csv),
+                    "--csv",
+                    str(noev_csv),
+                    "--out_dir",
+                    str(out_dir),
+                ]
+            )
+            with (out_dir / "annotations.tsv").open("r", encoding="utf-8", newline="") as f:
+                rows = list(csv.DictReader(f, delimiter="\t"))
+            split_counts = Counter((row.get("split") or "").strip().lower() for row in rows)
+            self.assertGreater(int(split_counts.get("train", 0)), 0)
+            self.assertGreater(int(split_counts.get("val", 0)), 0)
+            self.assertGreater(int(split_counts.get("train", 0)), int(split_counts.get("val", 0)))
+
+    def test_signer_split_keeps_pure_signers_on_their_original_split(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sign_csv = root / "annotations.tsv"
+            noev_csv = root / "annotations_no_event.tsv"
+            sign_csv.write_text(
+                (
+                    "attachment_id\ttext\tuser_id\tbegin\tend\tsplit\n"
+                    "a1.mp4\tA\tuser_train_only\t0\t10\ttrain\n"
+                    "a2.mp4\tA\tuser_overlap\t0\t10\ttrain\n"
+                    "a3.mp4\tA\tuser_overlap\t0\t10\tval\n"
+                    "v1.mp4\tV\tuser_val_only\t0\t10\tval\n"
+                ),
+                encoding="utf-8",
+            )
+            noev_csv.write_text(
+                (
+                    "attachment_id\ttext\tuser_id\tbegin\tend\tsplit\n"
+                    "n1.mp4\tno_event\tuser_train_only\t0\t10\ttrain\n"
+                    "n2.mp4\tno_event\tuser_val_only\t0\t10\tval\n"
+                ),
+                encoding="utf-8",
+            )
+            out_dir = root / "signer_split"
+            signer_split_mod.main(
+                [
+                    "--csv",
+                    str(sign_csv),
+                    "--csv",
+                    str(noev_csv),
+                    "--out_dir",
+                    str(out_dir),
+                ]
+            )
+            with (out_dir / "annotations.tsv").open("r", encoding="utf-8", newline="") as f:
+                rows = list(csv.DictReader(f, delimiter="\t"))
+            split_by_user = {}
+            for row in rows:
+                split_by_user.setdefault(row["user_id"], set()).add((row.get("split") or "").strip().lower())
+            self.assertEqual(split_by_user["user_train_only"], {"train"})
+            self.assertEqual(split_by_user["user_val_only"], {"val"})
+
     def test_build_overlap_report_fails_on_shared_video(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -323,12 +669,14 @@ class BioPipelineV2Tests(unittest.TestCase):
             ],
             dtype=np.float32,
         )
-        sweep = _threshold_sweep(y, probs, [0.3, 0.5, 0.7])
+        mask = np.ones((1, 6, 42, 1), dtype=np.float32)
+        sweep = _threshold_sweep(y, probs, [0.3, 0.5, 0.7], mask_seq=mask)
         self.assertEqual(len(sweep["thresholds"]), 3)
         self.assertIn("b_f1_tol", sweep["best_b_f1_tol"])
         self.assertIn("balanced_guardrails_passed", sweep["thresholds"][0])
         self.assertIn("bio_violation_rate_pred", sweep["thresholds"][0])
         self.assertIn("bio_violation_abs_err", sweep["thresholds"][0])
+        self.assertIn("startup_false_start_rate", sweep["thresholds"][0])
 
     def test_train_one_epoch_logs_first_batch_even_with_large_log_every(self) -> None:
         class TinyModel(torch.nn.Module):
@@ -436,14 +784,29 @@ class BioPipelineV2Tests(unittest.TestCase):
             dtype=np.float32,
         )
         thresholds = [0.3, 0.5, 0.7]
-        buffered = _threshold_sweep(y, probs, thresholds)
+        mask = np.ones((2, 6, 42, 1), dtype=np.float32)
+        buffered = _threshold_sweep(y, probs, thresholds, mask_seq=mask)
         state = _init_threshold_sweep_state(thresholds)
-        _update_threshold_sweep_state(state, y[:1], probs[:1])
-        _update_threshold_sweep_state(state, y[1:], probs[1:])
+        _update_threshold_sweep_state(state, y[:1], probs[:1], mask[:1], None)
+        _update_threshold_sweep_state(state, y[1:], probs[1:], mask[1:], None)
         streamed = _finalize_threshold_sweep_state(state)
         self.assertEqual(buffered["best_b_f1_tol"], streamed["best_b_f1_tol"])
         self.assertEqual(buffered["best_balanced"], streamed["best_balanced"])
         self.assertEqual(buffered["thresholds"], streamed["thresholds"])
+
+    def test_startup_prefix_mask_finds_pre_hand_frames(self) -> None:
+        mask = torch.zeros((1, 5, 42, 1), dtype=torch.float32)
+        mask[0, 2:, 21:, 0] = 1.0
+        startup_mask, first_visible, left, right, total = _startup_prefix_mask_torch(
+            mask,
+            min_valid_joints=8,
+            min_visible_frames=1,
+        )
+        self.assertEqual(int(first_visible[0].item()), 2)
+        self.assertEqual(startup_mask[0].tolist(), [True, True, False, False, False])
+        self.assertEqual(int(left[0, 2].item()), 0)
+        self.assertEqual(int(right[0, 2].item()), 21)
+        self.assertEqual(int(total[0, 2].item()), 21)
 
     def test_boundary_comparator_uses_tie_break_chain(self) -> None:
         best = {

@@ -209,6 +209,14 @@ def _format_console_payload(payload: Dict[str, Any]) -> Optional[str]:
             f"score={_fmt_float(payload.get('balanced_score', 0.0), 4)} "
             f"b_f1={_fmt_float(payload.get('b_f1_tol', 0.0), 4)}"
         )
+    if event == "best_recall_safe":
+        return (
+            f"best_recall_safe updated e{int(payload.get('epoch', 0))} "
+            f"thr={_fmt_float(payload.get('threshold', 0.5), 2)} "
+            f"score={_fmt_float(payload.get('recall_safe_score', 0.0), 4)} "
+            f"clip_hit={_fmt_float(payload.get('clip_hit_rate', 0.0), 4)} "
+            f"all_o={_fmt_float(payload.get('all_o_clip_rate', 0.0), 4)}"
+        )
     if event == "early_stop":
         return (
             f"early_stop e{int(payload.get('epoch', 0))} "
@@ -287,6 +295,22 @@ def _load_json_if_exists(path: Path) -> Dict[str, Any]:
         return {}
     raw = json.loads(path.read_text(encoding="utf-8"))
     return raw if isinstance(raw, dict) else {}
+
+
+def _raise_if_bad_synth_realism(dataset_dir: Path, stats: Dict[str, Any], *, allow_bad_synth_stats: bool) -> None:
+    generated = dict(stats.get("generated", {}) or {})
+    acceptance = dict(generated.get("acceptance", {}) or {})
+    if not acceptance:
+        return
+    if bool(acceptance.get("passed", False)) or bool(allow_bad_synth_stats):
+        return
+    failures = list(acceptance.get("failures", []) or [])
+    detail = "; ".join(str(x) for x in failures) if failures else "unknown realism gate failure"
+    raise RuntimeError(
+        f"Synth dataset realism gate failed for {dataset_dir}. "
+        f"Refuse to train on a dataset that does not meet continuous-video thresholds. "
+        f"Failures: {detail}. Use --allow_bad_synth_stats to override."
+    )
 
 
 def _optimizer_to_device(optim: torch.optim.Optimizer, device: torch.device) -> None:
@@ -924,6 +948,14 @@ def _make_runtime_summary(
         "meta_parsing_val": bool(meta_parsing_val),
         "train_shard_cache_items": int(train_shard_cache_items),
         "val_shard_cache_items": int(val_shard_cache_items),
+        "preprocessing_version": str(getattr(args, "preprocessing_version", "")),
+        "preprocessing_config": {
+            "version": str(getattr(args, "preprocessing_version", "")),
+            "center_alpha": float(getattr(args, "preprocessing_center_alpha", 0.2)),
+            "scale_alpha": float(getattr(args, "preprocessing_scale_alpha", 0.1)),
+            "min_scale": float(getattr(args, "preprocessing_min_scale", 1e-3)),
+            "min_visible_joints_for_scale": int(getattr(args, "preprocessing_min_visible_joints_for_scale", 4)),
+        },
         "train_batching_mode": "shard_aware_boundary_batch_sampler",
         "environment": {
             "platform": platform.platform(),
@@ -1118,16 +1150,18 @@ def boundary_error_mean(y_true: torch.Tensor, y_pred: torch.Tensor) -> Tuple[flo
 def parse_bio_segments_strict(seq: np.ndarray) -> Dict[str, Any]:
     arr = np.asarray(seq, dtype=np.uint8).reshape(-1)
     lengths: List[int] = []
+    starts: List[int] = []
     in_seg = False
     cur = 0
     invalid_i = 0
-    for raw in arr:
+    for idx, raw in enumerate(arr.tolist()):
         v = int(raw)
         if v == 1:  # B
             if in_seg and cur > 0:
                 lengths.append(cur)
             in_seg = True
             cur = 1
+            starts.append(int(idx))
         elif v == 2:  # I
             if in_seg:
                 cur += 1
@@ -1144,9 +1178,278 @@ def parse_bio_segments_strict(seq: np.ndarray) -> Dict[str, Any]:
     violation_rate = float(invalid_i / total) if total > 0 else 0.0
     return {
         "lengths": lengths,
+        "starts": starts,
         "invalid_i_count": int(invalid_i),
         "violation_count": int(invalid_i),
         "violation_rate": float(violation_rate),
+    }
+
+
+def _mask_hand_counts_torch(mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    mask_t = mask
+    if mask_t.dim() != 4:
+        raise ValueError(f"Expected mask shape (B,T,V,1), got {tuple(mask_t.shape)}")
+    mask_bin = mask_t[..., 0] > 0.5
+    if mask_bin.shape[-1] >= 42:
+        left = mask_bin[..., :21].sum(dim=-1)
+        right = mask_bin[..., 21:42].sum(dim=-1)
+    else:
+        left = torch.zeros(mask_bin.shape[:2], dtype=torch.long, device=mask_t.device)
+        right = torch.zeros(mask_bin.shape[:2], dtype=torch.long, device=mask_t.device)
+    total = left + right
+    return left, right, total
+
+
+def _mask_hand_counts_np(mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    mask_arr = np.asarray(mask, dtype=np.float32)
+    if mask_arr.ndim != 3:
+        raise ValueError(f"Expected mask shape (T,V,1), got {tuple(mask_arr.shape)}")
+    mask_bin = mask_arr[..., 0] > 0.5
+    if mask_bin.shape[-1] >= 42:
+        left = mask_bin[..., :21].sum(axis=-1, dtype=np.int64)
+        right = mask_bin[..., 21:42].sum(axis=-1, dtype=np.int64)
+    else:
+        left = np.zeros((mask_bin.shape[0],), dtype=np.int64)
+        right = np.zeros((mask_bin.shape[0],), dtype=np.int64)
+    total = left + right
+    return left, right, total
+
+
+def _startup_prefix_mask_torch(
+    mask: torch.Tensor,
+    *,
+    min_valid_joints: int,
+    min_visible_frames: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    left, right, total = _mask_hand_counts_torch(mask)
+    visible = (left >= int(min_valid_joints)) | (right >= int(min_valid_joints)) | (total >= int(min_valid_joints))
+    B, T = visible.shape
+    startup_mask = torch.ones((B, T), dtype=torch.bool, device=mask.device)
+    first_visible = torch.full((B,), int(T), dtype=torch.long, device=mask.device)
+    stable = max(1, int(min_visible_frames))
+    for b in range(B):
+        run = 0
+        found = None
+        for t in range(T):
+            run = run + 1 if bool(visible[b, t].item()) else 0
+            if run >= stable:
+                found = int(t - stable + 1)
+                break
+        if found is not None:
+            first_visible[b] = int(found)
+            startup_mask[b, found:] = False
+    return startup_mask, first_visible, left, right, total
+
+
+def _startup_prefix_info_np(
+    mask_seq: np.ndarray,
+    *,
+    min_valid_joints: int,
+    min_visible_frames: int,
+) -> Dict[str, Any]:
+    left, right, total = _mask_hand_counts_np(mask_seq)
+    visible = (left >= int(min_valid_joints)) | (right >= int(min_valid_joints)) | (total >= int(min_valid_joints))
+    stable = max(1, int(min_visible_frames))
+    first_visible: Optional[int] = None
+    run = 0
+    for idx, flag in enumerate(visible.tolist()):
+        run = run + 1 if bool(flag) else 0
+        if run >= stable:
+            first_visible = int(idx - stable + 1)
+            break
+    startup_len = int(first_visible) if first_visible is not None else int(mask_seq.shape[0])
+    startup_mask = np.zeros((int(mask_seq.shape[0]),), dtype=bool)
+    if startup_len > 0:
+        startup_mask[:startup_len] = True
+    return {
+        "first_visible_frame": int(first_visible) if first_visible is not None else int(mask_seq.shape[0]),
+        "startup_mask": startup_mask,
+        "left_counts": left,
+        "right_counts": right,
+        "total_counts": total,
+        "visible": visible.astype(np.uint8, copy=False),
+    }
+
+
+def _signness_targets_from_bio_torch(bio: torch.Tensor) -> torch.Tensor:
+    return (bio != 0).to(dtype=torch.float32)
+
+
+def _onset_targets_from_bio_torch(bio: torch.Tensor, *, band_width: int = 3) -> torch.Tensor:
+    y = (bio == 1).to(dtype=torch.float32)
+    if y.numel() == 0:
+        return y
+    band = max(1, int(band_width))
+    out = y.clone()
+    for shift in range(1, band):
+        out[..., shift:] = torch.maximum(out[..., shift:], y[..., :-shift])
+    return out
+
+
+def _compute_aux_losses(
+    *,
+    logits: torch.Tensor,
+    signness_logits: Optional[torch.Tensor],
+    onset_logits: Optional[torch.Tensor],
+    bio: torch.Tensor,
+    mask: torch.Tensor,
+    label_smoothing: float,
+    startup_visible_joint_threshold: int,
+    startup_visible_hand_frames: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    zero = logits.new_zeros(())
+    signness_loss = zero
+    onset_loss = zero
+    startup_penalty = zero
+    startup_mask, _first_visible, _left, _right, _total = _startup_prefix_mask_torch(
+        mask,
+        min_valid_joints=int(startup_visible_joint_threshold),
+        min_visible_frames=int(startup_visible_hand_frames),
+    )
+    if signness_logits is not None:
+        signness_targets = _signness_targets_from_bio_torch(bio)
+        signness_loss = F.binary_cross_entropy_with_logits(
+            signness_logits.squeeze(-1),
+            signness_targets,
+        )
+    if onset_logits is not None:
+        onset_targets = _onset_targets_from_bio_torch(bio, band_width=3)
+        onset_loss = F.binary_cross_entropy_with_logits(
+            onset_logits.squeeze(-1),
+            onset_targets,
+        )
+    if bool(startup_mask.any().item()):
+        startup_logits = logits[startup_mask]
+        startup_targets = torch.zeros((startup_logits.shape[0],), dtype=torch.long, device=logits.device)
+        startup_bio_ce = F.cross_entropy(
+            startup_logits,
+            startup_targets,
+            label_smoothing=float(max(0.0, label_smoothing)),
+        )
+        if signness_logits is not None:
+            startup_signness = F.binary_cross_entropy_with_logits(
+                signness_logits.squeeze(-1)[startup_mask],
+                torch.zeros((int(startup_mask.sum().item()),), dtype=torch.float32, device=logits.device),
+            )
+            startup_penalty = startup_signness + 0.25 * startup_bio_ce
+        else:
+            startup_penalty = startup_bio_ce
+    return signness_loss, onset_loss, startup_penalty
+
+
+def _sequence_has_overlap(
+    true_stats: Dict[str, Any],
+    pred_stats: Dict[str, Any],
+) -> bool:
+    true_segments = [(int(s), int(e)) for s, e in zip(true_stats.get("starts", []), true_stats.get("ends", []))]
+    pred_segments = [(int(s), int(e)) for s, e in zip(pred_stats.get("starts", []), pred_stats.get("ends", []))]
+    for ts, te in true_segments:
+        for ps, pe in pred_segments:
+            if max(ts, ps) <= min(te, pe):
+                return True
+    return False
+
+
+def _sequence_start_cover(
+    true_stats: Dict[str, Any],
+    pred_stats: Dict[str, Any],
+    *,
+    tol: int = 2,
+) -> bool:
+    true_starts = [int(x) for x in true_stats.get("starts", [])]
+    pred_starts = [int(x) for x in pred_stats.get("starts", [])]
+    if not true_starts or not pred_starts:
+        return False
+    return any(abs(ps - ts) <= int(tol) for ts in true_starts for ps in pred_starts)
+
+
+def _clip_recall_metrics(
+    y_seq: np.ndarray,
+    p_seq: np.ndarray,
+    metas: Sequence[Any],
+) -> Dict[str, float]:
+    sign_clip_count = 0
+    clip_hit_count = 0
+    all_o_clip_count = 0
+    start_cover_count = 0
+    signer_hits: Dict[str, List[float]] = {}
+    for idx in range(int(y_seq.shape[0])):
+        yi = np.asarray(y_seq[idx], dtype=np.uint8)
+        pi = np.asarray(p_seq[idx], dtype=np.uint8)
+        true_stats = parse_bio_segments_strict(yi)
+        if int(len(true_stats.get("starts", []))) <= 0:
+            continue
+        sign_clip_count += 1
+        pred_stats = parse_bio_segments_strict(pi)
+        clip_hit = 1.0 if _sequence_has_overlap(true_stats, pred_stats) else 0.0
+        start_cover = 1.0 if _sequence_start_cover(true_stats, pred_stats, tol=2) else 0.0
+        all_o = 1.0 if int(len(pred_stats.get("starts", []))) <= 0 else 0.0
+        clip_hit_count += int(clip_hit)
+        start_cover_count += int(start_cover)
+        all_o_clip_count += int(all_o)
+        meta = metas[idx] if idx < len(metas) else {}
+        signer_id = ""
+        if isinstance(meta, dict):
+            signer_id = str(
+                meta.get("sequence_source_group")
+                or meta.get("signer_id")
+                or meta.get("source_group")
+                or ""
+            ).strip()
+        signer_key = signer_id or f"sample_{idx}"
+        row = signer_hits.setdefault(signer_key, [0.0, 0.0])
+        row[0] += float(clip_hit)
+        row[1] += 1.0
+    signer_macro = 0.0
+    if signer_hits:
+        signer_macro = float(
+            np.mean([float(hit / max(1.0, total)) for hit, total in signer_hits.values()])
+        )
+    denom = max(1, sign_clip_count)
+    return {
+        "sign_clip_count": float(sign_clip_count),
+        "clip_hit_rate": float(clip_hit_count / denom),
+        "all_o_clip_rate": float(all_o_clip_count / denom),
+        "start_cover_rate": float(start_cover_count / denom),
+        "signer_macro_clip_hit_rate": float(signer_macro),
+    }
+
+
+def _startup_failure_stats(
+    *,
+    mask_seq: np.ndarray,
+    pred_seq: np.ndarray,
+    active_prob_seq: Optional[np.ndarray],
+    active_threshold: float,
+    min_valid_joints: int,
+    min_visible_frames: int,
+) -> Dict[str, float]:
+    info = _startup_prefix_info_np(
+        mask_seq,
+        min_valid_joints=int(min_valid_joints),
+        min_visible_frames=int(min_visible_frames),
+    )
+    startup_mask = np.asarray(info["startup_mask"], dtype=bool)
+    pred_arr = np.asarray(pred_seq, dtype=np.uint8).reshape(-1)
+    pred_stats = parse_bio_segments_strict(pred_arr)
+    starts = [int(x) for x in pred_stats.get("starts", [])]
+    first_visible = int(info["first_visible_frame"])
+    false_starts = [s for s in starts if s < first_visible]
+    active_prob = None if active_prob_seq is None else np.asarray(active_prob_seq, dtype=np.float32).reshape(-1)
+    startup_frames = int(startup_mask.sum())
+    if active_prob is None:
+        active_on_startup = (pred_arr[startup_mask] != 0).astype(np.float32, copy=False) if startup_frames > 0 else np.zeros((0,), dtype=np.float32)
+    else:
+        active_on_startup = (active_prob[startup_mask] >= float(active_threshold)).astype(np.float32, copy=False) if startup_frames > 0 else np.zeros((0,), dtype=np.float32)
+    pred_b_on_startup = (pred_arr[startup_mask] == 1).astype(np.float32, copy=False) if startup_frames > 0 else np.zeros((0,), dtype=np.float32)
+    return {
+        "startup_first_visible_hand_frame": float(first_visible),
+        "startup_false_start_count": float(len(false_starts)),
+        "startup_pred_starts": float(len(starts)),
+        "startup_segment_before_first_hand": 1.0 if false_starts else 0.0,
+        "startup_nohand_frames": float(startup_frames),
+        "startup_nohand_pred_B": float(pred_b_on_startup.sum()) if startup_frames > 0 else 0.0,
+        "startup_nohand_pred_active": float(active_on_startup.sum()) if startup_frames > 0 else 0.0,
     }
 
 
@@ -1257,6 +1560,8 @@ def balanced_model_score(
     lambda_trans: float = 0.75,
     lambda_berr: float = 0.05,
     lambda_bio_violation: float = 1.0,
+    lambda_startup_false_start: float = 1.5,
+    lambda_startup_nohand_active: float = 0.75,
 ) -> float:
     b_f1 = float(metrics.get("b_f1_tol", 0.0) or 0.0)
     seg_ratio = float(metrics.get("avg_seg_len_ratio", segment_length_ratio(metrics)) or 0.0)
@@ -1268,14 +1573,40 @@ def balanced_model_score(
     avg_true_seg = max(1.0, float(metrics.get("avg_seg_len_true", 1.0) or 1.0))
     b_err_penalty = float(metrics.get("b_err_mean", 0.0) or 0.0) / avg_true_seg
     bio_violation_penalty = float(metrics.get("bio_violation_abs_err", metrics.get("bio_violation_rate_pred", 0.0)) or 0.0)
+    startup_false_start_penalty = float(metrics.get("startup_false_start_rate", 0.0) or 0.0)
+    startup_nohand_active_penalty = float(metrics.get("startup_nohand_pred_active_rate", 0.0) or 0.0)
     score = (
         b_f1
         - float(lambda_len) * len_penalty
         - float(lambda_trans) * trans_penalty
         - float(lambda_berr) * b_err_penalty
         - float(lambda_bio_violation) * bio_violation_penalty
+        - float(lambda_startup_false_start) * startup_false_start_penalty
+        - float(lambda_startup_nohand_active) * startup_nohand_active_penalty
     )
     return float(score)
+
+
+def recall_safe_model_score(
+    metrics: Dict[str, float],
+    *,
+    lambda_start_cover: float = 0.50,
+    lambda_signer_macro: float = 0.25,
+    lambda_all_o: float = 0.90,
+    lambda_startup_false_start: float = 0.60,
+) -> float:
+    clip_hit = float(metrics.get("clip_hit_rate", 0.0) or 0.0)
+    start_cover = float(metrics.get("start_cover_rate", 0.0) or 0.0)
+    signer_macro = float(metrics.get("signer_macro_clip_hit_rate", 0.0) or 0.0)
+    all_o = float(metrics.get("all_o_clip_rate", 1.0) or 0.0)
+    startup_false = float(metrics.get("startup_segment_before_first_hand_rate", 0.0) or 0.0)
+    return float(
+        clip_hit
+        + float(lambda_start_cover) * start_cover
+        + float(lambda_signer_macro) * signer_macro
+        - float(lambda_all_o) * all_o
+        - float(lambda_startup_false_start) * startup_false
+    )
 
 
 def _score_weights_from_args(args: argparse.Namespace) -> Dict[str, float]:
@@ -1284,6 +1615,8 @@ def _score_weights_from_args(args: argparse.Namespace) -> Dict[str, float]:
         "lambda_trans": float(getattr(args, "balanced_lambda_trans", 0.75)),
         "lambda_berr": float(getattr(args, "balanced_lambda_berr", 0.05)),
         "lambda_bio_violation": float(getattr(args, "balanced_lambda_bio_violation", 1.0)),
+        "lambda_startup_false_start": float(getattr(args, "balanced_lambda_startup_false_start", 1.5)),
+        "lambda_startup_nohand_active": float(getattr(args, "balanced_lambda_startup_nohand_active", 0.75)),
     }
 
 
@@ -1305,6 +1638,7 @@ def _selection_candidate(
     merged["selection_source"] = 1.0 if selection_source == "threshold_sweep" else 0.0
     merged["argmax_b_f1_tol"] = float(base_metrics.get("b_f1_tol", 0.0))
     merged["argmax_balanced_score"] = float(base_metrics.get("balanced_score", 0.0))
+    merged["argmax_recall_safe_score"] = float(base_metrics.get("recall_safe_score", 0.0))
     return merged
 
 
@@ -1423,6 +1757,39 @@ def _schedule_matches(current: Dict[str, Any], saved: Dict[str, Any]) -> bool:
     return True
 
 
+def _model_has_signness_head(model: torch.nn.Module) -> bool:
+    raw = getattr(model, "_orig_mod", model)
+    cfg = getattr(raw, "cfg", None)
+    return bool(getattr(cfg, "use_signness_head", False)) and hasattr(raw, "forward_with_aux")
+
+
+def _model_has_onset_head(model: torch.nn.Module) -> bool:
+    raw = getattr(model, "_orig_mod", model)
+    cfg = getattr(raw, "cfg", None)
+    return bool(getattr(cfg, "use_onset_head", False)) and hasattr(raw, "forward_with_heads")
+
+
+def _forward_bio_with_optional_heads(
+    model: torch.nn.Module,
+    pts: torch.Tensor,
+    mask: torch.Tensor,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], torch.Tensor]:
+    if _model_has_onset_head(model):
+        if hasattr(model, "forward_with_heads"):
+            return model.forward_with_heads(pts, mask)
+        raw = getattr(model, "_orig_mod", model)
+        return raw.forward_with_heads(pts, mask)
+    if _model_has_signness_head(model):
+        if hasattr(model, "forward_with_aux"):
+            logits, signness_logits, hN = model.forward_with_aux(pts, mask)
+            return logits, signness_logits, None, hN
+        raw = getattr(model, "_orig_mod", model)
+        logits, signness_logits, hN = raw.forward_with_aux(pts, mask)
+        return logits, signness_logits, None, hN
+    logits, hN = model(pts, mask)
+    return logits, None, None, hN
+
+
 def train_one_epoch(
     model: BioTagger,
     loader: DataLoader,
@@ -1441,6 +1808,11 @@ def train_one_epoch(
     tb_log_every: int,
     *,
     label_smoothing: float,
+    loss_lambda_signness: float = 0.0,
+    loss_lambda_onset: float = 0.0,
+    loss_lambda_startup_nohand: float = 0.0,
+    startup_visible_joint_threshold: int = 8,
+    startup_visible_hand_frames: int = 1,
     ema: Optional[ModelEma],
     channels_last: bool,
 ) -> Tuple[int, Dict[str, float]]:
@@ -1452,6 +1824,9 @@ def train_one_epoch(
     t_fwd_sum = 0.0
     steps = 0
     total_loss = 0.0
+    total_signness_loss = 0.0
+    total_onset_loss = 0.0
+    total_startup_penalty = 0.0
     total_samples = 0
     nonfinite_batches = 0
     skipped_updates = 0
@@ -1483,13 +1858,29 @@ def train_one_epoch(
 
         t1 = time.time()
         with amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-            logits, _ = model(pts, mask)
+            logits, signness_logits, onset_logits, _ = _forward_bio_with_optional_heads(model, pts, mask)
             logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0)
-            loss = F.cross_entropy(
+            bio_loss = F.cross_entropy(
                 logits.reshape(-1, 3),
                 bio.reshape(-1),
                 weight=class_weights,
                 label_smoothing=float(max(0.0, label_smoothing)),
+            )
+            signness_loss, onset_loss, startup_penalty = _compute_aux_losses(
+                logits=logits,
+                signness_logits=signness_logits,
+                onset_logits=onset_logits,
+                bio=bio,
+                mask=mask,
+                label_smoothing=float(label_smoothing),
+                startup_visible_joint_threshold=int(startup_visible_joint_threshold),
+                startup_visible_hand_frames=int(startup_visible_hand_frames),
+            )
+            loss = (
+                bio_loss
+                + float(max(0.0, loss_lambda_signness)) * signness_loss
+                + float(max(0.0, loss_lambda_onset)) * onset_loss
+                + float(max(0.0, loss_lambda_startup_nohand)) * startup_penalty
             )
 
         optim.zero_grad(set_to_none=True)
@@ -1522,6 +1913,9 @@ def train_one_epoch(
         bs = int(bio.size(0))
         total_samples += bs
         total_loss += float(loss.item()) * bs
+        total_signness_loss += float(signness_loss.item()) * bs
+        total_onset_loss += float(onset_loss.item()) * bs
+        total_startup_penalty += float(startup_penalty.item()) * bs
         if grad_norm is not None and torch.isfinite(torch.as_tensor(grad_norm)):
             grad_norm_sum += float(grad_norm)
             grad_norm_count += 1
@@ -1540,6 +1934,9 @@ def train_one_epoch(
                 tb_logger.scalar("train/acc", float(m1["acc"]), step + 1)
                 tb_logger.scalar("train/f1_macro", float(f1_macro), step + 1)
                 tb_logger.scalar("train/b_f1_tol", float(m2["b_f1_tol"]), step + 1)
+                tb_logger.scalar("train/signness_loss", float(signness_loss.item()), step + 1)
+                tb_logger.scalar("train/onset_loss", float(onset_loss.item()), step + 1)
+                tb_logger.scalar("train/startup_nohand_penalty", float(startup_penalty.item()), step + 1)
                 tb_logger.scalar("train/b_prec_tol", float(m2["b_prec_tol"]), step + 1)
                 tb_logger.scalar("train/b_rec_tol", float(m2["b_rec_tol"]), step + 1)
                 tb_logger.scalar("train/p_O", float(m1["p_O"]), step + 1)
@@ -1572,6 +1969,9 @@ def train_one_epoch(
                 "acc": float(m1["acc"]),
                 "f1_macro": float(f1_macro),
                 "b_f1_tol": float(m2["b_f1_tol"]),
+                "signness_loss": float(signness_loss.item()),
+                "onset_loss": float(onset_loss.item()),
+                "startup_nohand_penalty": float(startup_penalty.item()),
                 "lr": lr,
                 "samples_per_sec": float(sps),
                 "amp_scale": float(scaler.get_scale()),
@@ -1595,6 +1995,9 @@ def train_one_epoch(
         "epoch": float(epoch),
         "step": float(step),
         "avg_loss": float(total_loss / max(1, total_samples)) if total_samples > 0 else 0.0,
+        "avg_signness_loss": float(total_signness_loss / max(1, total_samples)) if total_samples > 0 else 0.0,
+        "avg_onset_loss": float(total_onset_loss / max(1, total_samples)) if total_samples > 0 else 0.0,
+        "avg_startup_nohand_penalty": float(total_startup_penalty / max(1, total_samples)) if total_samples > 0 else 0.0,
         "samples": float(total_samples),
         "steps": float(steps),
         "dataloader_time_sec": float(t_load_sum),
@@ -1616,6 +2019,9 @@ def train_one_epoch(
             "epoch": epoch,
             "step": step,
             "avg_loss": float(avg_loss),
+            "avg_signness_loss": float(total_signness_loss / max(1, total_samples)),
+            "avg_onset_loss": float(total_onset_loss / max(1, total_samples)),
+            "avg_startup_nohand_penalty": float(total_startup_penalty / max(1, total_samples)),
             "samples": int(total_samples),
             "steps": int(steps),
             "epoch_time_sec": float(epoch_time),
@@ -1650,6 +2056,9 @@ def train_one_epoch(
         logger.log(payload)
         if tb_enabled:
             tb_logger.scalar("train/epoch_loss", float(avg_loss), step)
+            tb_logger.scalar("train/signness_loss", float(total_signness_loss / max(1, total_samples)), step)
+            tb_logger.scalar("train/onset_loss", float(total_onset_loss / max(1, total_samples)), step)
+            tb_logger.scalar("train/startup_nohand_penalty", float(total_startup_penalty / max(1, total_samples)), step)
             tb_logger.scalar("train/samples_per_sec", float(total_samples / epoch_time), step)
             tb_logger.scalar("train/dataloader_time_sec", float(t_load_sum), step)
             tb_logger.scalar("train/fwd_bwd_time_sec", float(t_fwd_sum), step)
@@ -1672,6 +2081,11 @@ def eval_epoch(
     class_weights: torch.Tensor,
     *,
     label_smoothing: float = 0.0,
+    loss_lambda_signness: float = 0.0,
+    loss_lambda_onset: float = 0.0,
+    loss_lambda_startup_nohand: float = 0.0,
+    startup_visible_joint_threshold: int = 8,
+    startup_visible_hand_frames: int = 1,
     collect_examples: bool = False,
     examples_k: int = 5,
     collect_predictions: bool = False,
@@ -1682,14 +2096,20 @@ def eval_epoch(
     model.eval()
     prepare_batch = _batch_prepare_fn(loader, device, channels_last=channels_last)
     total_loss = 0.0
+    total_signness_loss = 0.0
+    total_onset_loss = 0.0
+    total_startup_penalty = 0.0
     total_n = 0
     ys = []
     ps = []
+    masks_all: List[np.ndarray] = []
+    active_probs_all: List[np.ndarray] = []
     metas_all: List[Any] = []
     conf_all: List[np.ndarray] = []
     correct_all: List[np.ndarray] = []
     b_prob_all: List[np.ndarray] = []
     b_target_all: List[np.ndarray] = []
+    onset_probs_all: List[np.ndarray] = []
     collect_threshold_inputs = bool(threshold_sweep_points)
     collect_prediction_rows = bool(collect_predictions)
     threshold_state = _init_threshold_sweep_state(threshold_sweep_points or []) if collect_threshold_inputs else None
@@ -1701,20 +2121,52 @@ def eval_epoch(
         meta_batch = batch.get("meta", [None] * int(bio.size(0)))
 
         with amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-            logits, _ = model(pts, mask)
+            logits, signness_logits, onset_logits, _ = _forward_bio_with_optional_heads(model, pts, mask)
             logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0)
-            loss = F.cross_entropy(
+            bio_loss = F.cross_entropy(
                 logits.reshape(-1, 3),
                 bio.reshape(-1),
                 weight=class_weights,
                 label_smoothing=float(max(0.0, label_smoothing)),
             )
+            signness_loss, onset_loss, startup_penalty = _compute_aux_losses(
+                logits=logits,
+                signness_logits=signness_logits,
+                onset_logits=onset_logits,
+                bio=bio,
+                mask=mask,
+                label_smoothing=float(label_smoothing),
+                startup_visible_joint_threshold=int(startup_visible_joint_threshold),
+                startup_visible_hand_frames=int(startup_visible_hand_frames),
+            )
+            loss = (
+                bio_loss
+                + float(max(0.0, loss_lambda_signness)) * signness_loss
+                + float(max(0.0, loss_lambda_onset)) * onset_loss
+                + float(max(0.0, loss_lambda_startup_nohand)) * startup_penalty
+            )
         probs = torch.softmax(logits, dim=-1)
         pred = probs.argmax(dim=-1)
         probs_cpu = probs.detach().float().cpu()
         bio_cpu = bio.detach().cpu()
+        mask_cpu = mask.detach().float().cpu()
+        active_probs_cpu = (
+            torch.sigmoid(signness_logits.detach().float()).cpu()
+            if signness_logits is not None
+            else None
+        )
+        onset_probs_cpu = (
+            torch.sigmoid(onset_logits.detach().float()).cpu()
+            if onset_logits is not None
+            else None
+        )
         ys.append(bio)
         ps.append(pred)
+        masks_all.append(mask_cpu.numpy().astype(np.float32, copy=False))
+        if active_probs_cpu is not None:
+            active_probs_all.append(active_probs_cpu.numpy().astype(np.float32, copy=False))
+        if onset_probs_cpu is not None:
+            onset_probs_all.append(onset_probs_cpu.numpy().astype(np.float32, copy=False))
         conf_all.append(probs_cpu.max(dim=-1).values.numpy().reshape(-1))
         correct_all.append((pred == bio).detach().cpu().numpy().reshape(-1).astype(np.float32))
         b_prob_all.append(probs_cpu[..., 1].numpy().reshape(-1))
@@ -1724,11 +2176,23 @@ def eval_epoch(
                 threshold_state or {},
                 bio_cpu.numpy().astype(np.uint8, copy=False),
                 probs_cpu.numpy().astype(np.float32, copy=False),
+                mask_cpu.numpy().astype(np.float32, copy=False),
+                (
+                    active_probs_cpu.numpy().astype(np.float32, copy=False)
+                    if active_probs_cpu is not None
+                    else None
+                ),
+                meta_batch if isinstance(meta_batch, list) else [None] * int(bio.size(0)),
+                startup_visible_joint_threshold=int(startup_visible_joint_threshold),
+                startup_visible_hand_frames=int(startup_visible_hand_frames),
             )
         if collect_prediction_rows:
             metas_all.extend(meta_batch if isinstance(meta_batch, list) else [None] * int(bio.size(0)))
         bs = int(bio.size(0))
         total_loss += float(loss.item()) * bs
+        total_signness_loss += float(signness_loss.item()) * bs
+        total_onset_loss += float(onset_loss.item()) * bs
+        total_startup_penalty += float(startup_penalty.item()) * bs
         total_n += bs
 
     y = torch.cat(ys, dim=0)
@@ -1750,12 +2214,37 @@ def eval_epoch(
 
     y_seq = y.detach().cpu().numpy()
     p_seq = p.detach().cpu().numpy()
+    clip_metrics = _clip_recall_metrics(y_seq, p_seq, metas_all)
     structural = _structural_bio_stats(y_seq, p_seq)
+    mask_seq_all = np.concatenate(masks_all, axis=0) if masks_all else np.zeros((0, y_seq.shape[1], 42, 1), dtype=np.float32)
+    active_prob_seq = np.concatenate(active_probs_all, axis=0).squeeze(-1) if active_probs_all else None
+    startup_seq_stats: List[Dict[str, float]] = []
+    for idx in range(y_seq.shape[0]):
+        startup_seq_stats.append(
+            _startup_failure_stats(
+                mask_seq=np.asarray(mask_seq_all[idx], dtype=np.float32),
+                pred_seq=np.asarray(p_seq[idx], dtype=np.uint8),
+                active_prob_seq=(None if active_prob_seq is None else np.asarray(active_prob_seq[idx], dtype=np.float32)),
+                active_threshold=0.5,
+                min_valid_joints=int(startup_visible_joint_threshold),
+                min_visible_frames=int(startup_visible_hand_frames),
+            )
+        )
+    startup_first_visible_mean = float(np.mean([row["startup_first_visible_hand_frame"] for row in startup_seq_stats])) if startup_seq_stats else 0.0
+    startup_false_start_count = float(sum(row["startup_false_start_count"] for row in startup_seq_stats))
+    startup_pred_starts = float(sum(row["startup_pred_starts"] for row in startup_seq_stats))
+    startup_seq_false = float(sum(row["startup_segment_before_first_hand"] for row in startup_seq_stats))
+    startup_nohand_frames = float(sum(row["startup_nohand_frames"] for row in startup_seq_stats))
+    startup_nohand_pred_b = float(sum(row["startup_nohand_pred_B"] for row in startup_seq_stats))
+    startup_nohand_pred_active = float(sum(row["startup_nohand_pred_active"] for row in startup_seq_stats))
 
     cm = confusion_matrix(y_np, p_np, labels=[0, 1, 2])
 
     metrics = {
         "loss": float(avg_loss),
+        "signness_loss": float(total_signness_loss / max(1, total_n)),
+        "onset_loss": float(total_onset_loss / max(1, total_n)),
+        "startup_nohand_penalty": float(total_startup_penalty / max(1, total_n)),
         **m1,
         **m2,
         "support_O": float(support[0]),
@@ -1767,6 +2256,12 @@ def eval_epoch(
         "b_err_matched": float(b_matched),
         "b_err_missing": float(b_missing),
         "pred_B_ratio": ratio_b,
+        "startup_first_visible_hand_frame_mean": float(startup_first_visible_mean),
+        "startup_false_start_rate": float(startup_false_start_count / max(1.0, startup_pred_starts)),
+        "startup_segment_before_first_hand_rate": float(startup_seq_false / max(1.0, float(len(startup_seq_stats)))),
+        "startup_nohand_pred_B_rate": float(startup_nohand_pred_b / max(1.0, startup_nohand_frames)),
+        "startup_nohand_pred_active_rate": float(startup_nohand_pred_active / max(1.0, startup_nohand_frames)),
+        **clip_metrics,
         **structural,
         "balanced_score": float(balanced_model_score({
             "b_f1_tol": float(m2.get("b_f1_tol", 0.0)),
@@ -1776,7 +2271,13 @@ def eval_epoch(
             "avg_seg_len_true": float(structural.get("avg_seg_len_true", 0.0)),
             "bio_violation_abs_err": float(structural.get("bio_violation_abs_err", 0.0)),
             "bio_violation_rate_pred": float(structural.get("bio_violation_rate_pred", 0.0)),
+            "startup_false_start_rate": float(startup_false_start_count / max(1.0, startup_pred_starts)),
+            "startup_nohand_pred_active_rate": float(startup_nohand_pred_active / max(1.0, startup_nohand_frames)),
         }, **(score_weights or {}))),
+        "recall_safe_score": float(recall_safe_model_score({
+            **clip_metrics,
+            "startup_segment_before_first_hand_rate": float(startup_seq_false / max(1.0, float(len(startup_seq_stats)))),
+        })),
     }
     top1_conf = np.concatenate(conf_all, axis=0) if conf_all else np.zeros((0,), dtype=np.float32)
     top1_correct = np.concatenate(correct_all, axis=0) if correct_all else np.zeros((0,), dtype=np.float32)
@@ -1808,6 +2309,7 @@ def eval_epoch(
         analysis["prediction_rows"] = _collect_sample_diagnostics(y_seq, p_seq, metas_all)
     if collect_threshold_inputs and threshold_state is not None:
         analysis["threshold_sweep"] = _finalize_threshold_sweep_state(threshold_state, score_weights=score_weights)
+    analysis["startup_stats"] = startup_seq_stats
     return metrics, cm, examples, analysis
 
 
@@ -1822,7 +2324,8 @@ def segment_length_ratio(metrics: Dict[str, float]) -> float:
 def passes_balanced_guardrails(metrics: Dict[str, float]) -> bool:
     pred_b_ratio = float(metrics.get("pred_B_ratio", 0.0) or 0.0)
     seg_ratio = segment_length_ratio(metrics)
-    return (0.85 <= pred_b_ratio <= 1.15) and (0.80 <= seg_ratio <= 1.25)
+    startup_false_start = float(metrics.get("startup_segment_before_first_hand_rate", 0.0) or 0.0)
+    return (0.85 <= pred_b_ratio <= 1.15) and (0.80 <= seg_ratio <= 1.25) and (startup_false_start <= 0.05)
 
 
 def _is_better_balanced(
@@ -1847,6 +2350,32 @@ def _is_better_balanced(
     if cand_f1 < best_f1:
         return False
     return float(candidate.get("b_err_mean", float("inf"))) < float(best.get("b_err_mean", float("inf")))
+
+
+def _is_better_recall_safe(candidate: Dict[str, float], best: Optional[Dict[str, float]]) -> bool:
+    if best is None:
+        return True
+    cand_score = float(candidate.get("recall_safe_score", recall_safe_model_score(candidate)))
+    best_score = float(best.get("recall_safe_score", recall_safe_model_score(best)))
+    if cand_score > best_score:
+        return True
+    if cand_score < best_score:
+        return False
+    cand_hit = float(candidate.get("clip_hit_rate", 0.0))
+    best_hit = float(best.get("clip_hit_rate", 0.0))
+    if cand_hit > best_hit:
+        return True
+    if cand_hit < best_hit:
+        return False
+    cand_all_o = float(candidate.get("all_o_clip_rate", 1.0))
+    best_all_o = float(best.get("all_o_clip_rate", 1.0))
+    if cand_all_o < best_all_o:
+        return True
+    if cand_all_o > best_all_o:
+        return False
+    return float(candidate.get("startup_segment_before_first_hand_rate", 1.0)) < float(
+        best.get("startup_segment_before_first_hand_rate", 1.0)
+    )
 
 
 def _boundary_pred_ratio_distance(metrics: Dict[str, Any]) -> float:
@@ -1899,6 +2428,18 @@ def _empty_threshold_accumulator(threshold: float) -> Dict[str, Any]:
         "true_frames": 0,
         "pred_frames": 0,
         "support": np.zeros((3,), dtype=np.int64),
+        "startup_first_visible_sum": 0.0,
+        "startup_seq_false_count": 0.0,
+        "startup_false_start_count": 0.0,
+        "startup_pred_starts": 0.0,
+        "startup_nohand_frames": 0.0,
+        "startup_nohand_pred_b": 0.0,
+        "startup_nohand_pred_active": 0.0,
+        "sign_clip_count": 0.0,
+        "clip_hit_count": 0.0,
+        "all_o_clip_count": 0.0,
+        "start_cover_count": 0.0,
+        "signer_hits": {},
     }
 
 
@@ -1910,11 +2451,26 @@ def _init_threshold_sweep_state(thresholds: Sequence[float]) -> Dict[str, Any]:
     }
 
 
-def _update_threshold_sweep_state(state: Dict[str, Any], y_batch: np.ndarray, probs_batch: np.ndarray) -> None:
+def _update_threshold_sweep_state(
+    state: Dict[str, Any],
+    y_batch: np.ndarray,
+    probs_batch: np.ndarray,
+    mask_batch: Optional[np.ndarray] = None,
+    active_probs_batch: Optional[np.ndarray] = None,
+    metas_batch: Optional[Sequence[Any]] = None,
+    *,
+    startup_visible_joint_threshold: int = 8,
+    startup_visible_hand_frames: int = 1,
+) -> None:
     if not state.get("accumulators"):
         return
     y_arr = np.asarray(y_batch, dtype=np.uint8)
     probs_arr = np.asarray(probs_batch, dtype=np.float32)
+    if mask_batch is None:
+        mask_arr = np.ones((*y_arr.shape, 42, 1), dtype=np.float32)
+    else:
+        mask_arr = np.asarray(mask_batch, dtype=np.float32)
+    active_arr = None if active_probs_batch is None else np.asarray(active_probs_batch, dtype=np.float32)
     if y_arr.size == 0 or probs_arr.size == 0:
         return
     alt_pred = np.where(probs_arr[..., 0] >= probs_arr[..., 2], 0, 2).astype(np.uint8)
@@ -1960,13 +2516,51 @@ def _update_threshold_sweep_state(state: Dict[str, Any], y_batch: np.ndarray, pr
         transition_pred_sum = 0.0
         pred_violation_count = 0
         pred_frames = 0
-        for pi in pred_thr:
+        for seq_idx, pi in enumerate(pred_thr):
+            yi = y_arr[seq_idx]
             pred_stats = parse_bio_segments_strict(pi)
+            true_stats = parse_bio_segments_strict(yi)
             pred_seg_sum += float(sum(int(v) for v in pred_stats["lengths"]))
             pred_seg_count += int(len(pred_stats["lengths"]))
             transition_pred_sum += float(transition_rate(pi))
             pred_violation_count += int(pred_stats["violation_count"])
             pred_frames += int(np.asarray(pi).size)
+            startup_stats = _startup_failure_stats(
+                mask_seq=mask_arr[seq_idx],
+                pred_seq=pi,
+                active_prob_seq=(None if active_arr is None else active_arr[seq_idx].squeeze(-1)),
+                active_threshold=0.5,
+                min_valid_joints=int(startup_visible_joint_threshold),
+                min_visible_frames=int(startup_visible_hand_frames),
+            )
+            acc["startup_first_visible_sum"] += float(startup_stats["startup_first_visible_hand_frame"])
+            acc["startup_seq_false_count"] += float(startup_stats["startup_segment_before_first_hand"])
+            acc["startup_false_start_count"] += float(startup_stats["startup_false_start_count"])
+            acc["startup_pred_starts"] += float(startup_stats["startup_pred_starts"])
+            acc["startup_nohand_frames"] += float(startup_stats["startup_nohand_frames"])
+            acc["startup_nohand_pred_b"] += float(startup_stats["startup_nohand_pred_B"])
+            acc["startup_nohand_pred_active"] += float(startup_stats["startup_nohand_pred_active"])
+            if int(len(true_stats.get("starts", []))) > 0:
+                acc["sign_clip_count"] += 1.0
+                hit = 1.0 if _sequence_has_overlap(true_stats, pred_stats) else 0.0
+                start_cover = 1.0 if _sequence_start_cover(true_stats, pred_stats, tol=2) else 0.0
+                all_o = 1.0 if int(len(pred_stats.get("starts", []))) <= 0 else 0.0
+                acc["clip_hit_count"] += hit
+                acc["start_cover_count"] += start_cover
+                acc["all_o_clip_count"] += all_o
+                meta = metas_batch[seq_idx] if metas_batch is not None and seq_idx < len(metas_batch) else {}
+                signer_id = ""
+                if isinstance(meta, dict):
+                    signer_id = str(
+                        meta.get("sequence_source_group")
+                        or meta.get("signer_id")
+                        or meta.get("source_group")
+                        or ""
+                    ).strip()
+                signer_key = signer_id or f"sample_{seq_idx}"
+                signer_row = acc["signer_hits"].setdefault(signer_key, [0.0, 0.0])
+                signer_row[0] += hit
+                signer_row[1] += 1.0
         acc["pred_seg_sum"] += float(pred_seg_sum)
         acc["pred_seg_count"] += int(pred_seg_count)
         acc["transition_pred_sum"] += float(transition_pred_sum)
@@ -1991,6 +2585,17 @@ def _finalize_threshold_metrics(acc: Dict[str, Any], *, score_weights: Optional[
     pred_frames = max(1, int(acc.get("pred_frames", 0)))
     true_b = float(acc.get("true_b", 0))
     pred_b = float(acc.get("pred_b", 0))
+    startup_seq_count = max(1, int(acc.get("sequence_count", 0)))
+    startup_nohand_frames = float(acc.get("startup_nohand_frames", 0.0))
+    startup_pred_starts = float(acc.get("startup_pred_starts", 0.0))
+    sign_clip_count = float(acc.get("sign_clip_count", 0.0))
+    clip_hit_count = float(acc.get("clip_hit_count", 0.0))
+    all_o_clip_count = float(acc.get("all_o_clip_count", 0.0))
+    start_cover_count = float(acc.get("start_cover_count", 0.0))
+    signer_hits = dict(acc.get("signer_hits", {}) or {})
+    signer_macro = 0.0
+    if signer_hits:
+        signer_macro = float(np.mean([float(hit / max(1.0, total)) for hit, total in signer_hits.values()]))
     metrics = {
         **frame_out,
         "b_prec_tol": float(prec),
@@ -2003,6 +2608,15 @@ def _finalize_threshold_metrics(acc: Dict[str, Any], *, score_weights: Optional[
         "b_err_matched": float(int(acc.get("boundary_err_matched", 0))),
         "b_err_missing": float(int(acc.get("boundary_err_missing", 0))),
         "pred_B_ratio": float(pred_b / (true_b + 1e-9)),
+        "startup_first_visible_hand_frame_mean": float(float(acc.get("startup_first_visible_sum", 0.0)) / startup_seq_count),
+        "startup_false_start_rate": float(float(acc.get("startup_false_start_count", 0.0)) / max(1.0, startup_pred_starts)),
+        "startup_segment_before_first_hand_rate": float(float(acc.get("startup_seq_false_count", 0.0)) / startup_seq_count),
+        "startup_nohand_pred_B_rate": float(float(acc.get("startup_nohand_pred_b", 0.0)) / max(1.0, startup_nohand_frames)),
+        "startup_nohand_pred_active_rate": float(float(acc.get("startup_nohand_pred_active", 0.0)) / max(1.0, startup_nohand_frames)),
+        "clip_hit_rate": float(clip_hit_count / max(1.0, sign_clip_count)),
+        "all_o_clip_rate": float(all_o_clip_count / max(1.0, sign_clip_count)),
+        "start_cover_rate": float(start_cover_count / max(1.0, sign_clip_count)),
+        "signer_macro_clip_hit_rate": float(signer_macro),
         "avg_seg_len_true": float(avg_true_seg),
         "avg_seg_len_pred": float(avg_pred_seg),
         "avg_seg_len_ratio": float(segment_length_ratio({"avg_seg_len_true": avg_true_seg, "avg_seg_len_pred": avg_pred_seg})),
@@ -2018,6 +2632,7 @@ def _finalize_threshold_metrics(acc: Dict[str, Any], *, score_weights: Optional[
     metrics["bio_violation_abs_err"] = float(abs(metrics["bio_violation_rate_pred"] - metrics["bio_violation_rate_true"]))
     metrics["balanced_guardrails_passed"] = 1.0 if passes_balanced_guardrails(metrics) else 0.0
     metrics["balanced_score"] = float(balanced_model_score(metrics, **(score_weights or {})))
+    metrics["recall_safe_score"] = float(recall_safe_model_score(metrics))
     return {k: float(v) for k, v in metrics.items()}
 
 
@@ -2028,10 +2643,11 @@ def _finalize_threshold_sweep_state(
 ) -> Dict[str, Any]:
     accumulators = list(state.get("accumulators", []))
     if not accumulators:
-        return {"thresholds": [], "best_b_f1_tol": {}, "best_balanced": {}}
+        return {"thresholds": [], "best_b_f1_tol": {}, "best_balanced": {}, "best_recall_safe": {}}
     threshold_rows: List[Dict[str, Any]] = []
     best_f1: Optional[Dict[str, Any]] = None
     best_balanced: Optional[Dict[str, Any]] = None
+    best_recall_safe: Optional[Dict[str, Any]] = None
     for acc in accumulators:
         metrics = _finalize_threshold_metrics(acc, score_weights=score_weights)
         row = {"threshold": float(acc.get("threshold", 0.5)), **metrics}
@@ -2041,10 +2657,13 @@ def _finalize_threshold_sweep_state(
         if row["balanced_guardrails_passed"] > 0.0:
             if best_balanced is None or _is_better_balanced(row, best_balanced, score_weights=score_weights):
                 best_balanced = dict(row)
+        if best_recall_safe is None or _is_better_recall_safe(row, best_recall_safe):
+            best_recall_safe = dict(row)
     return {
         "thresholds": threshold_rows,
         "best_b_f1_tol": best_f1 or {},
         "best_balanced": best_balanced or {},
+        "best_recall_safe": best_recall_safe or {},
     }
 
 
@@ -2108,12 +2727,24 @@ def _threshold_sweep(
     probs: np.ndarray,
     thresholds: Sequence[float],
     *,
+    mask_seq: Optional[np.ndarray] = None,
+    active_probs: Optional[np.ndarray] = None,
+    startup_visible_joint_threshold: int = 8,
+    startup_visible_hand_frames: int = 1,
     score_weights: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
     if y_seq.size == 0 or probs.size == 0:
-        return {"thresholds": [], "best_b_f1_tol": {}, "best_balanced": {}}
+        return {"thresholds": [], "best_b_f1_tol": {}, "best_balanced": {}, "best_recall_safe": {}}
     state = _init_threshold_sweep_state(thresholds)
-    _update_threshold_sweep_state(state, y_seq, probs)
+    _update_threshold_sweep_state(
+        state,
+        y_seq,
+        probs,
+        mask_seq,
+        active_probs,
+        startup_visible_joint_threshold=int(startup_visible_joint_threshold),
+        startup_visible_hand_frames=int(startup_visible_hand_frames),
+    )
     return _finalize_threshold_sweep_state(state, score_weights=score_weights)
 
 
@@ -2130,6 +2761,7 @@ def _build_checkpoint_payload(
     last_metrics: Dict[str, Any],
     best_boundary_metrics: Optional[Dict[str, float]],
     best_balanced_metrics: Optional[Dict[str, float]],
+    best_recall_safe_metrics: Optional[Dict[str, float]],
     history: Sequence[Dict[str, Any]],
     epochs_no_improve: int,
     schedule_state: Dict[str, Any],
@@ -2153,6 +2785,7 @@ def _build_checkpoint_payload(
         "last_metrics": dict(last_metrics),
         "best_boundary_metrics": dict(best_boundary_metrics or {}),
         "best_balanced_metrics": dict(best_balanced_metrics or {}),
+        "best_recall_safe_metrics": dict(best_recall_safe_metrics or {}),
         "history_epoch": int(epoch),
         "epoch_summary": dict(last_metrics),
         "epochs_no_improve": int(epochs_no_improve),
@@ -2235,6 +2868,7 @@ def _write_analysis_artifacts(
             "epoch": int(epoch),
             "best_b_f1_tol": dict(threshold_sweep.get("best_b_f1_tol", {})),
             "best_balanced": dict(threshold_sweep.get("best_balanced", {})),
+            "best_recall_safe": dict(threshold_sweep.get("best_recall_safe", {})),
         }
         _write_json(thresholds_dir / f"best_threshold_ep{int(epoch):03d}.json", best_payload)
         _write_json(thresholds_dir / "best_threshold_latest.json", best_payload)
@@ -2273,6 +2907,13 @@ def _selection_context(selection: Optional[Dict[str, Any]]) -> Dict[str, float]:
         "selection_threshold": float(selection.get("selection_threshold", selection.get("threshold", 0.5))),
         "b_err_mean": float(selection.get("b_err_mean", 0.0)),
         "pred_B_ratio": float(selection.get("pred_B_ratio", 0.0)),
+        "clip_hit_rate": float(selection.get("clip_hit_rate", 0.0)),
+        "all_o_clip_rate": float(selection.get("all_o_clip_rate", 0.0)),
+        "start_cover_rate": float(selection.get("start_cover_rate", 0.0)),
+        "signer_macro_clip_hit_rate": float(selection.get("signer_macro_clip_hit_rate", 0.0)),
+        "startup_false_start_rate": float(selection.get("startup_false_start_rate", 0.0)),
+        "startup_segment_before_first_hand_rate": float(selection.get("startup_segment_before_first_hand_rate", 0.0)),
+        "startup_nohand_pred_active_rate": float(selection.get("startup_nohand_pred_active_rate", 0.0)),
         "transition_rate_abs_err": float(selection.get("transition_rate_abs_err", 0.0)),
         "bio_violation_abs_err": float(selection.get("bio_violation_abs_err", 0.0)),
     }
@@ -2336,6 +2977,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     ap.add_argument("--val_dir", type=str, default=defaults.get("val_dir", ""), help="Step2 synth val dir (optional)")
     ap.add_argument(
+        "--allow_bad_synth_stats",
+        action="store_true",
+        default=_as_bool(defaults.get("allow_bad_synth_stats"), False),
+        help="Allow training even if synth stats.json fails the realism acceptance gate.",
+    )
+    ap.add_argument(
         "--out_dir",
         type=str,
         default=defaults.get("out_dir"),
@@ -2366,6 +3013,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     ap.add_argument("--balanced_lambda_trans", type=float, default=float(defaults.get("balanced_lambda_trans", 0.75)))
     ap.add_argument("--balanced_lambda_berr", type=float, default=float(defaults.get("balanced_lambda_berr", 0.05)))
     ap.add_argument("--balanced_lambda_bio_violation", type=float, default=float(defaults.get("balanced_lambda_bio_violation", 1.0)))
+    ap.add_argument("--balanced_lambda_startup_false_start", type=float, default=float(defaults.get("balanced_lambda_startup_false_start", 1.5)))
+    ap.add_argument("--balanced_lambda_startup_nohand_active", type=float, default=float(defaults.get("balanced_lambda_startup_nohand_active", 0.75)))
     ap.add_argument("--weight_decay", type=float, default=float(defaults.get("weight_decay", 1e-4)))
     ap.add_argument("--grad_clip", type=float, default=float(defaults.get("grad_clip", 1.0)))
     ap.add_argument("--no_amp", action="store_true", default=_as_bool(defaults.get("no_amp"), False), help="Disable AMP even on CUDA.")
@@ -2384,9 +3033,23 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     ap.add_argument("--p_with_b", type=float, default=float(defaults.get("p_with_b", 0.85)))
 
     # class weights for O,B,I (B should be big)
-    ap.add_argument("--wO", type=float, default=float(defaults.get("wO", 1.5)))
-    ap.add_argument("--wB", type=float, default=float(defaults.get("wB", 25.0)))
-    ap.add_argument("--wI", type=float, default=float(defaults.get("wI", 1.0)))
+    ap.add_argument("--wO", type=float, default=float(defaults.get("wO", 1.0)))
+    ap.add_argument("--wB", type=float, default=float(defaults.get("wB", 12.0)))
+    ap.add_argument("--wI", type=float, default=float(defaults.get("wI", 3.0)))
+    ap.add_argument("--loss_lambda_signness", type=float, default=float(defaults.get("loss_lambda_signness", 0.25)))
+    ap.add_argument("--loss_lambda_onset", type=float, default=float(defaults.get("loss_lambda_onset", 0.5)))
+    ap.add_argument("--loss_lambda_startup_nohand", type=float, default=float(defaults.get("loss_lambda_startup_nohand", 0.35)))
+    ap.add_argument("--startup_visible_joint_threshold", type=int, default=int(defaults.get("startup_visible_joint_threshold", 8)))
+    ap.add_argument("--startup_visible_hand_frames", type=int, default=int(defaults.get("startup_visible_hand_frames", 1)))
+    ap.add_argument("--preprocessing_version", type=str, default=str(defaults.get("preprocessing_version", "canonical_hands42_v3")))
+    ap.add_argument("--preprocessing_center_alpha", type=float, default=float(defaults.get("preprocessing_center_alpha", 0.2)))
+    ap.add_argument("--preprocessing_scale_alpha", type=float, default=float(defaults.get("preprocessing_scale_alpha", 0.1)))
+    ap.add_argument("--preprocessing_min_scale", type=float, default=float(defaults.get("preprocessing_min_scale", 1e-3)))
+    ap.add_argument(
+        "--preprocessing_min_visible_joints_for_scale",
+        type=int,
+        default=int(defaults.get("preprocessing_min_visible_joints_for_scale", 4)),
+    )
 
     # model config
     ap.add_argument("--embed_dim", type=int, default=int(defaults.get("embed_dim", 128)))
@@ -2396,6 +3059,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     ap.add_argument("--gru_layers", type=int, default=int(defaults.get("gru_layers", 1)))
     ap.add_argument("--drop_conv", type=float, default=float(defaults.get("drop_conv", 0.10)))
     ap.add_argument("--drop_head", type=float, default=float(defaults.get("drop_head", 0.10)))
+    ap.add_argument("--signness_head_dropout", type=float, default=float(defaults.get("signness_head_dropout", 0.10)))
+    ap.add_argument("--onset_head_dropout", type=float, default=float(defaults.get("onset_head_dropout", 0.10)))
+    ap.add_argument("--use_signness_head", action="store_true", default=_as_bool(defaults.get("use_signness_head"), False))
+    ap.add_argument("--no_use_signness_head", dest="use_signness_head", action="store_false")
+    ap.add_argument("--use_onset_head", action="store_true", default=_as_bool(defaults.get("use_onset_head"), False))
+    ap.add_argument("--no_use_onset_head", dest="use_onset_head", action="store_false")
 
     ap.add_argument("--log_every", type=int, default=int(defaults.get("log_every", 100)))
     ap.add_argument("--console_log_format", type=str, default=str(defaults.get("console_log_format", "text")), choices=["text", "json"], help="Stdout log format; train_log.jsonl remains structured JSONL.")
@@ -2493,16 +3162,19 @@ def main(argv: Optional[List[str]] = None) -> None:
     with _startup_phase(logger, startup_phase_times, "dataset_scan"):
         train_ds = ShardedBiosDataset(args.train_dir, shard_cache_items=int(args.train_shard_cache_items), parse_meta=False)
         train_stats = _load_json_if_exists(Path(args.train_dir) / "stats.json")
+        _raise_if_bad_synth_realism(Path(args.train_dir), train_stats, allow_bad_synth_stats=bool(args.allow_bad_synth_stats))
         train_dataset_signature = train_stats.get("dataset_signature", {}) if isinstance(train_stats.get("dataset_signature", {}), dict) else {}
         if args.val_dir:
             val_ds = ShardedBiosDataset(args.val_dir, shard_cache_items=int(args.val_shard_cache_items), parse_meta=True)
             val_stats = _load_json_if_exists(Path(args.val_dir) / "stats.json")
+            _raise_if_bad_synth_realism(Path(args.val_dir), val_stats, allow_bad_synth_stats=bool(args.allow_bad_synth_stats))
             val_dataset_signature = val_stats.get("dataset_signature", {}) if isinstance(val_stats.get("dataset_signature", {}), dict) else {}
 
     step = 0
     start_epoch = 1
     best_boundary_metrics: Optional[Dict[str, float]] = None
     best_balanced_metrics: Optional[Dict[str, float]] = None
+    best_recall_safe_metrics: Optional[Dict[str, float]] = None
     history: List[Dict[str, Any]] = []
     epochs_no_improve = 0
     balanced_tracking_started = False
@@ -2518,10 +3190,14 @@ def main(argv: Optional[List[str]] = None) -> None:
             gru_hidden=int(args.gru_hidden),
             gru_layers=int(args.gru_layers),
             head_dropout=float(args.drop_head),
+            signness_head_dropout=float(args.signness_head_dropout),
+            onset_head_dropout=float(args.onset_head_dropout),
             use_vel=True,
             use_acc=True,
             use_mask=True,
             use_aggs=True,
+            use_signness_head=bool(args.use_signness_head),
+            use_onset_head=bool(args.use_onset_head),
         )
         model = BioTagger(cfg).to(device)
         optim = torch.optim.AdamW(model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
@@ -2582,6 +3258,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                 start_epoch = resumed_epoch + 1
                 best_boundary_metrics = dict(ckpt.get("best_boundary_metrics", {}) or {}) or None
                 best_balanced_metrics = dict(ckpt.get("best_balanced_metrics", {}) or {}) or None
+                best_recall_safe_metrics = dict(ckpt.get("best_recall_safe_metrics", {}) or {}) or None
                 history = _restore_history_from_checkpoint(ckpt, resume_path)
                 epochs_no_improve = int(ckpt.get("epochs_no_improve", 0))
                 balanced_tracking_started = bool(ckpt.get("balanced_tracking_started", bool(best_balanced_metrics)))
@@ -2847,6 +3524,11 @@ def main(argv: Optional[List[str]] = None) -> None:
             tb_logger=tb_logger,
             tb_log_every=int(args.log_every_steps),
             label_smoothing=float(args.label_smoothing),
+            loss_lambda_signness=float(args.loss_lambda_signness),
+            loss_lambda_onset=float(args.loss_lambda_onset),
+            loss_lambda_startup_nohand=float(args.loss_lambda_startup_nohand),
+            startup_visible_joint_threshold=int(args.startup_visible_joint_threshold),
+            startup_visible_hand_frames=int(args.startup_visible_hand_frames),
             ema=ema,
             channels_last=bool(args.channels_last),
         )
@@ -2878,6 +3560,11 @@ def main(argv: Optional[List[str]] = None) -> None:
                 amp_dtype=amp_dtype,
                 class_weights=class_weights,
                 label_smoothing=float(args.label_smoothing),
+                loss_lambda_signness=float(args.loss_lambda_signness),
+                loss_lambda_onset=float(args.loss_lambda_onset),
+                loss_lambda_startup_nohand=float(args.loss_lambda_startup_nohand),
+                startup_visible_joint_threshold=int(args.startup_visible_joint_threshold),
+                startup_visible_hand_frames=int(args.startup_visible_hand_frames),
                 collect_examples=collect_examples,
                 examples_k=int(args.tb_examples_k),
                 collect_predictions=bool(planned_prediction_artifacts),
@@ -2893,6 +3580,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             threshold_sweep = analysis.get("threshold_sweep", {}) if isinstance(analysis, dict) else {}
             best_boundary_row = threshold_sweep.get("best_b_f1_tol", {}) if isinstance(threshold_sweep, dict) else {}
             best_balanced_row = threshold_sweep.get("best_balanced", {}) if isinstance(threshold_sweep, dict) else {}
+            best_recall_row = threshold_sweep.get("best_recall_safe", {}) if isinstance(threshold_sweep, dict) else {}
             boundary_candidate = _selection_candidate(
                 metrics,
                 best_boundary_row if isinstance(best_boundary_row, dict) and best_boundary_row else None,
@@ -2903,6 +3591,11 @@ def main(argv: Optional[List[str]] = None) -> None:
                 balanced_candidate = _selection_candidate(metrics, best_balanced_row, selection_source="threshold_sweep")
             elif passes_balanced_guardrails(metrics):
                 balanced_candidate = _selection_candidate(metrics, None, selection_source="argmax")
+            recall_safe_candidate = _selection_candidate(
+                metrics,
+                best_recall_row if isinstance(best_recall_row, dict) and best_recall_row else None,
+                selection_source="threshold_sweep" if best_recall_row else "argmax",
+            )
             balanced_candidate_present = balanced_candidate is not None
             if balanced_candidate_present:
                 balanced_tracking_started = True
@@ -2925,6 +3618,12 @@ def main(argv: Optional[List[str]] = None) -> None:
                     }
                     if balanced_candidate is not None else {}
                 ),
+                "best_recall_safe": {
+                    "threshold": float(recall_safe_candidate.get("selection_threshold", 0.5)),
+                    "source": "threshold_sweep" if best_recall_row else "argmax",
+                    "recall_safe_score": float(recall_safe_candidate.get("recall_safe_score", 0.0)),
+                    **_selection_context(recall_safe_candidate),
+                },
             }
             logger.log({
                 "event": "val_epoch",
@@ -2939,6 +3638,9 @@ def main(argv: Optional[List[str]] = None) -> None:
                 "selected_balanced_threshold": float(balanced_candidate.get("selection_threshold", 0.5)) if balanced_candidate is not None else 0.5,
                 "selected_balanced_score": float(balanced_candidate.get("balanced_score", 0.0)) if balanced_candidate is not None else float(metrics.get("balanced_score", 0.0)),
                 "selected_balanced_source": ("threshold_sweep" if best_balanced_row else "argmax") if balanced_candidate is not None else "argmax",
+                "selected_recall_safe_threshold": float(recall_safe_candidate.get("selection_threshold", 0.5)),
+                "selected_recall_safe_score": float(recall_safe_candidate.get("recall_safe_score", 0.0)),
+                "selected_recall_safe_source": "threshold_sweep" if best_recall_row else "argmax",
                 "balanced_tracking_started": 1.0 if balanced_tracking_started else 0.0,
                 "balanced_candidate_present": 1.0 if balanced_candidate_present else 0.0,
             })
@@ -2981,6 +3683,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                     last_metrics=epoch_summary,
                     best_boundary_metrics=best_boundary_metrics,
                     best_balanced_metrics=best_balanced_metrics,
+                    best_recall_safe_metrics=best_recall_safe_metrics,
                     history=history,
                     epochs_no_improve=epochs_no_improve,
                     schedule_state=schedule_state,
@@ -3036,6 +3739,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                     last_metrics=epoch_summary,
                     best_boundary_metrics=best_boundary_metrics,
                     best_balanced_metrics=best_balanced_metrics,
+                    best_recall_safe_metrics=best_recall_safe_metrics,
                     history=history,
                     epochs_no_improve=epochs_no_improve,
                     schedule_state=schedule_state,
@@ -3060,13 +3764,53 @@ def main(argv: Optional[List[str]] = None) -> None:
                         "pred_B_ratio": float(best_balanced_metrics.get("pred_B_ratio", 0.0)),
                     }
                 )
+            recall_safe_improved = _is_better_recall_safe(recall_safe_candidate, best_recall_safe_metrics)
+            if recall_safe_improved:
+                best_recall_safe_metrics = dict(recall_safe_candidate)
+                recall_payload = _build_checkpoint_payload(
+                    epoch=epoch,
+                    global_step=step,
+                    model=model,
+                    optim=optim,
+                    scaler=scaler,
+                    ema=ema,
+                    cfg=cfg,
+                    args=args,
+                    last_metrics=epoch_summary,
+                    best_boundary_metrics=best_boundary_metrics,
+                    best_balanced_metrics=best_balanced_metrics,
+                    best_recall_safe_metrics=best_recall_safe_metrics,
+                    history=history,
+                    epochs_no_improve=epochs_no_improve,
+                    schedule_state=schedule_state,
+                    train_dataset_signature=train_dataset_signature,
+                    val_dataset_signature=val_dataset_signature,
+                    balanced_tracking_started=balanced_tracking_started,
+                    runtime_summary={**runtime_summary, "selection_role": "best_recall_safe"},
+                    include_history=False,
+                    include_runtime_summary=False,
+                )
+                torch.save(recall_payload, out_dir / "best_recall_safe.pt")
+                _save_model_only_checkpoint(out_dir / "best_recall_safe_model.pt", recall_payload)
+                logger.log(
+                    {
+                        "event": "best_recall_safe",
+                        "epoch": int(epoch),
+                        "step": int(step),
+                        "threshold": float(best_recall_safe_metrics.get("selection_threshold", 0.5)),
+                        "recall_safe_score": float(best_recall_safe_metrics.get("recall_safe_score", 0.0)),
+                        "clip_hit_rate": float(best_recall_safe_metrics.get("clip_hit_rate", 0.0)),
+                        "start_cover_rate": float(best_recall_safe_metrics.get("start_cover_rate", 0.0)),
+                        "all_o_clip_rate": float(best_recall_safe_metrics.get("all_o_clip_rate", 0.0)),
+                    }
+                )
             write_prediction_rows = _should_write_prediction_artifacts(
                 enabled=bool(args.save_analysis_artifacts),
                 epoch=int(epoch),
                 every=int(args.prediction_artifacts_every),
                 total_epochs=int(args.epochs),
                 boundary_improved=bool(boundary_improved),
-                balanced_improved=bool(balanced_improved),
+                balanced_improved=bool(balanced_improved or recall_safe_improved),
             )
             if args.save_analysis_artifacts:
                 if write_prediction_rows and "prediction_rows" not in analysis:
@@ -3078,6 +3822,11 @@ def main(argv: Optional[List[str]] = None) -> None:
                         amp_dtype=amp_dtype,
                         class_weights=class_weights,
                         label_smoothing=float(args.label_smoothing),
+                        loss_lambda_signness=float(args.loss_lambda_signness),
+                        loss_lambda_onset=float(args.loss_lambda_onset),
+                        loss_lambda_startup_nohand=float(args.loss_lambda_startup_nohand),
+                        startup_visible_joint_threshold=int(args.startup_visible_joint_threshold),
+                        startup_visible_hand_frames=int(args.startup_visible_hand_frames),
                         collect_examples=False,
                         examples_k=int(args.tb_examples_k),
                         collect_predictions=True,
@@ -3127,6 +3876,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             last_metrics=epoch_summary,
             best_boundary_metrics=best_boundary_metrics,
             best_balanced_metrics=best_balanced_metrics,
+            best_recall_safe_metrics=best_recall_safe_metrics,
             history=history,
             epochs_no_improve=epochs_no_improve,
             schedule_state=schedule_state,
@@ -3149,6 +3899,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             last_metrics=epoch_summary,
             best_boundary_metrics=best_boundary_metrics,
             best_balanced_metrics=best_balanced_metrics,
+            best_recall_safe_metrics=best_recall_safe_metrics,
             history=history,
             epochs_no_improve=epochs_no_improve,
             schedule_state=schedule_state,
@@ -3201,6 +3952,15 @@ def main(argv: Optional[List[str]] = None) -> None:
             "b_err_mean": float(best_balanced_metrics.get("b_err_mean", 0.0)),
             "threshold": float(best_balanced_metrics.get("selection_threshold", 0.5)),
         }
+    if best_recall_safe_metrics is not None:
+        done_payload["best_recall_safe"] = {
+            "clip_hit_rate": float(best_recall_safe_metrics.get("clip_hit_rate", 0.0)),
+            "all_o_clip_rate": float(best_recall_safe_metrics.get("all_o_clip_rate", 0.0)),
+            "start_cover_rate": float(best_recall_safe_metrics.get("start_cover_rate", 0.0)),
+            "signer_macro_clip_hit_rate": float(best_recall_safe_metrics.get("signer_macro_clip_hit_rate", 0.0)),
+            "recall_safe_score": float(best_recall_safe_metrics.get("recall_safe_score", 0.0)),
+            "threshold": float(best_recall_safe_metrics.get("selection_threshold", 0.5)),
+        }
     logger.log(done_payload)
     if tb_logger.enabled:
         tb_logger.hparams(
@@ -3217,6 +3977,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             {
                 "best_boundary_b_f1_tol": float(best_boundary_metrics.get("b_f1_tol", 0.0)) if best_boundary_metrics else 0.0,
                 "best_balanced_b_f1_tol": float(best_balanced_metrics.get("b_f1_tol", 0.0)) if best_balanced_metrics else 0.0,
+                "best_recall_safe_clip_hit_rate": float(best_recall_safe_metrics.get("clip_hit_rate", 0.0)) if best_recall_safe_metrics else 0.0,
             },
         )
         tb_logger.scalar("meta/warmup_epochs", float(warmup_epochs), 0)
@@ -3247,6 +4008,21 @@ def main(argv: Optional[List[str]] = None) -> None:
                     "avg_seg_len_ratio": float(best_balanced_metrics.get("avg_seg_len_ratio", 0.0)),
                     "b_err_mean": float(best_balanced_metrics.get("b_err_mean", 0.0)),
                     "threshold": float(best_balanced_metrics.get("selection_threshold", 0.5)),
+                },
+                ensure_ascii=True,
+            ),
+        )
+    if best_recall_safe_metrics is not None:
+        print(
+            "best_recall_safe.pt:",
+            json.dumps(
+                {
+                    "clip_hit_rate": float(best_recall_safe_metrics.get("clip_hit_rate", 0.0)),
+                    "all_o_clip_rate": float(best_recall_safe_metrics.get("all_o_clip_rate", 0.0)),
+                    "start_cover_rate": float(best_recall_safe_metrics.get("start_cover_rate", 0.0)),
+                    "signer_macro_clip_hit_rate": float(best_recall_safe_metrics.get("signer_macro_clip_hit_rate", 0.0)),
+                    "recall_safe_score": float(best_recall_safe_metrics.get("recall_safe_score", 0.0)),
+                    "threshold": float(best_recall_safe_metrics.get("selection_threshold", 0.5)),
                 },
                 ensure_ascii=True,
             ),
