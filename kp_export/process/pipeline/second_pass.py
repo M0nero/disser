@@ -2,21 +2,22 @@ from __future__ import annotations
 from typing import Dict, List, Optional, Tuple
 from time import perf_counter
 
-from ..mp.roi import run_second_pass_for
+from ...mp.roi import run_second_pass_for
+from ..contracts import SecondPassResult
 
 
 def _execute_second_pass(hand, pts, score, *, debug_roi: bool = False, **kwargs):
     if kwargs.get("hands_sp") is None:
-        return pts, score, False, 0.0, None
+        return SecondPassResult(landmarks=pts, score=score, recovered=False, roi=None), 0.0
     t0 = perf_counter()
-    pts, score, recovered, roi = run_second_pass_for(
+    result = run_second_pass_for(
         hand,
         cur_pts=pts,
         cur_score=score,
         debug_return_roi=debug_roi,
         **kwargs,
     )
-    return pts, score, recovered, perf_counter() - t0, roi
+    return result, perf_counter() - t0
 
 
 def _apply_hold_if_needed(

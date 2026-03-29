@@ -8,8 +8,9 @@ HandSource = Literal["pass1", "pass2", "tracked", "occluded", "hold", None]
 
 @dataclass
 class VideoMeta:
-    id: str
-    file: str
+    sample_id: str
+    slug: str
+    source_video: str
     num_frames: int
     fps: float
     hands_frames: int
@@ -30,7 +31,6 @@ class VideoMeta:
     sp_recovered_right_frac: float = 0.0
     track_recovered_left_frac: float = 0.0
     track_recovered_right_frac: float = 0.0
-    file_pp: str = ""
     pp_filled_left: int = 0
     pp_filled_right: int = 0
     pp_gaps_filled_left: int = 0

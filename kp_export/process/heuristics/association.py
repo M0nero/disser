@@ -2,7 +2,7 @@ from __future__ import annotations
 from typing import Dict, List, Optional, Tuple
 import math
 
-from .process_constants import (
+from .constants import (
     DEDUP_D0_SCALE,
     DEDUP_DIST_SCALE,
     DEDUP_IOU_THRESHOLD,
@@ -10,8 +10,8 @@ from .process_constants import (
     POSE_WRIST_REJECT_MIN_WORLD,
     POSE_WRIST_REJECT_SCALE,
 )
-from .process_geometry import _hand_scale, _iou_norm, _mean_l2_xy, _wrist_xy
-from .process_pose import (
+from .geometry import _hand_scale, _iou_norm, _mean_l2_xy, _wrist_xy
+from .pose import (
     _pose_wrists_close,
     _pose_wrist_dists,
     _pose_wrist_out_of_frame,

@@ -9,6 +9,7 @@ from typing import Dict, Iterable, List, Sequence, Tuple
 
 import matplotlib
 import numpy as np
+import pyarrow.parquet as pq
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
@@ -26,10 +27,12 @@ def _safe_float(value, default=np.nan) -> float:
 
 
 def _load_manifest(path: Path) -> List[Dict]:
+    if path.suffix.lower() == ".parquet":
+        return [dict(row) for row in pq.read_table(path).to_pylist()]
     with path.open("r", encoding="utf-8") as f:
         data = json.load(f)
     if not isinstance(data, list):
-        raise RuntimeError(f"Manifest must be a JSON array: {path}")
+        raise RuntimeError(f"Input must be a JSON array or parquet table: {path}")
     return data
 
 
@@ -718,8 +721,8 @@ def _figure9_inset(
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser("Build publication-ready figures from Slovo manifest.")
-    ap.add_argument("--manifest", default="datasets/skeletons/Slovo/manifest.json")
+    ap = argparse.ArgumentParser("Build publication-ready figures from Slovo videos.parquet.")
+    ap.add_argument("--manifest", default="datasets/skeletons/Slovo/videos.parquet")
     ap.add_argument("--out-dir", default="outputs/Slovo/paper_figures")
     ap.add_argument("--formats", default="png,pdf", help="Comma-separated, e.g. png,pdf,svg")
     ap.add_argument("--dpi", type=int, default=300)

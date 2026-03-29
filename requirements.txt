@@ -87,3 +87,5 @@ typing_extensions==4.15.0
 tzdata==2025.2
 wcwidth==0.2.14
 widgetsnbextension==4.0.15
+zarr==2.18.3
+numcodecs==0.13.1

@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import List, Dict, Any
 import numpy as np
 import matplotlib.pyplot as plt
+import pyarrow.parquet as pq
 
 METRIC_KEYS = [
     "both_coverage", "left_coverage", "right_coverage",
@@ -103,21 +104,29 @@ def auto_recommend(videos: List[Dict[str,Any]]) -> Dict[str, Any]:
     }
     return rec
 
+def _load_videos(path: Path) -> List[Dict[str, Any]]:
+    if path.suffix.lower() == ".parquet":
+        return [dict(row) for row in pq.read_table(path).to_pylist()]
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if isinstance(data, list):
+        return [dict(row) for row in data if isinstance(row, dict)]
+    videos = data.get("videos", []) if isinstance(data, dict) else []
+    return [dict(row) for row in videos if isinstance(row, dict)]
+
+
 def main():
-    ap = argparse.ArgumentParser("Analyze manifest.json and suggest preprocessing flags")
-    ap.add_argument("--manifest", type=str, required=True, help="Path to manifest.json")
+    ap = argparse.ArgumentParser("Analyze videos.parquet and suggest preprocessing flags")
+    ap.add_argument("--manifest", type=str, required=True, help="Path to videos.parquet (or legacy manifest.json)")
     ap.add_argument("--out-dir", type=str, required=True, help="Directory to save the report")
     args = ap.parse_args()
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    with open(args.manifest, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    videos = data.get("videos", [])
+    videos = _load_videos(Path(args.manifest))
     if not videos:
-        raise SystemExit("Empty manifest: no 'videos' entries found.")
+        raise SystemExit("Empty input: no video/sample rows found.")
 
     # Save per-video CSV
     csv_path = out_dir / "metrics.csv"
@@ -157,7 +166,7 @@ def main():
 
     # Human-readable report.md
     md = []
-    md.append("# Manifest Analysis Report\n")
+    md.append("# Extractor Metrics Report\n")
     md.append(f"- Total videos: **{len(videos)}**\n")
     if "both_coverage" in summary:
         med = summary["both_coverage"]["p50"]

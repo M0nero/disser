@@ -1,5 +1,5 @@
 from __future__ import annotations
 
-from .api import process_task, process_video
+from .pipeline.runner import process_task, process_video
 
 __all__ = ["process_video", "process_task"]

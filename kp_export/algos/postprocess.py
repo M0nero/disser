@@ -1,8 +1,11 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+from copy import deepcopy
 import math
 import statistics
+from typing import Any, Dict, List, Optional, Tuple
+
+from ..core.geometry import hand_scale
 
 MP_HAND_NUM_LANDMARKS = 21
 
@@ -18,22 +21,98 @@ def _copy_pts(pts: List[Dict[str, float]]) -> List[Dict[str, float]]:
     return [dict(p) for p in pts]
 
 
-def _copy_frame(fr: Dict[str, Any]) -> Dict[str, Any]:
-    out = dict(fr)
-    for hand_key in ("hand 1", "hand 2"):
-        pts = out.get(hand_key)
-        if isinstance(pts, list):
-            out[hand_key] = _copy_pts(pts)
-    return out
+def _is_frame_record(frame: Any) -> bool:
+    return hasattr(frame, "hand_1") and hasattr(frame, "hand_2") and hasattr(frame, "diagnostics")
 
 
-def _hand_keys(hand_idx: int) -> Tuple[str, str, str, str, str]:
-    hand_key = f"hand {hand_idx}"
-    score_key = f"hand {hand_idx}_score"
-    source_key = f"hand {hand_idx}_source"
-    state_key = f"hand {hand_idx}_state"
-    reject_key = f"hand {hand_idx}_reject_reason"
-    return hand_key, score_key, source_key, state_key, reject_key
+def _legacy_hand_key(hand_idx: int) -> str:
+    return f"hand {hand_idx}"
+
+
+def _diag_key(hand_idx: int, field: str) -> str:
+    return f"hand_{hand_idx}_{field}"
+
+
+def _hand_obs(frame: Any, hand_idx: int):
+    return frame.hand_1 if hand_idx == 1 else frame.hand_2
+
+
+def _get_hand_pts(frame: Any, hand_idx: int):
+    if _is_frame_record(frame):
+        return _hand_obs(frame, hand_idx).landmarks
+    return frame.get(_legacy_hand_key(hand_idx))
+
+
+def _set_hand_pts(frame: Any, hand_idx: int, pts) -> None:
+    if _is_frame_record(frame):
+        _hand_obs(frame, hand_idx).landmarks = pts
+        frame.both_hands = bool(frame.hand_1.landmarks is not None and frame.hand_2.landmarks is not None)
+        return
+    frame[_legacy_hand_key(hand_idx)] = pts
+    frame["both_hands"] = 1 if (frame.get("hand 1") is not None and frame.get("hand 2") is not None) else 0
+
+
+def _get_hand_score(frame: Any, hand_idx: int):
+    if _is_frame_record(frame):
+        return _hand_obs(frame, hand_idx).score
+    return frame.get(f"hand {hand_idx}_score")
+
+
+def _get_hand_source(frame: Any, hand_idx: int):
+    if _is_frame_record(frame):
+        return _hand_obs(frame, hand_idx).source
+    return frame.get(f"hand {hand_idx}_source")
+
+
+def _set_hand_source(frame: Any, hand_idx: int, value) -> None:
+    if _is_frame_record(frame):
+        _hand_obs(frame, hand_idx).source = value
+        frame.diagnostics.values[_diag_key(hand_idx, "source")] = value
+        return
+    frame[f"hand {hand_idx}_source"] = value
+
+
+def _get_hand_state(frame: Any, hand_idx: int):
+    if _is_frame_record(frame):
+        return _hand_obs(frame, hand_idx).state
+    return frame.get(f"hand {hand_idx}_state")
+
+
+def _set_hand_state(frame: Any, hand_idx: int, value) -> None:
+    if _is_frame_record(frame):
+        _hand_obs(frame, hand_idx).state = value
+        frame.diagnostics.values[_diag_key(hand_idx, "state")] = value
+        return
+    frame[f"hand {hand_idx}_state"] = value
+
+
+def _get_hand_reject(frame: Any, hand_idx: int):
+    if _is_frame_record(frame):
+        return _hand_obs(frame, hand_idx).reject_reason
+    return frame.get(f"hand {hand_idx}_reject_reason")
+
+
+def _get_hand_is_anchor(frame: Any, hand_idx: int):
+    if _is_frame_record(frame):
+        return _hand_obs(frame, hand_idx).is_anchor
+    return frame.get(f"hand {hand_idx}_is_anchor")
+
+
+def _get_ts(frame: Any):
+    if _is_frame_record(frame):
+        return frame.ts_ms
+    return frame.get("ts")
+
+
+def _set_extra(frame: Any, key: str, value: Any) -> None:
+    if _is_frame_record(frame):
+        frame.extras[key] = value
+        return
+    frame[key] = value
+
+
+def _copy_frame(fr: Any) -> Any:
+    return deepcopy(fr)
 
 
 def _is_sanity_reject(reason: Optional[str]) -> bool:
@@ -43,45 +122,28 @@ def _is_sanity_reject(reason: Optional[str]) -> bool:
 
 
 def _is_anchor(fr: Dict[str, Any], hand_idx: int, hi: float) -> bool:
-    hand_key, score_key, source_key, _, reject_key = _hand_keys(hand_idx)
-    pts = fr.get(hand_key)
+    pts = _get_hand_pts(fr, hand_idx)
     if pts is None:
         return False
-    if _is_sanity_reject(fr.get(reject_key)):
+    if _is_sanity_reject(_get_hand_reject(fr, hand_idx)):
         return False
-    if fr.get(f"hand {hand_idx}_is_anchor"):
+    if _get_hand_is_anchor(fr, hand_idx):
         return True
-    score = fr.get(score_key)
-    source = fr.get(source_key)
+    score = _get_hand_score(fr, hand_idx)
+    source = _get_hand_source(fr, hand_idx)
     return score is not None and score >= hi and source in ("pass1", "pass2")
 
 
 def _should_replace(fr: Dict[str, Any], hand_idx: int) -> bool:
-    hand_key, _, source_key, state_key, _ = _hand_keys(hand_idx)
-    if fr.get(hand_key) is None:
+    if _get_hand_pts(fr, hand_idx) is None:
         return True
-    source = fr.get(source_key)
+    source = _get_hand_source(fr, hand_idx)
     if source in ("tracked", "occluded", "hold"):
         return True
-    state = fr.get(state_key)
+    state = _get_hand_state(fr, hand_idx)
     if state is None or state != "observed":
         return True
     return False
-
-
-def _hand_scale(pts: List[Dict[str, float]]) -> float:
-    if not pts or len(pts) < 2:
-        return 0.0
-    wx = float(pts[0]["x"])
-    wy = float(pts[0]["y"])
-    d = []
-    for j in range(1, min(MP_HAND_NUM_LANDMARKS, len(pts))):
-        px = float(pts[j]["x"])
-        py = float(pts[j]["y"])
-        d.append(math.hypot(px - wx, py - wy))
-    if not d:
-        return 0.0
-    return float(statistics.median(d))
 
 
 def _anchor_repr(pts: List[Dict[str, float]]) -> Optional[Tuple[Tuple[float, float, float], float, List[Tuple[float, float, float]]]]:
@@ -91,7 +153,7 @@ def _anchor_repr(pts: List[Dict[str, float]]) -> Optional[Tuple[Tuple[float, flo
     wx = float(pts[0]["x"])
     wy = float(pts[0]["y"])
     wz = float(pts[0]["z"])
-    scale = _hand_scale(pts)
+    scale = hand_scale(pts, min_points=min(2, MP_HAND_NUM_LANDMARKS))
     scale = max(scale, 1e-6)
     offsets: List[Tuple[float, float, float]] = []
     for j in range(n):
@@ -126,10 +188,10 @@ def _interp_pts(a0, a1, t: float) -> List[Dict[str, float]]:
     return pts
 
 
-def _compute_dt_list(frames: List[Dict[str, Any]]) -> List[float]:
+def _compute_dt_list(frames: List[Any]) -> List[float]:
     if not frames:
         return []
-    ts_list = [fr.get("ts") for fr in frames]
+    ts_list = [_get_ts(fr) for fr in frames]
     if any(ts is None for ts in ts_list):
         return [1.0] * len(frames)
     diffs = []
@@ -314,13 +376,12 @@ def _rts_smooth_1d(obs: List[Optional[float]], dt_list: List[float], r_list: Lis
     return out
 
 
-def _measurement_variance(fr: Dict[str, Any], hand_idx: int, anchor_mask: bool) -> float:
-    _, _, source_key, state_key, _ = _hand_keys(hand_idx)
+def _measurement_variance(fr: Any, hand_idx: int, anchor_mask: bool) -> float:
     if anchor_mask:
         sigma = SIGMA_ANCHOR
     else:
-        source = fr.get(source_key)
-        state = fr.get(state_key)
+        source = _get_hand_source(fr, hand_idx)
+        state = _get_hand_state(fr, hand_idx)
         if source in ("pass1", "pass2") and state == "observed":
             sigma = SIGMA_OBS
         elif source == "interp":
@@ -330,10 +391,10 @@ def _measurement_variance(fr: Dict[str, Any], hand_idx: int, anchor_mask: bool) 
     return float(sigma * sigma)
 
 
-def _extract_hand_arrays(frames: List[Dict[str, Any]], hand_key: str) -> List[Optional[List[List[float]]]]:
+def _extract_hand_arrays(frames: List[Any], hand_idx: int) -> List[Optional[List[List[float]]]]:
     out: List[Optional[List[List[float]]]] = []
     for fr in frames:
-        pts = fr.get(hand_key)
+        pts = _get_hand_pts(fr, hand_idx)
         if not pts:
             out.append(None)
             continue
@@ -342,14 +403,14 @@ def _extract_hand_arrays(frames: List[Dict[str, Any]], hand_key: str) -> List[Op
     return out
 
 
-def _apply_smoothed(frames: List[Dict[str, Any]], hand_key: str, smoothed: List[Optional[List[List[float]]]]) -> None:
+def _apply_smoothed(frames: List[Any], hand_idx: int, smoothed: List[Optional[List[List[float]]]]) -> None:
     for i, arr in enumerate(smoothed):
         if arr is None:
             continue
-        frames[i][hand_key] = [
+        _set_hand_pts(frames[i], hand_idx, [
             {"x": float(p[0]), "y": float(p[1]), "z": float(p[2])}
             for p in arr
-        ]
+        ])
 
 
 def _wrist(pts: Optional[List[Dict[str, float]]]) -> Optional[Tuple[float, float, float]]:
@@ -359,14 +420,14 @@ def _wrist(pts: Optional[List[Dict[str, float]]]) -> Optional[Tuple[float, float
 
 
 def postprocess_sequence(
-    frames: List[Dict[str, Any]],
+    frames: List[Any],
     *,
     hi: float,
     max_gap: int,
     smoother: str,
     only_anchors: bool,
     world_coords: bool,
-) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+) -> Tuple[List[Any], Dict[str, Any]]:
     frames_pp = [_copy_frame(fr) for fr in frames]
     stats = {
         "pp_filled_left": 0,
@@ -392,8 +453,7 @@ def postprocess_sequence(
             is_anchor = _is_anchor(fr, hand_idx, hi)
             mask.append(is_anchor)
             if is_anchor:
-                hand_key = f"hand {hand_idx}"
-                pts = fr.get(hand_key)
+                pts = _get_hand_pts(fr, hand_idx)
                 if isinstance(pts, list):
                     anchors.append((i, pts))
         anchor_info[hand_idx] = anchors
@@ -405,7 +465,6 @@ def postprocess_sequence(
             continue
         filled = 0
         gaps_filled = 0
-        hand_key, _, source_key, state_key, _ = _hand_keys(hand_idx)
         for (i0, pts0), (i1, pts1) in zip(anchors, anchors[1:]):
             gap_len = i1 - i0 - 1
             if gap_len <= 0 or gap_len > max_gap:
@@ -423,18 +482,18 @@ def postprocess_sequence(
                 interp_pts = _interp_pts(a0, a1, t)
                 if not interp_pts:
                     continue
-                frames_pp[k][hand_key] = interp_pts
-                frames_pp[k][source_key] = "interp"
-                frames_pp[k][state_key] = "predicted"
-                frames_pp[k][f"hand {hand_idx}_pp_applied"] = True
-                frames_pp[k][f"hand {hand_idx}_pp_reason"] = "gap_fill"
+                _set_hand_pts(frames_pp[k], hand_idx, interp_pts)
+                _set_hand_source(frames_pp[k], hand_idx, "interp")
+                _set_hand_state(frames_pp[k], hand_idx, "predicted")
+                _set_extra(frames_pp[k], f"hand {hand_idx}_pp_applied", True)
+                _set_extra(frames_pp[k], f"hand {hand_idx}_pp_reason", "gap_fill")
                 if only_anchors:
                     raw_fr = frames[k]
-                    raw_pts = raw_fr.get(hand_key)
-                    raw_src = raw_fr.get(source_key)
+                    raw_pts = _get_hand_pts(raw_fr, hand_idx)
+                    raw_src = _get_hand_source(raw_fr, hand_idx)
                     if raw_pts is not None and raw_src in ("pass1", "pass2") and not anchor_mask[hand_idx][k]:
-                        frames_pp[k][f"hand {hand_idx}_pp_overrode"] = True
-                        frames_pp[k][f"hand {hand_idx}_pp_overrode_reason"] = "only_anchors"
+                        _set_extra(frames_pp[k], f"hand {hand_idx}_pp_overrode", True)
+                        _set_extra(frames_pp[k], f"hand {hand_idx}_pp_overrode_reason", "only_anchors")
                 filled += 1
                 filled_any = True
             if filled_any:
@@ -452,12 +511,11 @@ def postprocess_sequence(
     if smoother != "none":
         dt_list = _compute_dt_list(frames_pp)
         for hand_idx in (1, 2):
-            hand_key, _, _, _, _ = _hand_keys(hand_idx)
             before_wrist = [
-                _wrist(fr.get(hand_key))
+                _wrist(_get_hand_pts(fr, hand_idx))
                 for fr in frames_pp
             ]
-            seq = _extract_hand_arrays(frames_pp, hand_key)
+            seq = _extract_hand_arrays(frames_pp, hand_idx)
             if smoother == "ema":
                 smoothed = _ema_bidirectional(seq, EMA_ALPHA)
             else:
@@ -489,17 +547,17 @@ def postprocess_sequence(
                                 for i, val in enumerate(out):
                                     if val is not None and smoothed[i] is not None:
                                         smoothed[i][j][dim] = float(val)
-            _apply_smoothed(frames_pp, hand_key, smoothed)
+            _apply_smoothed(frames_pp, hand_idx, smoothed)
             for i, pts in anchor_info[hand_idx]:
                 if pts is not None:
-                    frames_pp[i][hand_key] = _copy_pts(pts)
+                    _set_hand_pts(frames_pp[i], hand_idx, _copy_pts(pts))
             delta_sum = 0.0
             delta_count = 0
             for i, fr in enumerate(frames_pp):
                 if anchor_mask[hand_idx][i]:
                     continue
                 b = before_wrist[i]
-                a = _wrist(fr.get(hand_key))
+                a = _wrist(_get_hand_pts(fr, hand_idx))
                 if b is None or a is None:
                     continue
                 dx = a[0] - b[0]

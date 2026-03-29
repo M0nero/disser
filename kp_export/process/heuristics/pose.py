@@ -2,7 +2,7 @@ from __future__ import annotations
 from typing import Dict, List, Optional, Tuple
 import math
 
-from .process_constants import (
+from .constants import (
     MP_POSE_LEFT_WRIST_IDX,
     MP_POSE_RIGHT_WRIST_IDX,
     POSE_WRIST_CROSS_SCALE,
@@ -11,9 +11,9 @@ from .process_constants import (
     POSE_WRIST_REJECT_MIN_IMAGE,
     POSE_WRIST_REJECT_MIN_WORLD,
 )
-from .process_geometry import _hand_scale, _wrist_xy
-from ..algos.tracking import HandTracker
-from ..core.utils import bbox_from_pts_px
+from .geometry import _hand_scale, _wrist_xy
+from ...algos.tracking import HandTracker
+from ...core.utils import bbox_from_pts_px
 
 
 def _pose_wrist_refs(world_coords, pose_img_landmarks, pose_world_full, last_pose_world_full):

@@ -9,6 +9,8 @@ import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import pyarrow.parquet as pq
+
 
 def _f(val: Any) -> float:
     try:
@@ -25,16 +27,12 @@ def _safe_rate(num: float, den: float) -> float:
     return num / den
 
 
-def _load_report(path: Path) -> Dict[str, Any]:
-    with path.open("r", encoding="utf-8") as f:
-        data = json.load(f)
-    if not isinstance(data, dict):
-        raise RuntimeError(f"Invalid report format (dict expected): {path}")
-    return data
+def _load_rows(path: Path) -> List[Dict[str, Any]]:
+    return pq.read_table(path).to_pylist()
 
 
 def _video_id(v: Dict[str, Any]) -> str:
-    vid = str(v.get("id") or "").strip()
+    vid = str(v.get("sample_id") or "").strip()
     if vid:
         return vid
     slug = str(v.get("slug") or "").strip()
@@ -47,61 +45,43 @@ def _video_id(v: Dict[str, Any]) -> str:
 
 
 def _extract_video_metrics(v: Dict[str, Any]) -> Optional[Dict[str, float]]:
-    meta = v.get("meta") or {}
-    ev = v.get("eval") or {}
-
-    num_frames = _f(meta.get("num_frames"))
+    num_frames = _f(v.get("num_frames"))
     if not math.isfinite(num_frames) or num_frames <= 0:
         return None
 
-    # Meta metrics.
     out: Dict[str, float] = {
         "num_frames": num_frames,
-        "quality_score": _f(meta.get("quality_score")),
-        "hands_coverage": _f(meta.get("hands_coverage")),
-        "left_coverage": _f(meta.get("left_coverage")),
-        "right_coverage": _f(meta.get("right_coverage")),
-        "both_coverage": _f(meta.get("both_coverage")),
-        "sp_recovered_left_frac": _f(meta.get("sp_recovered_left_frac")),
-        "sp_recovered_right_frac": _f(meta.get("sp_recovered_right_frac")),
-        "track_recovered_left_frac": _f(meta.get("track_recovered_left_frac")),
-        "track_recovered_right_frac": _f(meta.get("track_recovered_right_frac")),
+        "quality_score": _f(v.get("quality_score")),
+        "hands_coverage": _f(v.get("hands_coverage")),
+        "left_coverage": _f(v.get("left_coverage")),
+        "right_coverage": _f(v.get("right_coverage")),
+        "both_coverage": _f(v.get("both_coverage")),
+        "sp_recovered_left_frac": _f(v.get("sp_recovered_left_frac")),
+        "sp_recovered_right_frac": _f(v.get("sp_recovered_right_frac")),
+        "track_recovered_left_frac": _f(v.get("track_recovered_left_frac")),
+        "track_recovered_right_frac": _f(v.get("track_recovered_right_frac")),
     }
 
-    # Eval metrics (same denominators as extract_keypoints aggregate block).
-    if isinstance(ev, dict) and ev:
-        missing = _f(ev.get("missing_frames_1")) + _f(ev.get("missing_frames_2"))
-        occluded = _f(ev.get("occluded_frames_1")) + _f(ev.get("occluded_frames_2"))
-        outlier = _f(ev.get("outlier_frames_1")) + _f(ev.get("outlier_frames_2"))
-        sanity = _f(ev.get("sanity_reject_frames_1")) + _f(ev.get("sanity_reject_frames_2"))
-        swap = _f(ev.get("swap_frames"))
-        pp_fill = _f(ev.get("pp_filled_left")) + _f(ev.get("pp_filled_right"))
-        out.update(
-            {
-                "missing_rate": _safe_rate(missing, 2.0 * num_frames),
-                "occluded_rate": _safe_rate(occluded, 2.0 * num_frames),
-                "outlier_rate": _safe_rate(outlier, 2.0 * num_frames),
-                "sanity_reject_rate": _safe_rate(sanity, 2.0 * num_frames),
-                "swap_rate": _safe_rate(swap, num_frames),
-                "pp_filled_frac": _safe_rate(pp_fill, 2.0 * num_frames),
-            }
-        )
-    else:
-        out.update(
-            {
-                "missing_rate": float("nan"),
-                "occluded_rate": float("nan"),
-                "outlier_rate": float("nan"),
-                "sanity_reject_rate": float("nan"),
-                "swap_rate": float("nan"),
-                "pp_filled_frac": float("nan"),
-            }
-        )
+    missing = _f(v.get("missing_frames_1")) + _f(v.get("missing_frames_2"))
+    occluded = _f(v.get("occluded_frames_1")) + _f(v.get("occluded_frames_2"))
+    outlier = _f(v.get("outlier_frames_1")) + _f(v.get("outlier_frames_2"))
+    sanity = _f(v.get("sanity_reject_frames_1")) + _f(v.get("sanity_reject_frames_2"))
+    swap = _f(v.get("swap_frames"))
+    pp_fill = _f(v.get("pp_filled_left")) + _f(v.get("pp_filled_right"))
+    out.update(
+        {
+            "missing_rate": _safe_rate(missing, 2.0 * num_frames),
+            "occluded_rate": _safe_rate(occluded, 2.0 * num_frames),
+            "outlier_rate": _safe_rate(outlier, 2.0 * num_frames),
+            "sanity_reject_rate": _safe_rate(sanity, 2.0 * num_frames),
+            "swap_rate": _safe_rate(swap, num_frames),
+            "pp_filled_frac": _safe_rate(pp_fill, 2.0 * num_frames),
+        }
+    )
     return out
 
 
-def _build_map(report: Dict[str, Any]) -> Dict[str, Dict[str, float]]:
-    videos = report.get("videos") or []
+def _build_map(videos: List[Dict[str, Any]]) -> Dict[str, Dict[str, float]]:
     out: Dict[str, Dict[str, float]] = {}
     for v in videos:
         if not isinstance(v, dict):
@@ -192,8 +172,8 @@ def _as_markdown(
     lines.append("# Ablation: pass-1 naive vs final fault-tolerant")
     lines.append("")
     lines.append("## Coverage")
-    lines.append(f"- naive report: `{naive_path}`")
-    lines.append(f"- final report: `{final_path}`")
+    lines.append(f"- naive parquet: `{naive_path}`")
+    lines.append(f"- final parquet: `{final_path}`")
     lines.append(f"- videos with valid meta: naive={len(naive_map)}, final={len(final_map)}")
     lines.append(f"- matched by video id: {len(common_ids)}")
     lines.append("")
@@ -215,9 +195,9 @@ def _as_markdown(
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser("Compare naive vs final eval_report.json for ablation.")
-    ap.add_argument("--naive", default="outputs/Slovo_naive/eval_report.json")
-    ap.add_argument("--final", default="outputs/Slovo/eval_report.json")
+    ap = argparse.ArgumentParser("Compare naive vs final videos.parquet outputs for ablation.")
+    ap.add_argument("--naive", default="outputs/Slovo_naive/videos.parquet")
+    ap.add_argument("--final", default="outputs/Slovo/videos.parquet")
     ap.add_argument("--out-dir", default="outputs/ablation")
     args = ap.parse_args()
 
@@ -226,10 +206,8 @@ def main() -> int:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    naive_report = _load_report(naive_path)
-    final_report = _load_report(final_path)
-    naive_map = _build_map(naive_report)
-    final_map = _build_map(final_report)
+    naive_map = _build_map(_load_rows(naive_path))
+    final_map = _build_map(_load_rows(final_path))
     common_ids = sorted(set(naive_map.keys()) & set(final_map.keys()))
 
     metric_specs = [

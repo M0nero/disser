@@ -1,6 +1,7 @@
 from __future__ import annotations
 from typing import List, Dict, Optional, Tuple
 from ..core.utils import bbox_from_pts_px, clip_rect, px_to_norm
+from ..process.contracts import SecondPassResult
 import cv2
 
 
@@ -65,10 +66,10 @@ def run_second_pass_for(
     """
     trigger = (cur_pts is None) or (cur_score is None) or (cur_score < sp_trigger_below)
     if not (hands_sp is not None and trigger):
-        return cur_pts, cur_score, False, None
+        return SecondPassResult(landmarks=cur_pts, score=cur_score, recovered=False, roi=None)
 
     if sp_hands_up_only and not hands_up_gate(hand, pose_img_landmarks, proc_w, proc_h):
-        return cur_pts, cur_score, False, None
+        return SecondPassResult(landmarks=cur_pts, score=cur_score, recovered=False, roi=None)
 
     H, W = proc_h, proc_w
     short = min(W, H)
@@ -285,7 +286,19 @@ def run_second_pass_for(
     if best_pts is not None:
         if debug_out is not None and "selected" not in debug_out:
             debug_out["selected"] = None
-        return best_pts, best_score, True, (roi_selected if return_roi else None)
+        return SecondPassResult(
+            landmarks=best_pts,
+            score=best_score,
+            recovered=True,
+            roi=(roi_selected if return_roi else None),
+            debug=debug_out,
+        )
     if debug_out is not None and "selected" not in debug_out:
         debug_out["selected"] = None
-    return cur_pts, cur_score, False, (roi_selected if return_roi else None)
+    return SecondPassResult(
+        landmarks=cur_pts,
+        score=cur_score,
+        recovered=False,
+        roi=(roi_selected if return_roi else None),
+        debug=debug_out,
+    )

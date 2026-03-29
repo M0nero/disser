@@ -3,6 +3,9 @@ from __future__ import annotations
 from typing import List, Dict, Optional, Tuple
 import math
 
+from ..core.geometry import hand_scale, wrist_xy
+from ..process.contracts import SanityResult
+
 HAND_BONES = [
     (0, 1), (1, 2), (2, 3), (3, 4),
     (0, 5), (5, 6), (6, 7), (7, 8),
@@ -10,34 +13,6 @@ HAND_BONES = [
     (0, 13), (13, 14), (14, 15), (15, 16),
     (0, 17), (17, 18), (18, 19), (19, 20),
 ]
-
-def _wrist_xy(pts: Optional[List[Dict[str, float]]]) -> Optional[Tuple[float, float]]:
-    if not pts or len(pts) == 0:
-        return None
-    try:
-        return float(pts[0]["x"]), float(pts[0]["y"])
-    except Exception:
-        return None
-
-def _hand_scale(pts: Optional[List[Dict[str, float]]]) -> float:
-    if not pts or len(pts) < 2:
-        return 0.0
-    w = _wrist_xy(pts)
-    if w is None:
-        return 0.0
-    wx, wy = w
-    dists = []
-    for p in pts[1:]:
-        try:
-            dx = float(p["x"]) - wx
-            dy = float(p["y"]) - wy
-        except Exception:
-            continue
-        dists.append(math.hypot(dx, dy))
-    if not dists:
-        return 0.0
-    dists.sort()
-    return dists[len(dists) // 2]
 
 def check_hand_sanity(
     pts,
@@ -50,17 +25,17 @@ def check_hand_sanity(
     bone_tol=0.30,
     enable_wrist_check=True,
     debug_out: Optional[Dict[str, float]] = None,
-) -> tuple[bool, list[str]]:
+) -> SanityResult:
     reasons: List[str] = []
     if not pts:
-        return True, reasons
+        return SanityResult(ok=True, reason_codes=reasons, metrics=dict(debug_out or {}))
 
-    curr_scale = _hand_scale(pts)
+    curr_scale = hand_scale(pts)
     if debug_out is not None:
         debug_out["curr_scale"] = float(curr_scale)
     anchor_scale = None
     if prev_anchor:
-        anchor_scale = _hand_scale(prev_anchor)
+        anchor_scale = hand_scale(prev_anchor)
         if anchor_scale <= 0.0:
             anchor_scale = None
     if debug_out is not None:
@@ -81,8 +56,8 @@ def check_hand_sanity(
 
     # B) wrist_jump
     if enable_wrist_check and prev_pred:
-        cur_xy = _wrist_xy(pts)
-        prev_xy = _wrist_xy(prev_pred)
+        cur_xy = wrist_xy(pts)
+        prev_xy = wrist_xy(prev_pred)
         scale_ref = anchor_scale if anchor_scale is not None else curr_scale
         if cur_xy is not None and prev_xy is not None and scale_ref > 0.0:
             dist = math.hypot(cur_xy[0] - prev_xy[0], cur_xy[1] - prev_xy[1])
@@ -136,4 +111,8 @@ def check_hand_sanity(
         debug_out["bone_worst"] = None
         debug_out["bone_tol"] = float(bone_tol)
 
-    return (len(reasons) == 0), reasons
+    return SanityResult(
+        ok=(len(reasons) == 0),
+        reason_codes=reasons,
+        metrics=dict(debug_out or {}),
+    )

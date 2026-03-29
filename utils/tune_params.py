@@ -32,7 +32,6 @@ LOGGER = logging.getLogger(__name__)
 
 RUNTIME_FLAGS = {
     "--debug-video",
-    "--eval-report",
     "--in-dir",
     "--out-dir",
 }
@@ -163,24 +162,17 @@ def build_run_dir(out_dir: str | Path, args_dict: Dict[str, Any]) -> Path:
 
 def build_run_argv(in_dir: str | Path, out_dir: str | Path, args_dict: Dict[str, Any]) -> List[str]:
     run_dir = build_run_dir(out_dir, args_dict)
-    eval_report = run_dir / "eval_report.json"
     return [
         "--in-dir", str(in_dir),
         "--out-dir", str(run_dir),
-        "--eval-report", str(eval_report),
     ] + args_dict_to_argv(build_run_args(args_dict))
 
 
-def _load_eval_report(path: Path) -> Optional[Dict[str, Any]]:
+def _load_parquet_rows(path: Path) -> Optional[List[Dict[str, Any]]]:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
+        import pyarrow.parquet as pq
 
-
-def _load_manifest(path: Path) -> Optional[List[Dict[str, Any]]]:
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return pq.read_table(path).to_pylist()
     except Exception:
         return None
 
@@ -318,61 +310,20 @@ def validate_args_dict(args_dict: Dict[str, Any]) -> List[str]:
     return errors
 
 
-def _metrics_from_eval_report(
-    report: Dict[str, Any],
-    manifest: Optional[List[Dict[str, Any]]] = None,
-) -> Dict[str, float]:
+def _metrics_from_video_rows(rows: Optional[List[Dict[str, Any]]]) -> Dict[str, float]:
+    if not rows:
+        return {}
+
     metrics: Dict[str, float] = {}
-    aggregate = report.get("aggregate")
-    if isinstance(aggregate, dict):
-        for key in (
-            "quality_score",
-            "swap_rate",
-            "missing_rate",
-            "outlier_rate",
-            "sanity_reject_rate",
-            "pp_filled_frac",
-            "pp_smoothing_delta",
-        ):
-            val = aggregate.get(key)
-            if isinstance(val, (int, float)) and not isinstance(val, bool):
-                metrics[key] = float(val)
-
-    id_map: Dict[str, int] = {}
-    slug_map: Dict[str, int] = {}
-    quality_map: Dict[str, float] = {}
-    if manifest:
-        for entry in manifest:
-            if not isinstance(entry, dict):
-                continue
-            n = entry.get("num_frames")
-            if not isinstance(n, (int, float)) or n <= 0:
-                continue
-            if entry.get("id"):
-                id_map[str(entry.get("id"))] = int(n)
-            if entry.get("slug"):
-                slug_map[str(entry.get("slug"))] = int(n)
-            q = entry.get("quality_score")
-            if isinstance(q, (int, float)) and not isinstance(q, bool):
-                if entry.get("id"):
-                    quality_map[str(entry.get("id"))] = float(q)
-                if entry.get("slug"):
-                    quality_map[str(entry.get("slug"))] = float(q)
-
-    videos = report.get("videos") or []
-    miss_1_total = 0.0
-    miss_1_frames = 0.0
-    miss_2_total = 0.0
-    miss_2_frames = 0.0
-    out_1_total = 0.0
-    out_1_frames = 0.0
-    out_2_total = 0.0
-    out_2_frames = 0.0
-    san_1_total = 0.0
-    san_1_frames = 0.0
-    san_2_total = 0.0
-    san_2_frames = 0.0
     frames_total = 0.0
+    quality_weighted_sum = 0.0
+    quality_weighted_frames = 0.0
+    miss_1_total = 0.0
+    miss_2_total = 0.0
+    out_1_total = 0.0
+    out_2_total = 0.0
+    san_1_total = 0.0
+    san_2_total = 0.0
     missing_total = 0.0
     outlier_total = 0.0
     sanity_total = 0.0
@@ -382,111 +333,88 @@ def _metrics_from_eval_report(
     pp_filled_seen = False
     pp_delta_weighted_sum = 0.0
     pp_delta_weighted_frames = 0.0
-    missing_gap_p90_sum = 0.0
-    missing_gap_p90_frames = 0.0
-    occluded_gap_p90_sum = 0.0
-    occluded_gap_p90_frames = 0.0
-    quality_weighted_sum = 0.0
-    quality_weighted_frames = 0.0
-    eval_entries = []
-    for item in videos:
-        if not isinstance(item, dict):
-            continue
-        eval_part = item.get("eval")
-        if isinstance(eval_part, dict):
-            eval_entries.append(eval_part)
-        n = 0
-        meta = item.get("meta") or {}
-        if isinstance(meta, dict):
-            n = meta.get("num_frames") or 0
-        if not n:
-            vid = item.get("id")
-            slug = item.get("slug")
-            if vid is not None:
-                n = id_map.get(str(vid), 0)
-            if not n and slug is not None:
-                n = slug_map.get(str(slug), 0)
-        if not n or not isinstance(eval_part, dict):
-            continue
-        n = float(n)
-        frames_total += n
-        missing_total += float(eval_part.get("missing_frames_1") or 0) + float(eval_part.get("missing_frames_2") or 0)
-        outlier_total += float(eval_part.get("outlier_frames_1") or 0) + float(eval_part.get("outlier_frames_2") or 0)
-        sanity_total += float(eval_part.get("sanity_reject_frames_1") or 0) + float(eval_part.get("sanity_reject_frames_2") or 0)
-        occluded_total += float(eval_part.get("occluded_frames_1") or 0) + float(eval_part.get("occluded_frames_2") or 0)
-        swap_total += float(eval_part.get("swap_frames") or 0)
-        if "pp_filled_left" in eval_part or "pp_filled_right" in eval_part:
-            pp_filled_seen = True
-            pp_filled_total += float(eval_part.get("pp_filled_left") or 0) + float(eval_part.get("pp_filled_right") or 0)
-        pp_delta_vals = []
-        if eval_part.get("pp_smoothing_delta_left") is not None:
-            pp_delta_vals.append(float(eval_part.get("pp_smoothing_delta_left")))
-        if eval_part.get("pp_smoothing_delta_right") is not None:
-            pp_delta_vals.append(float(eval_part.get("pp_smoothing_delta_right")))
-        if pp_delta_vals:
-            pp_delta_weighted_sum += (sum(pp_delta_vals) / len(pp_delta_vals)) * n
-            pp_delta_weighted_frames += n
-        missing_gap_vals = []
-        if eval_part.get("missing_gap_p90_1") is not None:
-            missing_gap_vals.append(float(eval_part.get("missing_gap_p90_1")))
-        if eval_part.get("missing_gap_p90_2") is not None:
-            missing_gap_vals.append(float(eval_part.get("missing_gap_p90_2")))
-        if missing_gap_vals:
-            missing_gap_p90 = max(missing_gap_vals)
-            missing_gap_p90_sum += (missing_gap_p90 / n) * n
-            missing_gap_p90_frames += n
-        occluded_gap_vals = []
-        if eval_part.get("occluded_gap_p90_1") is not None:
-            occluded_gap_vals.append(float(eval_part.get("occluded_gap_p90_1")))
-        if eval_part.get("occluded_gap_p90_2") is not None:
-            occluded_gap_vals.append(float(eval_part.get("occluded_gap_p90_2")))
-        if occluded_gap_vals:
-            occluded_gap_p90 = max(occluded_gap_vals)
-            occluded_gap_p90_sum += (occluded_gap_p90 / n) * n
-            occluded_gap_p90_frames += n
-        q = None
-        vid = item.get("id")
-        slug = item.get("slug")
-        if vid is not None:
-            q = quality_map.get(str(vid))
-        if q is None and slug is not None:
-            q = quality_map.get(str(slug))
-        if q is not None:
-            quality_weighted_sum += float(q) * n
-            quality_weighted_frames += n
-        if "missing_frames_1" in eval_part:
-            miss_1_total += float(eval_part.get("missing_frames_1", 0))
-            miss_1_frames += n
-        if "missing_frames_2" in eval_part:
-            miss_2_total += float(eval_part.get("missing_frames_2", 0))
-            miss_2_frames += n
-        if "outlier_frames_1" in eval_part:
-            out_1_total += float(eval_part.get("outlier_frames_1", 0))
-            out_1_frames += n
-        if "outlier_frames_2" in eval_part:
-            out_2_total += float(eval_part.get("outlier_frames_2", 0))
-            out_2_frames += n
-        if "sanity_reject_frames_1" in eval_part:
-            san_1_total += float(eval_part.get("sanity_reject_frames_1", 0))
-            san_1_frames += n
-        if "sanity_reject_frames_2" in eval_part:
-            san_2_total += float(eval_part.get("sanity_reject_frames_2", 0))
-            san_2_frames += n
+    missing_gap_p90_weighted_sum = 0.0
+    missing_gap_p90_weighted_frames = 0.0
+    occluded_gap_p90_weighted_sum = 0.0
+    occluded_gap_p90_weighted_frames = 0.0
 
-    if miss_1_frames > 0.0:
-        metrics["missing_rate_1"] = float(miss_1_total / miss_1_frames)
-    if miss_2_frames > 0.0:
-        metrics["missing_rate_2"] = float(miss_2_total / miss_2_frames)
-    if out_1_frames > 0.0:
-        metrics["outlier_rate_1"] = float(out_1_total / out_1_frames)
-    if out_2_frames > 0.0:
-        metrics["outlier_rate_2"] = float(out_2_total / out_2_frames)
-    if san_1_frames > 0.0:
-        metrics["sanity_reject_rate_1"] = float(san_1_total / san_1_frames)
-    if san_2_frames > 0.0:
-        metrics["sanity_reject_rate_2"] = float(san_2_total / san_2_frames)
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        num_frames = _coerce_float(row.get("num_frames"))
+        if num_frames is None or num_frames <= 0:
+            continue
+        frames_total += num_frames
+        q = _coerce_float(row.get("quality_score"))
+        if q is not None:
+            quality_weighted_sum += q * num_frames
+            quality_weighted_frames += num_frames
+
+        swap = _coerce_float(row.get("swap_frames"))
+        if swap is not None:
+            swap_total += swap
+
+        missing_1 = _coerce_float(row.get("missing_frames_1")) or 0.0
+        missing_2 = _coerce_float(row.get("missing_frames_2")) or 0.0
+        outlier_1 = _coerce_float(row.get("outlier_frames_1")) or 0.0
+        outlier_2 = _coerce_float(row.get("outlier_frames_2")) or 0.0
+        sanity_1 = _coerce_float(row.get("sanity_reject_frames_1")) or 0.0
+        sanity_2 = _coerce_float(row.get("sanity_reject_frames_2")) or 0.0
+        occluded_1 = _coerce_float(row.get("occluded_frames_1")) or 0.0
+        occluded_2 = _coerce_float(row.get("occluded_frames_2")) or 0.0
+        pp_filled_left = _coerce_float(row.get("pp_filled_left")) or 0.0
+        pp_filled_right = _coerce_float(row.get("pp_filled_right")) or 0.0
+
+        miss_1_total += missing_1
+        miss_2_total += missing_2
+        out_1_total += outlier_1
+        out_2_total += outlier_2
+        san_1_total += sanity_1
+        san_2_total += sanity_2
+        missing_total += missing_1 + missing_2
+        outlier_total += outlier_1 + outlier_2
+        sanity_total += sanity_1 + sanity_2
+        occluded_total += occluded_1 + occluded_2
+        pp_filled_seen = pp_filled_seen or ("pp_filled_left" in row or "pp_filled_right" in row)
+        pp_filled_total += pp_filled_left + pp_filled_right
+
+        pp_delta_vals = []
+        if row.get("pp_smoothing_delta_left") is not None:
+            pp_delta_vals.append(float(row.get("pp_smoothing_delta_left")))
+        if row.get("pp_smoothing_delta_right") is not None:
+            pp_delta_vals.append(float(row.get("pp_smoothing_delta_right")))
+        if pp_delta_vals:
+            pp_delta_weighted_sum += (sum(pp_delta_vals) / len(pp_delta_vals)) * num_frames
+            pp_delta_weighted_frames += num_frames
+
+        missing_gap_vals = []
+        if row.get("missing_gap_p90_1") is not None:
+            missing_gap_vals.append(float(row.get("missing_gap_p90_1")))
+        if row.get("missing_gap_p90_2") is not None:
+            missing_gap_vals.append(float(row.get("missing_gap_p90_2")))
+        if missing_gap_vals:
+            missing_gap_p90_weighted_sum += (max(missing_gap_vals) / num_frames) * num_frames
+            missing_gap_p90_weighted_frames += num_frames
+
+        occluded_gap_vals = []
+        if row.get("occluded_gap_p90_1") is not None:
+            occluded_gap_vals.append(float(row.get("occluded_gap_p90_1")))
+        if row.get("occluded_gap_p90_2") is not None:
+            occluded_gap_vals.append(float(row.get("occluded_gap_p90_2")))
+        if occluded_gap_vals:
+            occluded_gap_p90_weighted_sum += (max(occluded_gap_vals) / num_frames) * num_frames
+            occluded_gap_p90_weighted_frames += num_frames
+
+    if quality_weighted_frames > 0.0:
+        metrics["quality_score"] = float(quality_weighted_sum / quality_weighted_frames)
     if frames_total > 0.0:
         metrics["swap_rate"] = float(swap_total / frames_total)
+        metrics["missing_rate_1"] = float(miss_1_total / frames_total)
+        metrics["missing_rate_2"] = float(miss_2_total / frames_total)
+        metrics["outlier_rate_1"] = float(out_1_total / frames_total)
+        metrics["outlier_rate_2"] = float(out_2_total / frames_total)
+        metrics["sanity_reject_rate_1"] = float(san_1_total / frames_total)
+        metrics["sanity_reject_rate_2"] = float(san_2_total / frames_total)
         metrics["missing_rate"] = float(missing_total / (2.0 * frames_total))
         metrics["outlier_rate"] = float(outlier_total / (2.0 * frames_total))
         metrics["sanity_reject_rate"] = float(sanity_total / (2.0 * frames_total))
@@ -495,15 +423,10 @@ def _metrics_from_eval_report(
             metrics["pp_filled_frac"] = float(pp_filled_total / (2.0 * frames_total))
     if pp_delta_weighted_frames > 0.0:
         metrics["pp_smoothing_delta"] = float(pp_delta_weighted_sum / pp_delta_weighted_frames)
-    if missing_gap_p90_frames > 0.0:
-        metrics["missing_gap_p90_frac"] = float(missing_gap_p90_sum / missing_gap_p90_frames)
-    if occluded_gap_p90_frames > 0.0:
-        metrics["occluded_gap_p90_frac"] = float(occluded_gap_p90_sum / occluded_gap_p90_frames)
-    if quality_weighted_frames > 0.0:
-        metrics["quality_score"] = float(quality_weighted_sum / quality_weighted_frames)
-
-    if not metrics and eval_entries:
-        metrics = _mean_numeric(eval_entries)
+    if missing_gap_p90_weighted_frames > 0.0:
+        metrics["missing_gap_p90_frac"] = float(missing_gap_p90_weighted_sum / missing_gap_p90_weighted_frames)
+    if occluded_gap_p90_weighted_frames > 0.0:
+        metrics["occluded_gap_p90_frac"] = float(occluded_gap_p90_weighted_sum / occluded_gap_p90_weighted_frames)
     return metrics
 
 
@@ -515,18 +438,10 @@ def _worker_run_one(
     resume: bool,
 ) -> Dict[str, Any]:
     run_dir = Path(out_dir) / "_tune_tmp" / config_id
-    eval_report_path = run_dir / "eval_report.json"
+    videos_parquet_path = run_dir / "videos.parquet"
     try:
-        if resume and eval_report_path.exists():
-            metrics: Dict[str, float] = {}
-            report = _load_eval_report(eval_report_path)
-            if report is not None:
-                manifest = _load_manifest(run_dir / "manifest.json")
-                metrics = _metrics_from_eval_report(report, manifest)
-            if not metrics:
-                manifest = _load_manifest(run_dir / "manifest.json")
-                if manifest:
-                    metrics = _mean_numeric(manifest)
+        if resume and videos_parquet_path.exists():
+            metrics = _metrics_from_video_rows(_load_parquet_rows(videos_parquet_path))
             return {
                 "ok": True,
                 "config_id": config_id,
@@ -543,7 +458,6 @@ def _worker_run_one(
         argv = [
             "--in-dir", str(in_dir),
             "--out-dir", str(run_dir),
-            "--eval-report", str(eval_report_path),
         ] + args_dict_to_argv(run_args)
 
         res = run_pipeline(argv)
@@ -555,16 +469,7 @@ def _worker_run_one(
                 "error": res.get("error") or "run_pipeline failed",
             }
 
-        metrics: Dict[str, float] = {}
-        if eval_report_path.exists():
-            report = _load_eval_report(eval_report_path)
-            if report is not None:
-                manifest = _load_manifest(run_dir / "manifest.json")
-                metrics = _metrics_from_eval_report(report, manifest)
-        if not metrics:
-            manifest = _load_manifest(run_dir / "manifest.json")
-            if manifest:
-                metrics = _mean_numeric(manifest)
+        metrics = _metrics_from_video_rows(_load_parquet_rows(videos_parquet_path))
 
         config_path = run_dir / "config.json"
         config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -594,19 +499,7 @@ def run_one_config(argv: List[str], run_dir: str | Path) -> Dict[str, Any]:
     if not res.get("ok"):
         return {"ok": False, "error": res.get("error") or "run_pipeline failed"}
 
-    metrics: Dict[str, float] = {}
-    eval_report_path = run_dir / "eval_report.json"
-    if eval_report_path.exists():
-        report = _load_eval_report(eval_report_path)
-        if report is not None:
-            manifest = _load_manifest(run_dir / "manifest.json")
-            metrics = _metrics_from_eval_report(report, manifest)
-
-    if not metrics:
-        manifest_path = run_dir / "manifest.json"
-        manifest = _load_manifest(manifest_path)
-        if manifest:
-            metrics = _mean_numeric(manifest)
+    metrics = _metrics_from_video_rows(_load_parquet_rows(run_dir / "videos.parquet"))
 
     args_dict = _argv_to_args_dict(argv)
     run_args = _filter_args(args_dict, drop_flags=RUNTIME_FLAGS)
@@ -1156,26 +1049,28 @@ def prepare_runs(
     for args_dict in args_dicts:
         normalized = normalize_args_dict(args_dict)
         run_dir = build_run_dir(out_dir, normalized)
-        eval_report = run_dir / "eval_report.json"
+        videos_parquet = run_dir / "videos.parquet"
+        runs_parquet = run_dir / "runs.parquet"
         argv = build_run_argv(in_dir, out_dir, normalized)
         run_args = build_run_args(normalized)
         run = {
             "id": run_dir.name,
             "run_dir": run_dir,
-            "eval_report_path": eval_report,
+            "videos_parquet_path": videos_parquet,
+            "runs_parquet_path": runs_parquet,
             "argv": argv,
             "args": normalized,
             "run_args": run_args,
             "skipped": False,
-            "eval_report": None,
+            "video_metrics": None,
             "aggregate": None,
         }
-        if resume and eval_report.exists():
-            report = _load_eval_report(eval_report)
-            if report is not None:
+        if resume and videos_parquet.exists():
+            metrics = _metrics_from_video_rows(_load_parquet_rows(videos_parquet))
+            if metrics:
                 run["skipped"] = True
-                run["eval_report"] = report
-                run["aggregate"] = report.get("aggregate")
+                run["video_metrics"] = metrics
+                run["aggregate"] = metrics
         runs.append(run)
     return runs
 

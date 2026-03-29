@@ -216,7 +216,28 @@ class HandTracker:
         self.last_valid_landmarks = tracked_landmarks
         return tracked_landmarks
 
-def smooth_tracks(frames: List[Dict[str, Any]], window_size=5):
+def _is_frame_record(frame: Any) -> bool:
+    return hasattr(frame, "hand_1") and hasattr(frame, "hand_2") and hasattr(frame, "diagnostics")
+
+
+def _get_hand_landmarks(frame: Any, hand_key: str):
+    if _is_frame_record(frame):
+        hand = frame.hand_1 if hand_key in {"hand 1", "hand_1"} else frame.hand_2
+        return hand.landmarks
+    return frame.get(hand_key)
+
+
+def _set_hand_landmarks(frame: Any, hand_key: str, landmarks):
+    if _is_frame_record(frame):
+        hand = frame.hand_1 if hand_key in {"hand 1", "hand_1"} else frame.hand_2
+        hand.landmarks = landmarks
+        frame.both_hands = bool(frame.hand_1.landmarks is not None and frame.hand_2.landmarks is not None)
+        return
+    frame[hand_key] = landmarks
+    frame["both_hands"] = 1 if (frame.get("hand 1") is not None and frame.get("hand 2") is not None) else 0
+
+
+def smooth_tracks(frames: List[Any], window_size=5):
     """
     Apply global smoothing to the collected frames.
     Simple moving average for now, but can be upgraded to Gaussian.
@@ -230,7 +251,7 @@ def smooth_tracks(frames: List[Dict[str, Any]], window_size=5):
     def get_hand_array(hand_key):
         arr = []
         for fr in frames:
-            h = fr.get(hand_key)
+            h = _get_hand_landmarks(fr, hand_key)
             if h is None:
                 arr.append(None)
             else:
@@ -246,22 +267,20 @@ def smooth_tracks(frames: List[Dict[str, Any]], window_size=5):
             if smoothed_arr[i] is not None:
                 # Reconstruct list of dicts
                 flat = smoothed_arr[i]
+                original = _get_hand_landmarks(fr, hand_key)
                 h = []
                 for j in range(0, len(flat), 3):
+                    visibility = None
+                    if original is not None and j // 3 < len(original):
+                        visibility = original[j // 3].get("visibility")
                     h.append({
                         "x": flat[j],
                         "y": flat[j+1],
                         "z": flat[j+2],
-                        "visibility": 1.0 # Visibility info is lost in smoothing, assume 1.0 or keep original?
-                        # Ideally we should keep original visibility if possible, but for now 1.0 is fine for smoothed
+                        "visibility": visibility,
                     })
-                    # Restore visibility from original if available?
-                    # The original might be None if it was a gap filled by smoothing (not implemented yet)
-                    # For now, we only smooth existing points.
-                    if fr.get(hand_key) is not None and j//3 < len(fr[hand_key]):
-                         h[-1]["visibility"] = fr[hand_key][j//3].get("visibility", 0.0)
-                
-                fr[hand_key] = h
+
+                _set_hand_landmarks(fr, hand_key, h)
 
     for hand_key in ["hand 1", "hand 2"]:
         data = get_hand_array(hand_key)
@@ -296,4 +315,3 @@ def smooth_tracks(frames: List[Dict[str, Any]], window_size=5):
             smoothed_data[i] = avg.tolist()
             
         set_hand_array(hand_key, smoothed_data)
-

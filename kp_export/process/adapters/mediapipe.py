@@ -2,13 +2,14 @@ from __future__ import annotations
 from typing import Any, Optional, Tuple
 from pathlib import Path
 
-from ..mp.mp_utils import create_hand_detector, create_pose_detector, resolve_task_model_path
-from .process_constants import (
+from ...mp.mp_utils import create_hand_detector, create_pose_detector, resolve_task_model_path
+from ..heuristics.constants import (
     HAND_SP_MIN_DETECTION,
     HAND_SP_MIN_TRACKING,
     SP_MIN_DET_MULTIPLIER,
     SP_MIN_TRACK_MULTIPLIER,
 )
+from .protocols import DetectorFactoryProtocol
 
 
 def _resolve_model_paths(
@@ -84,3 +85,34 @@ def _initialize_detectors(
             tasks_delegate=tasks_delegate,
         )
     return hands_detector, pose_detector, hands_sp
+
+
+class MediaPipeDetectorFactory:
+    def create(
+        self,
+        *,
+        backend: str,
+        mp: Any,
+        mp_solutions: Any,
+        hand_model_path: Optional[Path],
+        pose_model_path: Optional[Path],
+        min_det: float,
+        min_track: float,
+        pose_complexity: int,
+        tasks_delegate: Optional[str],
+        second_pass: bool,
+        world_coords: bool,
+    ):
+        return _initialize_detectors(
+            backend=backend,
+            mp=mp,
+            mp_solutions=mp_solutions,
+            hand_model_path=hand_model_path,
+            pose_model_path=pose_model_path,
+            min_det=min_det,
+            min_track=min_track,
+            pose_complexity=pose_complexity,
+            tasks_delegate=tasks_delegate,
+            second_pass=second_pass,
+            world_coords=world_coords,
+        )

@@ -1,5 +1,5 @@
 from __future__ import annotations
-import argparse, csv, json, sys, traceback
+import argparse, csv, json, sys, traceback, uuid
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 
@@ -9,10 +9,26 @@ if str(ROOT) not in sys.path:
 
 from kp_export.core.utils import parse_keep_indices
 from kp_export.annotations import load_skip_ids
-from kp_export.core.io_utils import combine_to_single_json
-from kp_export.parallel import process_worker, slug_for
+from kp_export.config import (
+    DebugConfig,
+    ExtractorConfig,
+    LoggingConfig,
+    MediaPipeConfig,
+    OcclusionConfig,
+    OutputConfig,
+    PoseConfig,
+    PostprocessConfig,
+    RuntimeConfig,
+    SanityConfig,
+    ScoreConfig,
+    SecondPassConfig,
+    TrackingConfig,
+    VideoConfig,
+)
+from kp_export.parallel import normalize_sample_id, process_worker, slug_for
 from kp_export.mp.mp_utils import resolve_task_model_path
 from kp_export.core.logging_utils import configure_logging, log_metrics, track_runtime
+from kp_export.tasks import TaskSpec
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 
@@ -185,22 +201,148 @@ def _resolve_video_path(
     return picked, None
 
 
+def _normalize_ndjson_base(out_dir: Path, raw: str) -> str:
+    raw_text = str(raw or "").strip()
+    if not raw_text:
+        return ""
+    base = Path(raw_text)
+    name = base.name or "frames.ndjson"
+    if not Path(name).suffix:
+        name = f"{name}.ndjson"
+    debug_dir = out_dir / "debug"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    return str((debug_dir / name).resolve())
+
+
+def _versions_snapshot() -> Dict[str, Any]:
+    versions: Dict[str, Any] = {"python": sys.version}
+    try:
+        import cv2
+
+        versions["cv2"] = cv2.__version__
+    except Exception:
+        versions["cv2"] = None
+    try:
+        import mediapipe as mp
+
+        versions["mediapipe"] = getattr(mp, "__version__", None)
+    except Exception:
+        versions["mediapipe"] = None
+    return versions
+
+
+def _mean(values: List[float]) -> Optional[float]:
+    return (sum(values) / len(values)) if values else None
+
+
+def _safe_rate(num: Any, denom: Any) -> Optional[float]:
+    if denom and denom > 0:
+        return float(num) / float(denom)
+    return None
+
+
+def _shutdown_process_pool_fast(executor: Optional[ProcessPoolExecutor]) -> None:
+    if executor is None:
+        return
+    try:
+        executor.shutdown(wait=False, cancel_futures=True)
+    except Exception:
+        pass
+
+    processes = getattr(executor, "_processes", None) or {}
+    for proc in list(processes.values()):
+        if proc is None:
+            continue
+        try:
+            if proc.is_alive():
+                proc.terminate()
+        except Exception:
+            pass
+
+    for proc in list(processes.values()):
+        if proc is None:
+            continue
+        try:
+            proc.join(timeout=1.0)
+        except Exception:
+            pass
+        try:
+            if proc.is_alive():
+                kill = getattr(proc, "kill", None)
+                if callable(kill):
+                    kill()
+                else:
+                    proc.terminate()
+        except Exception:
+            pass
+
+
+def _aggregate_video_rows(rows: List[Dict[str, Any]]) -> Dict[str, Optional[float]]:
+    frames_total = 0.0
+    quality_sum = 0.0
+    quality_frames = 0.0
+    swap_total = 0.0
+    missing_total = 0.0
+    outlier_total = 0.0
+    sanity_total = 0.0
+    pp_filled_total = 0.0
+    pp_filled_seen = False
+    pp_delta_weighted_sum = 0.0
+    pp_delta_weighted_frames = 0.0
+
+    for row in rows:
+        num_frames = float(int(row.get("num_frames", 0) or 0))
+        if num_frames <= 0:
+            continue
+        frames_total += num_frames
+        q = row.get("quality_score")
+        if q is not None:
+            quality_sum += float(q) * num_frames
+            quality_frames += num_frames
+        swap_total += float(row.get("swap_frames", 0) or 0)
+        missing_total += float(row.get("missing_frames_1", 0) or 0) + float(row.get("missing_frames_2", 0) or 0)
+        outlier_total += float(row.get("outlier_frames_1", 0) or 0) + float(row.get("outlier_frames_2", 0) or 0)
+        sanity_total += float(row.get("sanity_reject_frames_1", 0) or 0) + float(row.get("sanity_reject_frames_2", 0) or 0)
+        if row.get("pp_filled_left") is not None or row.get("pp_filled_right") is not None:
+            pp_filled_seen = True
+            pp_filled_total += float(row.get("pp_filled_left", 0) or 0) + float(row.get("pp_filled_right", 0) or 0)
+        pp_delta_vals = []
+        if row.get("pp_smoothing_delta_left") is not None:
+            pp_delta_vals.append(float(row.get("pp_smoothing_delta_left")))
+        if row.get("pp_smoothing_delta_right") is not None:
+            pp_delta_vals.append(float(row.get("pp_smoothing_delta_right")))
+        if pp_delta_vals:
+            pp_delta_weighted_sum += (sum(pp_delta_vals) / len(pp_delta_vals)) * num_frames
+            pp_delta_weighted_frames += num_frames
+
+    return {
+        "quality_score": (quality_sum / quality_frames) if quality_frames > 0.0 else None,
+        "swap_rate": (swap_total / frames_total) if frames_total > 0.0 else None,
+        "missing_rate": (missing_total / (2.0 * frames_total)) if frames_total > 0.0 else None,
+        "outlier_rate": (outlier_total / (2.0 * frames_total)) if frames_total > 0.0 else None,
+        "sanity_reject_rate": (sanity_total / (2.0 * frames_total)) if frames_total > 0.0 else None,
+        "pp_filled_frac": (pp_filled_total / (2.0 * frames_total)) if pp_filled_seen and frames_total > 0.0 else None,
+        "pp_smoothing_delta": (pp_delta_weighted_sum / pp_delta_weighted_frames) if pp_delta_weighted_frames > 0.0 else None,
+    }
+
+
 def run_pipeline(argv: list[str]) -> dict:
     return main(argv, _print_errors=False)
 
 
 def main(argv: Optional[List[str]] = None, *, _print_errors: bool = True) -> Dict[str, Any]:
     out_dir: Optional[Path] = None
-    manifest_path: Optional[Path] = None
-    eval_report_path = ""
     ap = argparse.ArgumentParser(
-        "Extract Pose+Hand landmarks to JSON (parallel, memory-safe)."
+        "Extract Pose+Hand landmarks to Zarr + Parquet (parallel, memory-safe)."
     )
     ap.add_argument("--in-dir", type=str, required=True)
     ap.add_argument("--pattern", type=str, default="*.mp4")
-    ap.add_argument("--out-dir", type=str, required=True)
-    ap.add_argument("--combined-json", type=str, default="")
-    ap.add_argument("--combined-with-meta", action="store_true")
+    ap.add_argument(
+        "--out-dir",
+        type=str,
+        required=True,
+        help="Extractor artifact root. Writes landmarks.zarr, videos.parquet, frames.parquet, and runs.parquet here.",
+    )
     ap.add_argument("--only-list", type=str, default="",
                     help="Optional path to a txt file with video names (one per line, with or without extension) to process from in-dir.")
     ap.add_argument("--segments-manifest", type=str, default="",
@@ -228,7 +370,12 @@ def main(argv: Optional[List[str]] = None, *, _print_errors: bool = True) -> Dic
     ap.add_argument("--pose-side-reassign-ratio", type=float, default=0.85)
     ap.add_argument("--ts-source", type=str, default="auto", choices=["auto", "pos_msec", "frame_fps"])
     ap.add_argument("--skip-existing", action="store_true")
-    ap.add_argument("--ndjson", type=str, default="")
+    ap.add_argument(
+        "--ndjson",
+        type=str,
+        default="",
+        help="Debug-only NDJSON base name. Files are written under <out-dir>/debug/ and are not part of the main output contract.",
+    )
     ap.add_argument("--jobs", type=int, default=1)
     ap.add_argument("--log-dir", type=str, default="outputs/logs",
                     help="Directory where structured kp_export logs will be written.")
@@ -236,7 +383,6 @@ def main(argv: Optional[List[str]] = None, *, _print_errors: bool = True) -> Dic
                     choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
                     help="Verbosity for kp_export logging output.")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--eval-report", type=str, default="")
     ap.add_argument("--debug-video", type=str, default="")
 
     ap.add_argument("--mp-backend", type=str, default="solutions",
@@ -325,77 +471,105 @@ def main(argv: Optional[List[str]] = None, *, _print_errors: bool = True) -> Dic
         in_dir = Path(args.in_dir)
         out_dir = Path(args.out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
+        ndjson_base = _normalize_ndjson_base(out_dir, args.ndjson)
 
         keep = parse_keep_indices(args.keep_pose_indices)
         sanity_scale_range = _parse_range(args.sanity_scale_range)
 
-        cfg: Dict[str, Any] = {
-            "in_dir": str(in_dir),
-            "out_dir": str(out_dir),
-            "world_coords": world_coords,
-            "keep_pose_indices": keep,
-            "stride": max(1, args.stride),
-            "short_side": args.short_side,
-            "min_det": args.min_det,
-            "min_track": args.min_track,
-            "pose_every": max(1, args.pose_every),
-            "pose_complexity": args.pose_complexity,
-            "ts_source": args.ts_source,
-            "min_hand_score": args.min_hand_score,
-            "hand_score_lo": args.hand_score_lo,
-            "hand_score_hi": args.hand_score_hi,
-            "hand_score_source": str(args.hand_score_source),
-            "tracker_init_score": float(args.tracker_init_score),
-            "anchor_score": float(args.anchor_score),
-            "pose_dist_qual_min": float(args.pose_dist_qual_min),
-            "tracker_update_score": float(args.tracker_update_score),
-            "pose_side_reassign_ratio": float(args.pose_side_reassign_ratio),
-            "pose_ema": args.pose_ema,
-            "ndjson": str(args.ndjson) if args.ndjson else "",
-            "second_pass": bool(args.second_pass),
-            "sp_trigger_below": args.sp_trigger_below,
-            "sp_roi_frac": args.sp_roi_frac,
-            "sp_margin": args.sp_margin,
-            "sp_escalate_step": args.sp_escalate_step,
-            "sp_escalate_max": args.sp_escalate_max,
-            "sp_hands_up_only": bool(args.sp_hands_up_only),
-            "sp_jitter_px": int(args.sp_jitter_px),
-            "sp_jitter_rings": int(args.sp_jitter_rings),
-            "sp_center_penalty": args.sp_center_penalty,
-            "sp_label_relax": args.sp_label_relax,
-            "sp_overlap_iou": args.sp_overlap_iou,
-            "sp_overlap_shrink": args.sp_overlap_shrink,
-            "sp_overlap_penalty_mult": args.sp_overlap_penalty_mult,
-            "sp_overlap_require_label": bool(args.sp_overlap_require_label),
-            "sp_debug_roi": bool(args.sp_debug_roi),
-            "interp_hold": int(args.interp_hold),
-            "write_hand_mask": bool(args.write_hand_mask),
-            "track_max_gap": int(args.track_max_gap),
-            "track_score_decay": float(args.track_score_decay),
-            "track_reset_ms": int(args.track_reset_ms),
-            "occ_hyst_frames": int(args.occ_hyst_frames),
-            "occ_return_k": float(args.occ_return_k),
-            "sanity_scale_range": sanity_scale_range,
-            "sanity_wrist_k": float(args.sanity_wrist_k),
-            "sanity_bone_tol": float(args.sanity_bone_tol),
-            "sanity_pass2": bool(args.sanity_pass2),
-            "sanity_anchor_max_gap": int(args.sanity_anchor_max_gap),
-            "sanity_enable": not bool(args.no_sanity),
-            "sanitize_rejects": bool(args.sanitize_rejects),
-            "postprocess": bool(args.postprocess),
-            "pp_max_gap": int(args.pp_max_gap),
-            "pp_smoother": str(args.pp_smoother),
-            "pp_only_anchors": bool(args.pp_only_anchors),
-            "mp_backend": mp_backend,
-            "hand_task": hand_task_path,
-            "pose_task": pose_task_path,
-            "mp_tasks_delegate": mp_tasks_delegate,
-            "log_dir": str(Path(args.log_dir or "outputs/logs")),
-            "log_level": log_level,
-            "seed": int(args.seed),
-            "eval_report": str(args.eval_report) if args.eval_report else "",
-            "debug_video": str(args.debug_video) if args.debug_video else "",
-        }
+        config = ExtractorConfig(
+            video=VideoConfig(
+                in_dir=str(in_dir),
+                out_dir=str(out_dir),
+                pattern=str(args.pattern),
+                stride=max(1, args.stride),
+                short_side=int(args.short_side),
+                ts_source=str(args.ts_source),
+            ),
+            pose=PoseConfig(
+                keep_pose_indices=keep,
+                world_coords=bool(world_coords),
+                pose_every=max(1, args.pose_every),
+                pose_complexity=int(args.pose_complexity),
+                pose_ema=float(args.pose_ema),
+            ),
+            score=ScoreConfig(
+                min_det=float(args.min_det),
+                min_track=float(args.min_track),
+                min_hand_score=float(args.min_hand_score),
+                hand_score_lo=float(args.hand_score_lo),
+                hand_score_hi=float(args.hand_score_hi),
+                hand_score_source=str(args.hand_score_source),
+                tracker_init_score=float(args.tracker_init_score),
+                anchor_score=float(args.anchor_score),
+                tracker_update_score=float(args.tracker_update_score),
+                pose_dist_qual_min=float(args.pose_dist_qual_min),
+                pose_side_reassign_ratio=float(args.pose_side_reassign_ratio),
+            ),
+            second_pass=SecondPassConfig(
+                enabled=bool(args.second_pass),
+                trigger_below=float(args.sp_trigger_below),
+                roi_frac=float(args.sp_roi_frac),
+                margin=float(args.sp_margin),
+                escalate_step=float(args.sp_escalate_step),
+                escalate_max=float(args.sp_escalate_max),
+                hands_up_only=bool(args.sp_hands_up_only),
+                jitter_px=int(args.sp_jitter_px),
+                jitter_rings=int(args.sp_jitter_rings),
+                center_penalty=float(args.sp_center_penalty),
+                label_relax=float(args.sp_label_relax),
+                overlap_iou=float(args.sp_overlap_iou),
+                overlap_shrink=float(args.sp_overlap_shrink),
+                overlap_penalty_mult=float(args.sp_overlap_penalty_mult),
+                overlap_require_label=bool(args.sp_overlap_require_label),
+                debug_roi=bool(args.sp_debug_roi),
+            ),
+            tracking=TrackingConfig(
+                interp_hold=int(args.interp_hold),
+                write_hand_mask=bool(args.write_hand_mask),
+                max_gap=int(args.track_max_gap),
+                score_decay=float(args.track_score_decay),
+                reset_ms=int(args.track_reset_ms),
+            ),
+            occlusion=OcclusionConfig(
+                hyst_frames=int(args.occ_hyst_frames),
+                return_k=float(args.occ_return_k),
+            ),
+            sanity=SanityConfig(
+                enabled=not bool(args.no_sanity),
+                scale_range=sanity_scale_range,
+                wrist_k=float(args.sanity_wrist_k),
+                bone_tol=float(args.sanity_bone_tol),
+                pass2=bool(args.sanity_pass2),
+                anchor_max_gap=int(args.sanity_anchor_max_gap),
+                sanitize_rejects=bool(args.sanitize_rejects),
+            ),
+            postprocess=PostprocessConfig(
+                enabled=bool(args.postprocess),
+                max_gap=int(args.pp_max_gap),
+                smoother=str(args.pp_smoother),
+                only_anchors=bool(args.pp_only_anchors),
+            ),
+            mediapipe=MediaPipeConfig(
+                backend=str(mp_backend),
+                hand_task=str(hand_task_path),
+                pose_task=str(pose_task_path),
+                tasks_delegate=str(mp_tasks_delegate),
+            ),
+            debug=DebugConfig(
+                ndjson=str(ndjson_base),
+                debug_video=str(args.debug_video) if args.debug_video else "",
+            ),
+            output=OutputConfig(stage_dir=""),
+            runtime=RuntimeConfig(
+                jobs=int(args.jobs),
+                seed=int(args.seed),
+                video_count=1,
+            ),
+            logging=LoggingConfig(
+                log_dir=str(Path(args.log_dir or "outputs/logs")),
+                log_level=str(log_level),
+            ),
+        )
 
         segments_manifest = Path(args.segments_manifest) if args.segments_manifest else None
 
@@ -409,18 +583,26 @@ def main(argv: Optional[List[str]] = None, *, _print_errors: bool = True) -> Dic
                 "skip_count": len(skip_ids),
             })
 
-        cfg.update({
-            "world_coords": world_coords,
-            "stride": max(1, args.stride),
-            "short_side": args.short_side,
-            "jobs": args.jobs,
-            "mp_backend": mp_backend,
-            "log_dir": str(Path(args.log_dir or "outputs/logs")),
-            "log_level": log_level,
-        })
+        versions = _versions_snapshot()
+        run_id = uuid.uuid4().hex
+        try:
+            from kp_export.output.writer import ExtractorOutputWriter
+        except Exception as exc:
+            raise SystemExit(
+                "Zarr/Parquet output dependencies are missing. Install 'zarr', 'numcodecs', and 'pyarrow'."
+            ) from exc
 
-        tasks: List[Dict[str, Any]] = []
+        writer = ExtractorOutputWriter(
+            out_dir=out_dir,
+            run_id=run_id,
+            args_snapshot=vars(args),
+            versions=versions,
+        )
+        config = config.with_stage_dir(str(writer.current_run_dir.resolve()))
+
+        tasks: List[TaskSpec] = []
         total_items = 0
+        skipped_existing = 0
         if segments_manifest:
             rows = _read_segments_manifest(segments_manifest)
             segments = _parse_segment_rows(rows)
@@ -454,6 +636,7 @@ def main(argv: Optional[List[str]] = None, *, _print_errors: bool = True) -> Dic
             missing_videos: List[str] = []
             dup_video_matches = 0
             seen_seg_uids = set()
+            seen_sample_ids = set()
             for seg in segments:
                 video_id = str(seg.get("video_id", "")).strip()
                 seg_uid = str(seg.get("seg_uid", "")).strip()
@@ -474,17 +657,30 @@ def main(argv: Optional[List[str]] = None, *, _print_errors: bool = True) -> Dic
                 if dup_type:
                     dup_video_matches += 1
                     print(f"[WARN] multiple video matches by {dup_type} for {video_id}, using {vpath}")
-                out_path = out_dir / f"{seg_uid}.json"
-                if args.skip_existing and out_path.exists():
-                    print(f"[SKIP] {out_path.name}")
+                sample_id = normalize_sample_id(seg_uid)
+                if sample_id in seen_sample_ids:
+                    print(f"[WARN] duplicate normalized sample_id {sample_id} from seg_uid {seg_uid}, skipping duplicate")
+                    continue
+                if args.skip_existing and writer.is_sample_committed(sample_id):
+                    print(f"[SKIP] {sample_id}")
+                    skipped_existing += 1
                     continue
                 seen_seg_uids.add(seg_uid)
-                tasks.append({
-                    "vpath": str(vpath),
-                    "cfg": cfg,
-                    "slug": seg_uid,
-                    "segment": seg,
-                })
+                seen_sample_ids.add(sample_id)
+                ndjson_path = ""
+                if config.debug.ndjson:
+                    base = Path(config.debug.ndjson)
+                    ndjson_path = str(base.with_name(f"{base.stem}.{sample_id}{base.suffix}"))
+                tasks.append(TaskSpec(
+                    sample_id=sample_id,
+                    slug=sample_id,
+                    source_video=str(vpath),
+                    config_dict=config.to_dict(),
+                    frame_start=seg.get("start"),
+                    frame_end=seg.get("end"),
+                    segment_meta=dict(seg),
+                    ndjson_path=ndjson_path,
+                ))
 
             if missing_videos:
                 missing_set = sorted(set(missing_videos))
@@ -543,264 +739,143 @@ def main(argv: Optional[List[str]] = None, *, _print_errors: bool = True) -> Dic
                     print(f"[WARN] duplicate slug for {v} -> {slug}, skipping duplicate")
                     continue
                 seen_slugs.add(slug)
-                out_path = out_dir / f"{slug}.json"
-                if args.skip_existing and out_path.exists():
-                    print(f"[SKIP] {out_path.name}")
+                sample_id = normalize_sample_id(slug)
+                if args.skip_existing and writer.is_sample_committed(sample_id):
+                    print(f"[SKIP] {sample_id}")
+                    skipped_existing += 1
                     continue
-                tasks.append({"vpath": str(v), "cfg": cfg})
+                ndjson_path = ""
+                if config.debug.ndjson:
+                    base = Path(config.debug.ndjson)
+                    ndjson_path = str(base.with_name(f"{base.stem}.{sample_id}{base.suffix}"))
+                tasks.append(TaskSpec(
+                    sample_id=sample_id,
+                    slug=sample_id,
+                    source_video=str(v),
+                    config_dict=config.to_dict(),
+                    ndjson_path=ndjson_path,
+                ))
 
             total_items = len(videos)
 
-        if not tasks:
+        if not tasks and skipped_existing <= 0:
             log_metrics(logger, "extract_keypoints.error", {
                 "reason": "no_tasks",
                 "segments_mode": bool(segments_manifest),
             })
             raise SystemExit("No videos/segments to process after filtering.")
 
-        cfg["video_count"] = len(tasks)
+        config = config.with_video_count(len(tasks))
+        tasks = [
+            TaskSpec(
+                sample_id=task.sample_id,
+                slug=task.slug,
+                source_video=task.source_video,
+                config_dict=config.to_dict(),
+                frame_start=task.frame_start,
+                frame_end=task.frame_end,
+                segment_meta=dict(task.segment_meta),
+                debug_video_path=task.debug_video_path,
+                ndjson_path=task.ndjson_path,
+            )
+            for task in tasks
+        ]
 
         log_metrics(logger, "extract_keypoints.tasks_prepared", {
             "scheduled": len(tasks),
             "skipped": max(0, total_items - len(tasks)),
+            "skipped_existing": int(skipped_existing),
             "skip_existing": bool(args.skip_existing),
             "segments_mode": bool(segments_manifest),
         })
 
-        manifest: List[Dict[str, Any]] = []
+        processed_rows: List[Dict[str, Any]] = []
+        failed_count = 0
         with track_runtime(logger, "extract_keypoints.processing", videos=len(tasks), jobs=args.jobs):
-            if args.jobs > 1:
-                with ProcessPoolExecutor(max_workers=args.jobs) as ex:
-                    futs = [ex.submit(process_worker, t) for t in tasks]
+            if args.jobs > 1 and tasks:
+                ex: Optional[ProcessPoolExecutor] = None
+                interrupted = False
+                try:
+                    ex = ProcessPoolExecutor(max_workers=args.jobs)
+                    futs = [ex.submit(process_worker, t.to_payload()) for t in tasks]
                     for fut in as_completed(futs):
                         try:
-                            manifest.append(fut.result())
+                            result = fut.result()
+                            video_row = writer.commit_staged_sample(result["staged_path"])
+                            processed_rows.append(video_row)
                         except Exception as e:
+                            failed_count += 1
                             print(f"[ERROR] {e}")
                             log_metrics(logger, "extract_keypoints.worker_error", {"error": str(e)})
+                except KeyboardInterrupt:
+                    interrupted = True
+                    print("\n[INTERRUPTED] Stopping workers...")
+                    log_metrics(logger, "extract_keypoints.interrupted", {
+                        "jobs": int(args.jobs),
+                        "processed_so_far": len(processed_rows),
+                        "failed_so_far": int(failed_count),
+                    })
+                    if ex is not None:
+                        _shutdown_process_pool_fast(ex)
+                    raise SystemExit(130)
+                finally:
+                    if ex is not None and not interrupted:
+                        ex.shutdown(wait=True, cancel_futures=False)
             else:
-                for t in tasks:
-                    try:
-                        manifest.append(process_worker(t))
-                    except Exception as e:
-                        print(f"[ERROR] {e}")
-                        log_metrics(logger, "extract_keypoints.worker_error", {"error": str(e)})
+                try:
+                    for t in tasks:
+                        try:
+                            result = process_worker(t.to_payload())
+                            video_row = writer.commit_staged_sample(result["staged_path"])
+                            processed_rows.append(video_row)
+                        except Exception as e:
+                            failed_count += 1
+                            print(f"[ERROR] {e}")
+                            log_metrics(logger, "extract_keypoints.worker_error", {"error": str(e)})
+                except KeyboardInterrupt:
+                    print("\n[INTERRUPTED] Stopping...")
+                    log_metrics(logger, "extract_keypoints.interrupted", {
+                        "jobs": 1,
+                        "processed_so_far": len(processed_rows),
+                        "failed_so_far": int(failed_count),
+                    })
+                    raise SystemExit(130)
 
-        def _manifest_sort_key(item: Dict[str, Any]) -> tuple:
-            seg_uid = item.get("seg_uid")
-            if seg_uid:
-                return (str(seg_uid), str(item.get("file", "")))
-            slug = item.get("slug")
-            if slug:
-                return (str(slug), str(item.get("file", "")))
-            return (str(item.get("id", "")), str(item.get("file", "")))
-
-        manifest.sort(key=_manifest_sort_key)
-
-        manifest_path = out_dir / "manifest.json"
-        with manifest_path.open("w", encoding="utf-8") as f:
-            json.dump(manifest, f, ensure_ascii=False, indent=2)
-        print(f"[OK] Manifest written to {manifest_path}")
-
-        if args.eval_report:
-            eval_path = Path(args.eval_report)
-            eval_path.parent.mkdir(parents=True, exist_ok=True)
-            eval_report_path = str(eval_path)
-
-            versions = {"python": sys.version}
-            try:
-                import cv2
-                versions["cv2"] = cv2.__version__
-            except Exception:
-                versions["cv2"] = None
-            try:
-                import mediapipe as mp
-                versions["mediapipe"] = getattr(mp, "__version__", None)
-            except Exception:
-                versions["mediapipe"] = None
-
-            run_meta = {
-                "seed": int(args.seed),
-                "jobs": int(args.jobs),
-                "mp_backend": mp_backend,
-                "args": vars(args),
-                "versions": versions,
-            }
-
-            slug_to_input = {}
-            id_to_input = {}
-            for t in tasks:
-                vpath = Path(t["vpath"])
-                slug = t.get("slug") or slug_for(vpath, in_dir)
-                slug_to_input[slug] = str(vpath)
-                seg = t.get("segment") or {}
-                if seg.get("seg_uid"):
-                    id_to_input.setdefault(str(seg.get("seg_uid")), str(vpath))
-                else:
-                    id_to_input.setdefault(vpath.stem, str(vpath))
-
-            eval_keys = {
-                "missing_frames_1",
-                "missing_frames_2",
-                "occluded_frames_1",
-                "occluded_frames_2",
-                "swap_frames",
-                "dedup_trigger_frames",
-                "sp_attempt_frames_1",
-                "sp_attempt_frames_2",
-                "sp_recovered_frames_1",
-                "sp_recovered_frames_2",
-                "hold_frames_1",
-                "hold_frames_2",
-                "outlier_frames_1",
-                "outlier_frames_2",
-                "sanity_reject_frames_1",
-                "sanity_reject_frames_2",
-                "missing_gap_p50_1",
-                "missing_gap_p90_1",
-                "missing_gap_max_1",
-                "missing_gap_p50_2",
-                "missing_gap_p90_2",
-                "missing_gap_max_2",
-                "occluded_gap_p50_1",
-                "occluded_gap_p90_1",
-                "occluded_gap_max_1",
-                "occluded_gap_p50_2",
-                "occluded_gap_p90_2",
-                "occluded_gap_max_2",
-                "pp_filled_left",
-                "pp_filled_right",
-                "pp_gaps_filled_left",
-                "pp_gaps_filled_right",
-                "pp_smoothing_delta_left",
-                "pp_smoothing_delta_right",
-            }
-
-            def _safe_rate(num, denom):
-                if denom and denom > 0:
-                    return float(num) / float(denom)
-                return None
-
-            videos_report = []
-            quality_scores = []
-            swap_rates = []
-            missing_rates = []
-            outlier_rates = []
-            sanity_rates = []
-            pp_filled_fracs = []
-            pp_smoothing_deltas = []
-
-            for entry in manifest:
-                entry_id = entry.get("id")
-                output_path = entry.get("file", "")
-                slug = entry.get("slug")
-                if not slug and output_path:
-                    slug = Path(output_path).stem
-
-                input_path = ""
-                if slug and slug in slug_to_input:
-                    input_path = slug_to_input[slug]
-                elif entry_id in id_to_input:
-                    input_path = id_to_input[entry_id]
-
-                eval_part = {k: entry[k] for k in eval_keys if k in entry}
-                meta_part = {
-                    k: v for k, v in entry.items()
-                    if k not in eval_keys and k not in ("id", "file")
-                }
-
-                num_frames = entry.get("num_frames") or 0
-                q = entry.get("quality_score")
-                if q is not None:
-                    quality_scores.append(float(q))
-                if eval_part:
-                    swap_rate = _safe_rate(eval_part.get("swap_frames"), num_frames)
-                    missing_rate = _safe_rate(
-                        (eval_part.get("missing_frames_1", 0) + eval_part.get("missing_frames_2", 0)),
-                        2 * num_frames
-                    )
-                    outlier_rate = _safe_rate(
-                        (eval_part.get("outlier_frames_1", 0) + eval_part.get("outlier_frames_2", 0)),
-                        2 * num_frames
-                    )
-                    sanity_rate = _safe_rate(
-                        (eval_part.get("sanity_reject_frames_1", 0) + eval_part.get("sanity_reject_frames_2", 0)),
-                        2 * num_frames
-                    )
-                    if swap_rate is not None:
-                        swap_rates.append(swap_rate)
-                    if missing_rate is not None:
-                        missing_rates.append(missing_rate)
-                    if outlier_rate is not None:
-                        outlier_rates.append(outlier_rate)
-                    if sanity_rate is not None:
-                        sanity_rates.append(sanity_rate)
-                    pp_filled = (
-                        eval_part.get("pp_filled_left", 0) + eval_part.get("pp_filled_right", 0)
-                    )
-                    pp_filled_frac = _safe_rate(pp_filled, 2 * num_frames)
-                    if pp_filled_frac is not None:
-                        pp_filled_fracs.append(pp_filled_frac)
-                    pp_delta_vals = []
-                    if eval_part.get("pp_smoothing_delta_left") is not None:
-                        pp_delta_vals.append(float(eval_part.get("pp_smoothing_delta_left")))
-                    if eval_part.get("pp_smoothing_delta_right") is not None:
-                        pp_delta_vals.append(float(eval_part.get("pp_smoothing_delta_right")))
-                    if pp_delta_vals:
-                        pp_smoothing_deltas.append(sum(pp_delta_vals) / len(pp_delta_vals))
-
-                video_item = {
-                    "id": entry_id,
-                    "slug": slug,
-                    "input": input_path,
-                    "output": output_path,
-                    "meta": meta_part,
-                }
-                if eval_part:
-                    video_item["eval"] = eval_part
-                videos_report.append(video_item)
-
-            videos_report.sort(key=lambda v: (str(v.get("slug") or v.get("id") or ""), str(v.get("output") or "")))
-
-            def _mean(vals):
-                return (sum(vals) / len(vals)) if vals else None
-
-            aggregate = {
-                "quality_score": _mean(quality_scores),
-                "swap_rate": _mean(swap_rates),
-                "missing_rate": _mean(missing_rates),
-                "outlier_rate": _mean(outlier_rates),
-                "sanity_reject_rate": _mean(sanity_rates),
-                "pp_filled_frac": _mean(pp_filled_fracs),
-                "pp_smoothing_delta": _mean(pp_smoothing_deltas),
-            }
-
-            report = {
-                "run": run_meta,
-                "videos": videos_report,
-                "aggregate": aggregate,
-            }
-            with eval_path.open("w", encoding="utf-8") as f:
-                json.dump(report, f, ensure_ascii=False, indent=2, sort_keys=True)
-            print(f"[OK] Eval report written to {eval_path}")
-
-        if args.combined_json:
-            combined_path = Path(args.combined_json)
-            combine_to_single_json(
-                out_dir, combined_path, with_meta=args.combined_with_meta
-            )
-            print(f"[OK] Combined JSON written to {combined_path}")
+        aggregate = _aggregate_video_rows(processed_rows)
+        output_paths = writer.finalize(
+            scheduled_count=len(tasks),
+            skipped_count=int(skipped_existing),
+            failed_count=int(failed_count),
+            processed_count=len(processed_rows),
+            segments_mode=bool(segments_manifest),
+            jobs=int(args.jobs),
+            seed=int(args.seed),
+            mp_backend=str(mp_backend),
+            aggregate=aggregate,
+        )
 
         log_metrics(logger, "extract_keypoints.completed", {
-            "videos_processed": len(manifest),
+            "videos_processed": len(processed_rows),
+            "videos_failed": int(failed_count),
+            "videos_skipped_existing": int(skipped_existing),
             "jobs_used": args.jobs,
+            "zarr_path": output_paths["zarr_path"],
+            "videos_parquet_path": output_paths["videos_parquet_path"],
+            "frames_parquet_path": output_paths["frames_parquet_path"],
+            "runs_parquet_path": output_paths["runs_parquet_path"],
         })
+        print(f"[OK] Zarr written to {output_paths['zarr_path']}")
+        print(f"[OK] Videos parquet written to {output_paths['videos_parquet_path']}")
+        print(f"[OK] Frames parquet written to {output_paths['frames_parquet_path']}")
+        print(f"[OK] Runs parquet written to {output_paths['runs_parquet_path']}")
         return {
             "ok": True,
             "out_dir": str(out_dir),
-            "manifest_path": str(manifest_path),
-            "eval_report_path": eval_report_path,
-            "code": 0,
+            "zarr_path": output_paths["zarr_path"],
+            "videos_parquet_path": output_paths["videos_parquet_path"],
+            "frames_parquet_path": output_paths["frames_parquet_path"],
+            "runs_parquet_path": output_paths["runs_parquet_path"],
+            "code": 0 if failed_count == 0 else 1,
         }
     except SystemExit as exc:
         code = exc.code if isinstance(exc.code, int) else 1
@@ -815,8 +890,10 @@ def main(argv: Optional[List[str]] = None, *, _print_errors: bool = True) -> Dic
         return {
             "ok": False,
             "out_dir": str(out_dir) if out_dir else "",
-            "manifest_path": str(manifest_path) if manifest_path else "",
-            "eval_report_path": eval_report_path,
+            "zarr_path": str((out_dir / "landmarks.zarr")) if out_dir else "",
+            "videos_parquet_path": str((out_dir / "videos.parquet")) if out_dir else "",
+            "frames_parquet_path": str((out_dir / "frames.parquet")) if out_dir else "",
+            "runs_parquet_path": str((out_dir / "runs.parquet")) if out_dir else "",
             "error": error,
             "code": int(code),
         }
@@ -826,8 +903,10 @@ def main(argv: Optional[List[str]] = None, *, _print_errors: bool = True) -> Dic
         return {
             "ok": False,
             "out_dir": str(out_dir) if out_dir else "",
-            "manifest_path": str(manifest_path) if manifest_path else "",
-            "eval_report_path": eval_report_path,
+            "zarr_path": str((out_dir / "landmarks.zarr")) if out_dir else "",
+            "videos_parquet_path": str((out_dir / "videos.parquet")) if out_dir else "",
+            "frames_parquet_path": str((out_dir / "frames.parquet")) if out_dir else "",
+            "runs_parquet_path": str((out_dir / "runs.parquet")) if out_dir else "",
             "error": str(exc),
             "code": 1,
         }

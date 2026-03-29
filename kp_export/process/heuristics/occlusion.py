@@ -1,13 +1,13 @@
 from __future__ import annotations
 from typing import Dict, List, Optional
 
-from .process_constants import (
+from .constants import (
     MP_POSE_LEFT_WRIST_IDX,
     MP_POSE_RIGHT_WRIST_IDX,
     OCCLUSION_IOU_THRESHOLD_WORLD,
     OCCLUSION_Z_THRESHOLD_WORLD,
 )
-from .process_geometry import _iou_norm
+from .geometry import _iou_norm
 
 
 def _resolve_pose_world(world_coords, pose_world_current, last_pose_world_full):
