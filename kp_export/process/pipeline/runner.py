@@ -254,6 +254,11 @@ def process_video(
     try:
         if hands_detector is None or pose_detector is None:
             raise RuntimeError('Mediapipe detectors failed to initialize')
+        use_prefetch_decode = (
+            int(gpu_prefetch_frames) > 0
+            and backend == "tasks"
+            and tasks_delegate == "gpu"
+        )
         decoded_iter = (
             iter_prefetched_decoded_frames(
                 cap,
@@ -265,7 +270,7 @@ def process_video(
                 ts_source=ts_source,
                 prefetch_frames=max(1, gpu_prefetch_frames),
             )
-            if int(gpu_prefetch_frames) > 0
+            if use_prefetch_decode
             else iter_decoded_frames(
                 cap,
                 frame_start=frame_start_i,

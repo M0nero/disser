@@ -25,3 +25,7 @@ class GpuExecutionPlannerTests(unittest.TestCase):
     def test_gpu_single_requires_tasks_gpu(self) -> None:
         with self.assertRaises(SystemExit):
             _resolve_execution_mode("gpu_single", mp_backend="tasks", mp_tasks_delegate="cpu")
+
+    def test_cpu_pool_is_rejected_for_tasks_gpu(self) -> None:
+        with self.assertRaises(SystemExit):
+            _resolve_execution_mode("cpu_pool", mp_backend="tasks", mp_tasks_delegate="gpu")

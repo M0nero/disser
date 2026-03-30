@@ -489,6 +489,8 @@ def _resolve_execution_mode(
         if backend == "tasks" and delegate == "gpu":
             return "gpu_single"
         return "cpu_pool"
+    if requested == "cpu_pool" and backend == "tasks" and delegate == "gpu":
+        raise SystemExit("--execution-mode cpu_pool is unsupported with --mp-backend tasks --mp-tasks-delegate gpu")
     if requested == "gpu_single" and not (backend == "tasks" and delegate == "gpu"):
         raise SystemExit("--execution-mode gpu_single requires --mp-backend tasks --mp-tasks-delegate gpu")
     return requested
