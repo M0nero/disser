@@ -259,6 +259,14 @@ class ExtractorOutputWriter:
 
     def commit_staged_sample(self, staged_path: str | Path) -> Dict[str, Any]:
         payload = load_staged_payload(staged_path)
+        return self.commit_payload(payload, remove_stage_path=staged_path)
+
+    def commit_payload(
+        self,
+        payload: Dict[str, Any],
+        *,
+        remove_stage_path: str | Path | None = None,
+    ) -> Dict[str, Any]:
         sample_id = str(payload["sample_id"])
         zarr_group, info = self._write_sample_group(payload)
         has_pp = bool(info.get("has_pp"))
@@ -277,7 +285,8 @@ class ExtractorOutputWriter:
         frame_writer.write_table(frame_table)
 
         self._processed_ids.add(sample_id)
-        remove_staged_payload(staged_path)
+        if remove_stage_path is not None:
+            remove_staged_payload(remove_stage_path)
         return video_row
 
     def _read_table_or_empty(self, path: Path, columns: Sequence[tuple[str, str]]):

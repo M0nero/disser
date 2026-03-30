@@ -49,6 +49,7 @@ def write_staged_payload(stage_dir: str | Path, sample_id: str, payload: Dict[st
         "source_video": payload_dict["source_video"],
         "sample_attrs": _json_ready(payload_dict.get("sample_attrs", {})),
         "video_row": _json_ready(payload_dict.get("video_row", {})),
+        "runtime_metrics": _json_ready(payload_dict.get("runtime_metrics")),
     }
     (tmp_path / "meta.json").write_text(
         json.dumps(meta, ensure_ascii=False, sort_keys=True),
@@ -91,6 +92,7 @@ def load_staged_payload(path: str | Path) -> Dict[str, Any]:
             "frame_rows": frame_rows,
             "raw_arrays": raw_arrays,
             "pp_arrays": pp_arrays,
+            "runtime_metrics": meta.get("runtime_metrics"),
         }
     with gzip.open(payload_path, "rb") as f:
         payload = pickle.load(f)

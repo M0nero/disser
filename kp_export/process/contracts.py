@@ -142,6 +142,7 @@ class SamplePayload:
     frame_rows: List[Dict[str, Any]]
     raw_arrays: Dict[str, Any]
     pp_arrays: Optional[Dict[str, Any]] = None
+    runtime_metrics: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -153,6 +154,7 @@ class SamplePayload:
             "frame_rows": [dict(row) for row in self.frame_rows],
             "raw_arrays": dict(self.raw_arrays),
             "pp_arrays": dict(self.pp_arrays) if self.pp_arrays is not None else None,
+            "runtime_metrics": dict(self.runtime_metrics) if self.runtime_metrics is not None else None,
         }
 
     def to_json_ready_dict(self) -> Dict[str, Any]:

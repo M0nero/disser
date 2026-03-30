@@ -322,6 +322,7 @@ def build_sample_payload(
     manifest_dict: Dict[str, Any],
     segment_meta: Optional[Dict[str, Any]],
     fps: float,
+    runtime_metrics: Optional[Dict[str, Any]] = None,
 ) -> SamplePayload:
     raw_arrays = extract_sample_arrays_from_records(frame_records, meta_header=meta_header)
     pp_arrays = (
@@ -368,4 +369,5 @@ def build_sample_payload(
         frame_rows=build_frame_rows_from_records(frame_records),
         raw_arrays=raw_arrays,
         pp_arrays=pp_arrays,
+        runtime_metrics=dict(runtime_metrics) if runtime_metrics is not None else None,
     )

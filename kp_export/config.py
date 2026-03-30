@@ -117,6 +117,8 @@ class RuntimeConfig:
     jobs: int = 1
     seed: int = 0
     video_count: int = 1
+    execution_mode: str = "auto"
+    gpu_prefetch_frames: int = 32
 
 
 @dataclass(frozen=True)
@@ -200,6 +202,8 @@ class ExtractorConfig:
                 jobs=self.runtime.jobs,
                 seed=self.runtime.seed,
                 video_count=int(video_count),
+                execution_mode=str(self.runtime.execution_mode),
+                gpu_prefetch_frames=int(self.runtime.gpu_prefetch_frames),
             ),
             logging=self.logging,
         )
@@ -265,4 +269,5 @@ class ExtractorConfig:
             "pp_max_gap": int(self.postprocess.max_gap),
             "pp_smoother": str(self.postprocess.smoother),
             "pp_only_anchors": bool(self.postprocess.only_anchors),
+            "gpu_prefetch_frames": int(self.runtime.gpu_prefetch_frames),
         }

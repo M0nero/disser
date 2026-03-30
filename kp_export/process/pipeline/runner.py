@@ -10,13 +10,13 @@ from ...tasks import TaskSpec
 from ... import _env  # ensure caps before cv2 import
 from ...core.logging_utils import get_logger, log_metrics
 from ...mp.mp_utils import normalize_backend_name, normalize_tasks_delegate, try_import_mediapipe
-from ..adapters import DetectorFactoryProtocol, MediaPipeDetectorFactory, _resolve_model_paths
+from ..adapters import DetectorFactoryProtocol, MediaPipeDetectorFactory, MediaPipeGpuSession, MediaPipeVideoDetectors, _resolve_model_paths
 from ..contracts import SamplePayload
 from ..records.builder import build_frame_record, build_sample_payload
 from ..records.legacy import legacy_frame_from_record
 from ..reporting import ReportingContext, emit_ndjson_line, finalize_records
 from ..state import SampleRuntime
-from .decode import iter_decoded_frames, open_video_capture
+from .decode import iter_decoded_frames, iter_prefetched_decoded_frames, open_video_capture
 from .detect import PoseRuntimeState
 from .frame_step import FrameStepContext, process_frame_step
 
@@ -91,11 +91,13 @@ def process_video(
     frame_end: Optional[int] = None,
     segment_meta: Optional[Dict[str, Any]] = None,
     detector_factory: Optional[DetectorFactoryProtocol] = None,
+    detector_session: Optional[MediaPipeGpuSession] = None,
+    gpu_prefetch_frames: int = 0,
 ) -> SamplePayload:
     detector_factory = detector_factory or MediaPipeDetectorFactory()
     uses_mediapipe = isinstance(detector_factory, MediaPipeDetectorFactory)
     mp = mp_solutions = None
-    if uses_mediapipe:
+    if uses_mediapipe and detector_session is None:
         mp, mp_solutions = try_import_mediapipe()
     backend = normalize_backend_name(mp_backend)
     delegate_raw = mp_tasks_delegate or "auto"
@@ -142,22 +144,35 @@ def process_video(
     if frame_end_i is not None and frame_end_i <= frame_start_i:
         raise RuntimeError(f"Invalid frame range: start={frame_start_i}, end={frame_end_i}")
 
-    hand_model_path, pose_model_path = _resolve_model_paths(backend, hand_task, pose_task)
+    if detector_session is not None:
+        hand_model_path = detector_session.hand_model_path
+        pose_model_path = detector_session.pose_model_path
+    else:
+        hand_model_path, pose_model_path = _resolve_model_paths(backend, hand_task, pose_task)
     cap, width_src, height_src, fps = open_video_capture(path, frame_start=frame_start_i)
 
-    hands_detector, pose_detector, hands_sp = detector_factory.create(
-        backend=backend,
-        mp=mp,
-        mp_solutions=mp_solutions,
-        hand_model_path=hand_model_path,
-        pose_model_path=pose_model_path,
-        min_det=min_det,
-        min_track=min_track,
-        pose_complexity=pose_complexity,
-        tasks_delegate=tasks_delegate,
-        second_pass=second_pass,
-        world_coords=world_coords,
-    )
+    detector_init_started = perf_counter()
+    session_detectors: Optional[MediaPipeVideoDetectors] = None
+    if detector_session is not None:
+        session_detectors = detector_session.create_video_detectors()
+        hands_detector = session_detectors.hands_detector
+        pose_detector = session_detectors.pose_detector
+        hands_sp = session_detectors.hands_sp
+    else:
+        hands_detector, pose_detector, hands_sp = detector_factory.create(
+            backend=backend,
+            mp=mp,
+            mp_solutions=mp_solutions,
+            hand_model_path=hand_model_path,
+            pose_model_path=pose_model_path,
+            min_det=min_det,
+            min_track=min_track,
+            pose_complexity=pose_complexity,
+            tasks_delegate=tasks_delegate,
+            second_pass=second_pass,
+            world_coords=world_coords,
+        )
+    detector_init_runtime = perf_counter() - detector_init_started
 
     frame_records = []
     proc_w = width_src
@@ -169,6 +184,7 @@ def process_video(
         log_metrics(LOGGER, 'process_video.ndjson', {'video': path.name, 'ndjson_path': str(ndjson_path)})
 
     processing_started = perf_counter()
+    decode_runtime = 0.0
     pose_runtime = 0.0
     hand_runtime = 0.0
     second_pass_runtime = 0.0
@@ -238,15 +254,35 @@ def process_video(
     try:
         if hands_detector is None or pose_detector is None:
             raise RuntimeError('Mediapipe detectors failed to initialize')
-        for decoded in iter_decoded_frames(
-            cap,
-            frame_start=frame_start_i,
-            frame_end=frame_end_i,
-            stride=max(1, stride),
-            short_side=short_side,
-            fps=fps,
-            ts_source=ts_source,
-        ):
+        decoded_iter = (
+            iter_prefetched_decoded_frames(
+                cap,
+                frame_start=frame_start_i,
+                frame_end=frame_end_i,
+                stride=max(1, stride),
+                short_side=short_side,
+                fps=fps,
+                ts_source=ts_source,
+                prefetch_frames=max(1, gpu_prefetch_frames),
+            )
+            if int(gpu_prefetch_frames) > 0
+            else iter_decoded_frames(
+                cap,
+                frame_start=frame_start_i,
+                frame_end=frame_end_i,
+                stride=max(1, stride),
+                short_side=short_side,
+                fps=fps,
+                ts_source=ts_source,
+            )
+        )
+        while True:
+            decode_t0 = perf_counter()
+            try:
+                decoded = next(decoded_iter)
+            except StopIteration:
+                break
+            decode_runtime += perf_counter() - decode_t0
             proc_w = decoded.proc_w
             proc_h = decoded.proc_h
             step = process_frame_step(decoded, context=step_context)
@@ -270,12 +306,15 @@ def process_video(
                 })
             emit_ndjson_line(ndjson_f, {'video': path.name, **legacy_frame_from_record(record)})
     finally:
-        if hands_sp is not None:
-            hands_sp.close()
-        if pose_detector is not None:
-            pose_detector.close()
-        if hands_detector is not None:
-            hands_detector.close()
+        if session_detectors is not None:
+            session_detectors.close()
+        else:
+            if hands_sp is not None:
+                hands_sp.close()
+            if pose_detector is not None:
+                pose_detector.close()
+            if hands_detector is not None:
+                hands_detector.close()
         cap.release()
         if ndjson_f is not None:
             ndjson_f.close()
@@ -337,6 +376,8 @@ def process_video(
             backend=backend,
             tasks_delegate=tasks_delegate,
             processing_elapsed=(perf_counter() - processing_started),
+            decode_runtime=decode_runtime,
+            detector_init_runtime=detector_init_runtime,
             hand_runtime=hand_runtime,
             pose_runtime=pose_runtime,
             second_pass_runtime=second_pass_runtime,
@@ -367,6 +408,14 @@ def process_video(
         manifest_dict=reporting.manifest_dict,
         segment_meta=segment_meta,
         fps=float(fps),
+        runtime_metrics={
+            "processing_elapsed": float(reporting.summary_metrics.get("processing_elapsed", 0.0) or 0.0),
+            "decode_runtime": float(reporting.summary_metrics.get("decode_runtime_sec", 0.0) or 0.0),
+            "detector_init_runtime": float(reporting.summary_metrics.get("detector_init_runtime_sec", 0.0) or 0.0),
+            "hand_runtime": float(reporting.summary_metrics.get("hand_runtime_sec", 0.0) or 0.0),
+            "pose_runtime": float(reporting.summary_metrics.get("pose_runtime_sec", 0.0) or 0.0),
+            "second_pass_runtime": float(reporting.summary_metrics.get("second_pass_runtime_sec", 0.0) or 0.0),
+        },
     )
 
 
@@ -374,6 +423,7 @@ def process_task(
     task: TaskSpec | Dict[str, Any],
     *,
     detector_factory: Optional[DetectorFactoryProtocol] = None,
+    detector_session: Optional[MediaPipeGpuSession] = None,
 ) -> SamplePayload:
     task_spec = task if isinstance(task, TaskSpec) else TaskSpec.from_payload(task)
     config = ExtractorConfig.from_dict(task_spec.config_dict)
@@ -389,5 +439,6 @@ def process_task(
         frame_end=task_spec.frame_end,
         segment_meta=(task_spec.segment_meta or None),
         detector_factory=detector_factory,
+        detector_session=detector_session,
         **kwargs,
     )

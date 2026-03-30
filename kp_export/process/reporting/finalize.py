@@ -23,6 +23,8 @@ class ReportingContext:
     backend: str
     tasks_delegate: str
     processing_elapsed: float
+    decode_runtime: float
+    detector_init_runtime: float
     hand_runtime: float
     pose_runtime: float
     second_pass_runtime: float
@@ -318,6 +320,8 @@ def finalize_records(
         "frames": len(frame_records),
         "processing": {
             "duration_sec": round(context.processing_elapsed, 4),
+            "decode_runtime_sec": round(context.decode_runtime, 4),
+            "detector_init_runtime_sec": round(context.detector_init_runtime, 4),
             "hand_runtime_sec": round(context.hand_runtime, 4),
             "pose_runtime_sec": round(context.pose_runtime, 4),
             "second_pass_runtime_sec": round(context.second_pass_runtime, 4),

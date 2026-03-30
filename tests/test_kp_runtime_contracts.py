@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -27,6 +28,7 @@ from kp_export.config import (
 )
 from kp_export.output.schema import FRAME_PARQUET_COLUMNS, normalize_row
 from kp_export.output.staging import load_staged_payload, write_staged_payload
+from kp_export.process.adapters import MediaPipeGpuSession
 from kp_export.process.contracts import FrameDiagnostics, FrameRecord, HandObservation, PoseObservation, SamplePayload, SecondPassResult
 from kp_export.process.pipeline.recover import HandFrameState, apply_occlusion_transition, update_or_track_hand
 from kp_export.process.pipeline.second_pass import _execute_second_pass
@@ -130,6 +132,8 @@ class RuntimeContractsTests(unittest.TestCase):
         self.assertEqual(kwargs["mp_backend"], "tasks")
         self.assertEqual(kwargs["track_max_gap"], 20)
         self.assertEqual(kwargs["sanity_scale_range"], (0.7, 1.35))
+        self.assertEqual(kwargs["gpu_prefetch_frames"], 32)
+        self.assertEqual(restored.runtime.execution_mode, "auto")
 
     def test_task_spec_roundtrip(self) -> None:
         task = TaskSpec(
@@ -157,6 +161,7 @@ class RuntimeContractsTests(unittest.TestCase):
             frame_rows=[{"frame_idx": 0, "ts_ms": 0, "dt_ms": 0, "hand_1_present": False, "hand_2_present": False, "pose_present": False, "both_hands": False}],
             raw_arrays={"ts_ms": np.asarray([0], dtype=np.int64), "left_xyz": np.zeros((1, 21, 3), dtype=np.float32)},
             pp_arrays=None,
+            runtime_metrics={"writer_runtime": 0.25},
         )
         with tempfile.TemporaryDirectory() as tmp:
             staged = write_staged_payload(tmp, "sample", payload)
@@ -164,6 +169,7 @@ class RuntimeContractsTests(unittest.TestCase):
             loaded = load_staged_payload(staged)
             self.assertEqual(loaded["sample_id"], "sample")
             self.assertEqual(int(loaded["raw_arrays"]["ts_ms"][0]), 0)
+            self.assertEqual(loaded["runtime_metrics"], {"writer_runtime": 0.25})
 
     def test_normalize_row_rejects_unknown_fields(self) -> None:
         with self.assertRaises(KeyError):
@@ -277,6 +283,8 @@ class RuntimeContractsTests(unittest.TestCase):
                 backend="tasks",
                 tasks_delegate="cpu",
                 processing_elapsed=0.5,
+                decode_runtime=0.05,
+                detector_init_runtime=0.02,
                 hand_runtime=0.1,
                 pose_runtime=0.2,
                 second_pass_runtime=0.0,
@@ -301,6 +309,61 @@ class RuntimeContractsTests(unittest.TestCase):
         self.assertEqual(result.summary_metrics["frames"], 2)
         self.assertTrue(result.summary_metrics["second_pass_enabled"])
         self.assertIsNone(result.frame_records_pp)
+
+    def test_gpu_session_reuses_only_static_second_pass_detector(self) -> None:
+        class _FakeDetector:
+            def __init__(self, name: str) -> None:
+                self.name = name
+                self.closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+        hand_created = []
+        pose_created = []
+
+        def _fake_hand(*args, **kwargs):
+            detector = _FakeDetector(f"hand_{len(hand_created)}")
+            hand_created.append(detector)
+            return detector
+
+        def _fake_pose(*args, **kwargs):
+            detector = _FakeDetector(f"pose_{len(pose_created)}")
+            pose_created.append(detector)
+            return detector
+
+        with mock.patch("kp_export.process.adapters.mediapipe.create_hand_detector", side_effect=_fake_hand), \
+             mock.patch("kp_export.process.adapters.mediapipe.create_pose_detector", side_effect=_fake_pose):
+            session = MediaPipeGpuSession(
+                backend="tasks",
+                mp=object(),
+                mp_solutions=object(),
+                hand_model_path=Path("hand.task"),
+                pose_model_path=Path("pose.task"),
+                min_det=0.4,
+                min_track=0.35,
+                pose_complexity=2,
+                tasks_delegate="gpu",
+                second_pass=True,
+                world_coords=False,
+            )
+            session.warmup()
+            video_1 = session.create_video_detectors()
+            video_2 = session.create_video_detectors()
+
+            self.assertIs(video_1.hands_sp, video_2.hands_sp)
+            self.assertIsNot(video_1.hands_detector, video_2.hands_detector)
+            self.assertIsNot(video_1.pose_detector, video_2.pose_detector)
+
+            video_1.close()
+            self.assertTrue(video_1.hands_detector.closed)
+            self.assertTrue(video_1.pose_detector.closed)
+            self.assertFalse(video_1.hands_sp.closed)
+
+            video_2.close()
+            self.assertFalse(video_2.hands_sp.closed)
+            session.close()
+            self.assertTrue(video_1.hands_sp.closed)
 
     def test_hand_runtime_tracks_history_export_and_anchor(self) -> None:
         pts = [{"x": 0.1, "y": 0.2, "z": 0.0}] * 21

@@ -1,5 +1,6 @@
 from __future__ import annotations
 import argparse, csv, json, os, sys, traceback, uuid
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Callable, List, Dict, Any, Optional, Tuple
 from time import perf_counter
@@ -28,7 +29,9 @@ from kp_export.config import (
     VideoConfig,
 )
 from kp_export.parallel import normalize_sample_id, process_worker, slug_for
-from kp_export.mp.mp_utils import resolve_task_model_path
+from kp_export.process import process_video
+from kp_export.process.adapters import MediaPipeGpuSession
+from kp_export.mp.mp_utils import resolve_task_model_path, try_import_mediapipe
 from kp_export.core.logging_utils import configure_logging, log_metrics, track_runtime
 from kp_export.runpod.status import ShardStatusReporter
 from kp_export.task_manifest import filter_tasks_for_shard, load_task_manifest, write_task_manifest
@@ -452,6 +455,163 @@ def _probe_gpu_delegate() -> None:
         raise SystemExit(f"GPU delegate requested but NVIDIA runtime is not healthy: {stderr}")
 
 
+def _detect_visible_gpu_count() -> Optional[int]:
+    raw = os.environ.get("RUNPOD_GPU_COUNT", "").strip()
+    if raw.isdigit():
+        return int(raw)
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "-L"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return None
+    if result.returncode != 0:
+        return None
+    lines = [line for line in (result.stdout or "").splitlines() if line.strip().startswith("GPU ")]
+    return len(lines) if lines else None
+
+
+def _resolve_execution_mode(
+    requested_mode: str,
+    *,
+    mp_backend: str,
+    mp_tasks_delegate: str,
+) -> str:
+    requested = str(requested_mode or "auto").strip().lower()
+    backend = str(mp_backend or "solutions").strip().lower()
+    delegate = str(mp_tasks_delegate or "auto").strip().lower()
+    if requested not in {"auto", "cpu_pool", "gpu_single"}:
+        raise SystemExit(f"Unsupported --execution-mode: {requested_mode}")
+    if requested == "auto":
+        if backend == "tasks" and delegate == "gpu":
+            return "gpu_single"
+        return "cpu_pool"
+    if requested == "gpu_single" and not (backend == "tasks" and delegate == "gpu"):
+        raise SystemExit("--execution-mode gpu_single requires --mp-backend tasks --mp-tasks-delegate gpu")
+    return requested
+
+
+@contextmanager
+def _redirect_native_stderr(path: Optional[Path]):
+    if path is None:
+        yield
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sys.stderr.flush()
+    saved_fd = os.dup(2)
+    target = open(path, "ab", buffering=0)
+    try:
+        os.dup2(target.fileno(), 2)
+        yield
+    finally:
+        try:
+            sys.stderr.flush()
+        except Exception:
+            pass
+        os.dup2(saved_fd, 2)
+        os.close(saved_fd)
+        target.close()
+
+
+def _accumulate_runtime_metrics(target: Dict[str, float], runtime_metrics: Optional[Dict[str, Any]]) -> None:
+    if not runtime_metrics:
+        return
+    for key in (
+        "processing_elapsed",
+        "decode_runtime",
+        "detector_init_runtime",
+        "hand_runtime",
+        "pose_runtime",
+        "second_pass_runtime",
+        "writer_runtime",
+    ):
+        value = runtime_metrics.get(key)
+        if value is None:
+            continue
+        try:
+            target[key] = float(target.get(key, 0.0) or 0.0) + float(value)
+        except Exception:
+            continue
+
+
+def _summarize_native_stderr(path: Optional[Path]) -> List[Dict[str, Any]]:
+    if path is None or not path.exists():
+        return []
+    counts: Dict[str, int] = {}
+    try:
+        for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            counts[line] = counts.get(line, 0) + 1
+    except Exception:
+        return []
+    return [
+        {"message": message, "count": count}
+        for message, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:5]
+    ]
+
+
+def _emit_runtime_summary(
+    logger,
+    *,
+    execution_mode: str,
+    processed_rows: List[Dict[str, Any]],
+    runtime_totals: Dict[str, float],
+    started_at: float,
+    native_warnings: Optional[List[Dict[str, Any]]] = None,
+) -> None:
+    elapsed = max(0.0, perf_counter() - started_at)
+    videos = len(processed_rows)
+    frames = sum(int(row.get("num_frames", 0) or 0) for row in processed_rows)
+    videos_per_sec = _safe_rate(videos, elapsed)
+    frames_per_sec = _safe_rate(frames, elapsed)
+    stage_keys = [
+        "decode_runtime",
+        "detector_init_runtime",
+        "hand_runtime",
+        "pose_runtime",
+        "second_pass_runtime",
+        "writer_runtime",
+    ]
+    stage_shares = {
+        f"{key}_share": round(runtime_totals.get(key, 0.0) / elapsed, 4) if elapsed > 0.0 else None
+        for key in stage_keys
+    }
+    payload = {
+        "execution_mode": str(execution_mode),
+        "videos": int(videos),
+        "frames": int(frames),
+        "elapsed_sec": round(elapsed, 3),
+        "videos_per_sec": round(videos_per_sec, 4) if videos_per_sec is not None else None,
+        "frames_per_sec": round(frames_per_sec, 4) if frames_per_sec is not None else None,
+        **{key: round(float(runtime_totals.get(key, 0.0) or 0.0), 3) for key in stage_keys},
+        **stage_shares,
+    }
+    if native_warnings:
+        payload["native_warning_count"] = int(sum(int(item.get("count", 0) or 0) for item in native_warnings))
+        payload["native_warnings_top"] = native_warnings
+    log_metrics(logger, "extract_keypoints.runtime_summary", payload)
+    print(
+        "[SUMMARY] "
+        f"mode={execution_mode} videos={videos} frames={frames} "
+        f"elapsed={_format_duration_hms(elapsed)} "
+        f"videos/s={videos_per_sec:.3f} frames/s={frames_per_sec:.2f}"
+        if videos_per_sec is not None and frames_per_sec is not None
+        else f"[SUMMARY] mode={execution_mode} videos={videos} frames={frames} elapsed={_format_duration_hms(elapsed)}"
+    )
+    if native_warnings:
+        top = native_warnings[0]
+        print(
+            "[SUMMARY] "
+            f"native_stderr={sum(int(item.get('count', 0) or 0) for item in native_warnings)} lines "
+            f"top={top['count']}x {top['message'][:120]}"
+        )
+
+
 def _ensure_writable_dir(path: Path, label: str) -> None:
     try:
         path.mkdir(parents=True, exist_ok=True)
@@ -673,6 +833,10 @@ def main(argv: Optional[List[str]] = None, *, _print_errors: bool = True) -> Dic
                     help="Render progress as one line per update or as a compact in-place status line.")
     ap.add_argument("--worker-console", action="store_true",
                     help="Allow worker processes to write logs to stderr/stdout. Off by default for cleaner parent logs.")
+    ap.add_argument("--execution-mode", type=str, default="auto", choices=["auto", "cpu_pool", "gpu_single"],
+                    help="Execution planner. 'auto' selects gpu_single for Tasks+GPU, otherwise cpu_pool.")
+    ap.add_argument("--gpu-prefetch-frames", type=int, default=32,
+                    help="Bounded frame prefetch depth for gpu_single mode.")
 
     ap.add_argument("--keep-pose-indices", type=str, default="0,9,10,11,12,13,14,15,16,23,24")
     ap.add_argument("--world-coords", action="store_true")
@@ -819,10 +983,22 @@ def main(argv: Optional[List[str]] = None, *, _print_errors: bool = True) -> Dic
 
         keep = parse_keep_indices(args.keep_pose_indices)
         sanity_scale_range = _parse_range(args.sanity_scale_range)
+        execution_mode = _resolve_execution_mode(
+            args.execution_mode,
+            mp_backend=mp_backend,
+            mp_tasks_delegate=mp_tasks_delegate,
+        )
         jobs = int(args.jobs)
-        if str(mp_tasks_delegate).lower() == "gpu" and jobs > 1:
-            print("[WARN] GPU delegate enabled; forcing --jobs 1 for safer per-Pod execution.")
+        if execution_mode == "gpu_single" and jobs != 1:
+            print("[WARN] gpu_single mode ignores --jobs and forces one extractor worker per GPU.")
             jobs = 1
+        if execution_mode == "gpu_single":
+            print("[WARN] gpu_single uses one in-process GPU worker; utilization may remain bursty by design.")
+        if execution_mode == "gpu_single" and bool(args.second_pass):
+            print("[WARN] gpu_single keeps second-pass parity enabled; GPU utilization may still be bursty by design.")
+        args.jobs = jobs
+        args.execution_mode = execution_mode
+        args.gpu_prefetch_frames = max(1, int(args.gpu_prefetch_frames))
 
         config = ExtractorConfig(
             video=VideoConfig(
@@ -912,6 +1088,8 @@ def main(argv: Optional[List[str]] = None, *, _print_errors: bool = True) -> Dic
                 jobs=int(jobs),
                 seed=int(args.seed),
                 video_count=1,
+                execution_mode=str(execution_mode),
+                gpu_prefetch_frames=int(args.gpu_prefetch_frames),
             ),
             logging=LoggingConfig(
                 log_dir=str(Path(args.log_dir or "outputs/logs")),
@@ -1025,6 +1203,7 @@ def main(argv: Optional[List[str]] = None, *, _print_errors: bool = True) -> Dic
             "segments_mode": bool(args.segments_manifest),
             "num_shards": int(args.num_shards),
             "shard_index": int(args.shard_index),
+            "execution_mode": str(execution_mode),
         })
         print(
             "[INFO] "
@@ -1057,6 +1236,23 @@ def main(argv: Optional[List[str]] = None, *, _print_errors: bool = True) -> Dic
             failed=0,
             remaining=len(tasks),
         )
+        visible_gpu_count = _detect_visible_gpu_count() if execution_mode == "gpu_single" else None
+        capability_payload = {
+            "mp_backend": str(mp_backend),
+            "mp_tasks_delegate": str(mp_tasks_delegate),
+            "execution_mode": str(execution_mode),
+            "visible_gpus": int(visible_gpu_count) if visible_gpu_count is not None else None,
+            "worker_count": int(jobs),
+            "gpu_prefetch_frames": int(config.runtime.gpu_prefetch_frames) if execution_mode == "gpu_single" else 0,
+        }
+        log_metrics(logger, "extract_keypoints.capabilities", capability_payload)
+        reporter.emit_event("run_capabilities", **capability_payload)
+        print(
+            "[INFO] "
+            f"backend={mp_backend} delegate={mp_tasks_delegate} mode={execution_mode} "
+            f"visible_gpus={visible_gpu_count if visible_gpu_count is not None else '?'} "
+            f"workers={jobs} prefetch={capability_payload['gpu_prefetch_frames']}"
+        )
 
         processed_rows: List[Dict[str, Any]] = []
         failed_count = 0
@@ -1064,163 +1260,290 @@ def main(argv: Optional[List[str]] = None, *, _print_errors: bool = True) -> Dic
         last_sample_id = ""
         progress_started_at = perf_counter()
         progress_state: Dict[str, Any] = {"last_log_at": progress_started_at, "last_done": 0}
+        gpu_process_kwargs = config.to_process_video_kwargs() if execution_mode == "gpu_single" else None
+        runtime_totals: Dict[str, float] = {
+            "processing_elapsed": 0.0,
+            "decode_runtime": 0.0,
+            "detector_init_runtime": 0.0,
+            "hand_runtime": 0.0,
+            "pose_runtime": 0.0,
+            "second_pass_runtime": 0.0,
+            "writer_runtime": 0.0,
+        }
+        native_stderr_path = writer.current_run_dir / "gpu_native_stderr.log" if execution_mode == "gpu_single" else None
         with track_runtime(logger, "extract_keypoints.processing", videos=len(tasks), jobs=jobs):
-            if jobs > 1 and tasks:
-                ex: Optional[ProcessPoolExecutor] = None
-                interrupted = False
-                broken_pool = False
-                try:
-                    ex = ProcessPoolExecutor(max_workers=jobs)
-                    fut_to_task = {ex.submit(process_worker, t.to_payload()): t for t in tasks}
-                    for fut in as_completed(fut_to_task):
-                        task = fut_to_task[fut]
-                        try:
-                            result = fut.result()
-                            video_row = writer.commit_staged_sample(result["staged_path"])
-                            processed_rows.append(video_row)
-                            last_sample_id = str(task.sample_id)
-                            reporter.emit_event(
-                                "sample_committed",
-                                sample_id=str(task.sample_id),
-                                source_video=str(task.source_video),
-                                num_frames=int(video_row.get("num_frames", 0) or 0),
-                            )
-                        except BrokenProcessPool as e:
-                            failed_count += 1
-                            broken_pool = True
-                            last_sample_id = str(task.sample_id)
-                            key = _error_key(e)
-                            error_counts[key] = error_counts.get(key, 0) + 1
-                            _write_failures_line(failures_path, task.sample_id)
-                            reporter.note_failure(task.sample_id, key)
-                            print(f"[ERROR] Worker pool crashed: {e}")
-                            log_metrics(logger, "extract_keypoints.worker_pool_broken", {
-                                "error": str(e),
-                                "sample_id": str(task.sample_id),
-                            })
-                            if ex is not None:
-                                _shutdown_process_pool_fast(ex)
-                            break
-                        except Exception as e:
-                            failed_count += 1
-                            last_sample_id = str(task.sample_id)
-                            key = _error_key(e)
-                            error_counts[key] = error_counts.get(key, 0) + 1
-                            _write_failures_line(failures_path, task.sample_id)
-                            reporter.note_failure(task.sample_id, key)
-                            if error_counts[key] == 1:
-                                print(f"[ERROR] {task.sample_id}: {e}")
-                            elif error_counts[key] in {10, 50, 100}:
-                                print(f"[ERROR] repeated {error_counts[key]}x: {e}")
-                            log_metrics(logger, "extract_keypoints.worker_error", {
-                                "error": str(e),
-                                "sample_id": str(task.sample_id),
-                                "error_count": int(error_counts[key]),
-                            })
-                        finally:
-                            _maybe_report_progress(
-                                logger,
-                                started_at=progress_started_at,
-                                total=len(tasks),
-                                ok_count=len(processed_rows),
-                                failed_count=failed_count,
-                                state=progress_state,
-                                reporter=reporter,
-                                console_mode=str(args.console_progress_mode),
-                                progress_every_items=int(args.progress_every_items),
-                                progress_every_sec=float(args.progress_every_sec),
-                                last_sample_id=last_sample_id,
-                            )
-                    if broken_pool:
+            stderr_context = _redirect_native_stderr(native_stderr_path) if execution_mode == "gpu_single" else nullcontext()
+            with stderr_context:
+                if execution_mode == "gpu_single" and tasks:
+                    gpu_session: Optional[MediaPipeGpuSession] = None
+                    try:
+                        mp, mp_solutions = try_import_mediapipe()
+                        warmup_started = perf_counter()
+                        gpu_session = MediaPipeGpuSession(
+                            backend=str(mp_backend),
+                            mp=mp,
+                            mp_solutions=mp_solutions,
+                            hand_model_path=Path(hand_task_path) if hand_task_path else None,
+                            pose_model_path=Path(pose_task_path) if pose_task_path else None,
+                            min_det=float(args.min_det),
+                            min_track=float(args.min_track),
+                            pose_complexity=int(args.pose_complexity),
+                            tasks_delegate=str(mp_tasks_delegate),
+                            second_pass=bool(args.second_pass),
+                            world_coords=bool(world_coords),
+                        )
+                        gpu_session.warmup()
+                        warmup_elapsed = perf_counter() - warmup_started
+                        runtime_totals["detector_init_runtime"] += warmup_elapsed
+                        reporter.emit_event(
+                            "gpu_session_ready",
+                            warmup_sec=round(warmup_elapsed, 3),
+                            prefetch_frames=int(config.runtime.gpu_prefetch_frames),
+                        )
+                        for t in tasks:
+                            try:
+                                sample_payload = process_video(
+                                    path=t.source_path,
+                                    sample_id=str(t.sample_id),
+                                    ndjson_path=Path(t.ndjson_path) if t.ndjson_path else None,
+                                    debug_video_path=Path(t.debug_video_path) if t.debug_video_path else None,
+                                    frame_start=t.frame_start,
+                                    frame_end=t.frame_end,
+                                    segment_meta=(t.segment_meta or None),
+                                    detector_session=gpu_session,
+                                    **dict(gpu_process_kwargs or {}),
+                                )
+                                writer_started = perf_counter()
+                                video_row = writer.commit_payload(sample_payload)
+                                writer_elapsed = perf_counter() - writer_started
+                                processed_rows.append(video_row)
+                                last_sample_id = str(t.sample_id)
+                                runtime_metrics = dict(sample_payload.runtime_metrics or {})
+                                runtime_metrics["writer_runtime"] = writer_elapsed
+                                _accumulate_runtime_metrics(runtime_totals, runtime_metrics)
+                                reporter.emit_event(
+                                    "sample_committed",
+                                    sample_id=str(t.sample_id),
+                                    source_video=str(t.source_video),
+                                    num_frames=int(video_row.get("num_frames", 0) or 0),
+                                )
+                            except Exception as e:
+                                failed_count += 1
+                                last_sample_id = str(t.sample_id)
+                                key = _error_key(e)
+                                error_counts[key] = error_counts.get(key, 0) + 1
+                                _write_failures_line(failures_path, t.sample_id)
+                                reporter.note_failure(t.sample_id, key)
+                                if error_counts[key] == 1:
+                                    print(f"[ERROR] {t.sample_id}: {e}")
+                                elif error_counts[key] in {10, 50, 100}:
+                                    print(f"[ERROR] repeated {error_counts[key]}x: {e}")
+                                log_metrics(logger, "extract_keypoints.worker_error", {
+                                    "error": str(e),
+                                    "sample_id": str(t.sample_id),
+                                    "error_count": int(error_counts[key]),
+                                    "execution_mode": "gpu_single",
+                                })
+                            finally:
+                                _maybe_report_progress(
+                                    logger,
+                                    started_at=progress_started_at,
+                                    total=len(tasks),
+                                    ok_count=len(processed_rows),
+                                    failed_count=failed_count,
+                                    state=progress_state,
+                                    reporter=reporter,
+                                    console_mode=str(args.console_progress_mode),
+                                    progress_every_items=int(args.progress_every_items),
+                                    progress_every_sec=float(args.progress_every_sec),
+                                    last_sample_id=last_sample_id,
+                                )
+                    except KeyboardInterrupt:
+                        print("\n[INTERRUPTED] Stopping GPU extraction...")
+                        log_metrics(logger, "extract_keypoints.interrupted", {
+                            "jobs": 1,
+                            "processed_so_far": len(processed_rows),
+                            "failed_so_far": int(failed_count),
+                            "execution_mode": "gpu_single",
+                        })
+                        reporter.emit_event("run_interrupted", processed=len(processed_rows), failed=int(failed_count))
                         reporter.update(
-                            state="failed",
+                            state="interrupted",
                             processed=len(processed_rows),
                             failed=failed_count,
                             remaining=max(0, len(tasks) - len(processed_rows) - failed_count),
                             last_sample_id=last_sample_id,
                         )
-                except KeyboardInterrupt:
-                    interrupted = True
-                    print("\n[INTERRUPTED] Stopping workers...")
-                    log_metrics(logger, "extract_keypoints.interrupted", {
-                        "jobs": int(jobs),
-                        "processed_so_far": len(processed_rows),
-                        "failed_so_far": int(failed_count),
-                    })
-                    reporter.emit_event("run_interrupted", processed=len(processed_rows), failed=int(failed_count))
-                    reporter.update(
-                        state="interrupted",
-                        processed=len(processed_rows),
-                        failed=failed_count,
-                        remaining=max(0, len(tasks) - len(processed_rows) - failed_count),
-                        last_sample_id=last_sample_id,
-                    )
-                    if ex is not None:
-                        _shutdown_process_pool_fast(ex)
-                    raise SystemExit(130)
-                finally:
-                    if ex is not None and not interrupted:
-                        ex.shutdown(wait=True, cancel_futures=False)
-            else:
-                try:
-                    for t in tasks:
-                        try:
-                            result = process_worker(t.to_payload())
-                            video_row = writer.commit_staged_sample(result["staged_path"])
-                            processed_rows.append(video_row)
-                            last_sample_id = str(t.sample_id)
-                            reporter.emit_event(
-                                "sample_committed",
-                                sample_id=str(t.sample_id),
-                                source_video=str(t.source_video),
-                                num_frames=int(video_row.get("num_frames", 0) or 0),
-                            )
-                        except Exception as e:
-                            failed_count += 1
-                            last_sample_id = str(t.sample_id)
-                            key = _error_key(e)
-                            error_counts[key] = error_counts.get(key, 0) + 1
-                            _write_failures_line(failures_path, t.sample_id)
-                            reporter.note_failure(t.sample_id, key)
-                            if error_counts[key] == 1:
-                                print(f"[ERROR] {t.sample_id}: {e}")
-                            elif error_counts[key] in {10, 50, 100}:
-                                print(f"[ERROR] repeated {error_counts[key]}x: {e}")
-                            log_metrics(logger, "extract_keypoints.worker_error", {
-                                "error": str(e),
-                                "sample_id": str(t.sample_id),
-                                "error_count": int(error_counts[key]),
-                            })
-                        finally:
-                            _maybe_report_progress(
-                                logger,
-                                started_at=progress_started_at,
-                                total=len(tasks),
-                                ok_count=len(processed_rows),
-                                failed_count=failed_count,
-                                state=progress_state,
-                                reporter=reporter,
-                                console_mode=str(args.console_progress_mode),
-                                progress_every_items=int(args.progress_every_items),
-                                progress_every_sec=float(args.progress_every_sec),
+                        raise SystemExit(130)
+                    finally:
+                        if gpu_session is not None:
+                            gpu_session.close()
+                elif jobs > 1 and tasks:
+                    ex: Optional[ProcessPoolExecutor] = None
+                    interrupted = False
+                    broken_pool = False
+                    try:
+                        ex = ProcessPoolExecutor(max_workers=jobs)
+                        fut_to_task = {ex.submit(process_worker, t.to_payload()): t for t in tasks}
+                        for fut in as_completed(fut_to_task):
+                            task = fut_to_task[fut]
+                            try:
+                                result = fut.result()
+                                writer_started = perf_counter()
+                                video_row = writer.commit_staged_sample(result["staged_path"])
+                                writer_elapsed = perf_counter() - writer_started
+                                processed_rows.append(video_row)
+                                last_sample_id = str(task.sample_id)
+                                runtime_metrics = dict(result.get("runtime_metrics") or {})
+                                runtime_metrics["writer_runtime"] = writer_elapsed
+                                _accumulate_runtime_metrics(runtime_totals, runtime_metrics)
+                                reporter.emit_event(
+                                    "sample_committed",
+                                    sample_id=str(task.sample_id),
+                                    source_video=str(task.source_video),
+                                    num_frames=int(video_row.get("num_frames", 0) or 0),
+                                )
+                            except BrokenProcessPool as e:
+                                failed_count += 1
+                                broken_pool = True
+                                last_sample_id = str(task.sample_id)
+                                key = _error_key(e)
+                                error_counts[key] = error_counts.get(key, 0) + 1
+                                _write_failures_line(failures_path, task.sample_id)
+                                reporter.note_failure(task.sample_id, key)
+                                print(f"[ERROR] Worker pool crashed: {e}")
+                                log_metrics(logger, "extract_keypoints.worker_pool_broken", {
+                                    "error": str(e),
+                                    "sample_id": str(task.sample_id),
+                                })
+                                if ex is not None:
+                                    _shutdown_process_pool_fast(ex)
+                                break
+                            except Exception as e:
+                                failed_count += 1
+                                last_sample_id = str(task.sample_id)
+                                key = _error_key(e)
+                                error_counts[key] = error_counts.get(key, 0) + 1
+                                _write_failures_line(failures_path, task.sample_id)
+                                reporter.note_failure(task.sample_id, key)
+                                if error_counts[key] == 1:
+                                    print(f"[ERROR] {task.sample_id}: {e}")
+                                elif error_counts[key] in {10, 50, 100}:
+                                    print(f"[ERROR] repeated {error_counts[key]}x: {e}")
+                                log_metrics(logger, "extract_keypoints.worker_error", {
+                                    "error": str(e),
+                                    "sample_id": str(task.sample_id),
+                                    "error_count": int(error_counts[key]),
+                                })
+                            finally:
+                                _maybe_report_progress(
+                                    logger,
+                                    started_at=progress_started_at,
+                                    total=len(tasks),
+                                    ok_count=len(processed_rows),
+                                    failed_count=failed_count,
+                                    state=progress_state,
+                                    reporter=reporter,
+                                    console_mode=str(args.console_progress_mode),
+                                    progress_every_items=int(args.progress_every_items),
+                                    progress_every_sec=float(args.progress_every_sec),
+                                    last_sample_id=last_sample_id,
+                                )
+                        if broken_pool:
+                            reporter.update(
+                                state="failed",
+                                processed=len(processed_rows),
+                                failed=failed_count,
+                                remaining=max(0, len(tasks) - len(processed_rows) - failed_count),
                                 last_sample_id=last_sample_id,
                             )
-                except KeyboardInterrupt:
-                    print("\n[INTERRUPTED] Stopping...")
-                    log_metrics(logger, "extract_keypoints.interrupted", {
-                        "jobs": 1,
-                        "processed_so_far": len(processed_rows),
-                        "failed_so_far": int(failed_count),
-                    })
-                    reporter.emit_event("run_interrupted", processed=len(processed_rows), failed=int(failed_count))
-                    reporter.update(
-                        state="interrupted",
-                        processed=len(processed_rows),
-                        failed=failed_count,
-                        remaining=max(0, len(tasks) - len(processed_rows) - failed_count),
-                        last_sample_id=last_sample_id,
-                    )
-                    raise SystemExit(130)
+                    except KeyboardInterrupt:
+                        interrupted = True
+                        print("\n[INTERRUPTED] Stopping workers...")
+                        log_metrics(logger, "extract_keypoints.interrupted", {
+                            "jobs": int(jobs),
+                            "processed_so_far": len(processed_rows),
+                            "failed_so_far": int(failed_count),
+                        })
+                        reporter.emit_event("run_interrupted", processed=len(processed_rows), failed=int(failed_count))
+                        reporter.update(
+                            state="interrupted",
+                            processed=len(processed_rows),
+                            failed=failed_count,
+                            remaining=max(0, len(tasks) - len(processed_rows) - failed_count),
+                            last_sample_id=last_sample_id,
+                        )
+                        if ex is not None:
+                            _shutdown_process_pool_fast(ex)
+                        raise SystemExit(130)
+                    finally:
+                        if ex is not None and not interrupted:
+                            ex.shutdown(wait=True, cancel_futures=False)
+                else:
+                    try:
+                        for t in tasks:
+                            try:
+                                result = process_worker(t.to_payload())
+                                writer_started = perf_counter()
+                                video_row = writer.commit_staged_sample(result["staged_path"])
+                                writer_elapsed = perf_counter() - writer_started
+                                processed_rows.append(video_row)
+                                last_sample_id = str(t.sample_id)
+                                runtime_metrics = dict(result.get("runtime_metrics") or {})
+                                runtime_metrics["writer_runtime"] = writer_elapsed
+                                _accumulate_runtime_metrics(runtime_totals, runtime_metrics)
+                                reporter.emit_event(
+                                    "sample_committed",
+                                    sample_id=str(t.sample_id),
+                                    source_video=str(t.source_video),
+                                    num_frames=int(video_row.get("num_frames", 0) or 0),
+                                )
+                            except Exception as e:
+                                failed_count += 1
+                                last_sample_id = str(t.sample_id)
+                                key = _error_key(e)
+                                error_counts[key] = error_counts.get(key, 0) + 1
+                                _write_failures_line(failures_path, t.sample_id)
+                                reporter.note_failure(t.sample_id, key)
+                                if error_counts[key] == 1:
+                                    print(f"[ERROR] {t.sample_id}: {e}")
+                                elif error_counts[key] in {10, 50, 100}:
+                                    print(f"[ERROR] repeated {error_counts[key]}x: {e}")
+                                log_metrics(logger, "extract_keypoints.worker_error", {
+                                    "error": str(e),
+                                    "sample_id": str(t.sample_id),
+                                    "error_count": int(error_counts[key]),
+                                })
+                            finally:
+                                _maybe_report_progress(
+                                    logger,
+                                    started_at=progress_started_at,
+                                    total=len(tasks),
+                                    ok_count=len(processed_rows),
+                                    failed_count=failed_count,
+                                    state=progress_state,
+                                    reporter=reporter,
+                                    console_mode=str(args.console_progress_mode),
+                                    progress_every_items=int(args.progress_every_items),
+                                    progress_every_sec=float(args.progress_every_sec),
+                                    last_sample_id=last_sample_id,
+                                )
+                    except KeyboardInterrupt:
+                        print("\n[INTERRUPTED] Stopping...")
+                        log_metrics(logger, "extract_keypoints.interrupted", {
+                            "jobs": 1,
+                            "processed_so_far": len(processed_rows),
+                            "failed_so_far": int(failed_count),
+                        })
+                        reporter.emit_event("run_interrupted", processed=len(processed_rows), failed=int(failed_count))
+                        reporter.update(
+                            state="interrupted",
+                            processed=len(processed_rows),
+                            failed=failed_count,
+                            remaining=max(0, len(tasks) - len(processed_rows) - failed_count),
+                            last_sample_id=last_sample_id,
+                        )
+                        raise SystemExit(130)
 
         _maybe_report_progress(
             logger,
@@ -1249,12 +1572,21 @@ def main(argv: Optional[List[str]] = None, *, _print_errors: bool = True) -> Dic
             mp_backend=str(mp_backend),
             aggregate=aggregate,
         )
+        _emit_runtime_summary(
+            logger,
+            execution_mode=str(execution_mode),
+            processed_rows=processed_rows,
+            runtime_totals=runtime_totals,
+            started_at=progress_started_at,
+            native_warnings=_summarize_native_stderr(native_stderr_path),
+        )
 
         log_metrics(logger, "extract_keypoints.completed", {
             "videos_processed": len(processed_rows),
             "videos_failed": int(failed_count),
             "videos_skipped_existing": int(skipped_existing),
             "jobs_used": jobs,
+            "execution_mode": str(execution_mode),
             "zarr_path": output_paths["zarr_path"],
             "videos_parquet_path": output_paths["videos_parquet_path"],
             "frames_parquet_path": output_paths["frames_parquet_path"],

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from queue import Queue
+from threading import Thread
 from typing import Any, Iterator, Optional
 
 import cv2
@@ -19,6 +21,11 @@ class DecodedFrame:
     rgb: Any
     proc_w: int
     proc_h: int
+
+
+@dataclass
+class _DecodeEnd:
+    error: Optional[BaseException] = None
 
 
 def open_video_capture(path: Path, *, frame_start: int = 0):
@@ -81,3 +88,46 @@ def iter_decoded_frames(
             proc_h=int(proc_h),
         )
         i += 1
+
+
+def iter_prefetched_decoded_frames(
+    cap,
+    *,
+    frame_start: int,
+    frame_end: Optional[int],
+    stride: int,
+    short_side: Optional[int],
+    fps: float,
+    ts_source: str,
+    prefetch_frames: int,
+) -> Iterator[DecodedFrame]:
+    depth = max(1, int(prefetch_frames))
+    q: Queue[DecodedFrame | _DecodeEnd] = Queue(maxsize=depth)
+
+    def _producer() -> None:
+        try:
+            for item in iter_decoded_frames(
+                cap,
+                frame_start=frame_start,
+                frame_end=frame_end,
+                stride=stride,
+                short_side=short_side,
+                fps=fps,
+                ts_source=ts_source,
+            ):
+                q.put(item)
+            q.put(_DecodeEnd())
+        except BaseException as exc:  # pragma: no cover - exercised via consumer path
+            q.put(_DecodeEnd(error=exc))
+
+    thread = Thread(target=_producer, name="kp-export-decode-prefetch", daemon=True)
+    thread.start()
+
+    while True:
+        item = q.get()
+        if isinstance(item, _DecodeEnd):
+            thread.join(timeout=1.0)
+            if item.error is not None:
+                raise item.error
+            break
+        yield item

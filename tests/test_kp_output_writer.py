@@ -96,6 +96,14 @@ def _sample_payload(sample_id: str, *, with_pp: bool) -> dict:
         ],
         "raw_arrays": raw_arrays,
         "pp_arrays": pp_arrays,
+        "runtime_metrics": {
+            "processing_elapsed": 0.5,
+            "decode_runtime": 0.1,
+            "detector_init_runtime": 0.05,
+            "hand_runtime": 0.2,
+            "pose_runtime": 0.1,
+            "second_pass_runtime": 0.05,
+        },
     }
 
 
@@ -182,6 +190,76 @@ class ExtractorOutputWriterTests(unittest.TestCase):
                 versions={"python": "test"},
             )
             self.assertTrue(writer2.is_sample_committed("sample_pp"))
+
+    def test_commit_payload_matches_staged_commit_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload = _sample_payload("sample_direct", with_pp=True)
+
+            staged_dir = root / "staged"
+            direct_dir = root / "direct"
+
+            staged_writer = ExtractorOutputWriter(
+                out_dir=staged_dir,
+                run_id="run_staged",
+                args_snapshot={"jobs": 1},
+                versions={"python": "test"},
+            )
+            staged = write_staged_payload(staged_writer.current_run_dir, "sample_direct", payload)
+            staged_writer.commit_staged_sample(staged)
+            staged_paths = staged_writer.finalize(
+                scheduled_count=1,
+                skipped_count=0,
+                failed_count=0,
+                processed_count=1,
+                segments_mode=False,
+                jobs=1,
+                seed=0,
+                mp_backend="tasks",
+                aggregate={"quality_score": 0.75},
+            )
+
+            direct_writer = ExtractorOutputWriter(
+                out_dir=direct_dir,
+                run_id="run_direct",
+                args_snapshot={"jobs": 1},
+                versions={"python": "test"},
+            )
+            direct_writer.commit_payload(payload)
+            direct_paths = direct_writer.finalize(
+                scheduled_count=1,
+                skipped_count=0,
+                failed_count=0,
+                processed_count=1,
+                segments_mode=False,
+                jobs=1,
+                seed=0,
+                mp_backend="tasks",
+                aggregate={"quality_score": 0.75},
+            )
+
+            def _without_run_id(rows):
+                return [{k: v for k, v in row.items() if k != "run_id"} for row in rows]
+
+            self.assertEqual(
+                _without_run_id(pq.read_table(staged_paths["videos_parquet_path"]).to_pylist()),
+                _without_run_id(pq.read_table(direct_paths["videos_parquet_path"]).to_pylist()),
+            )
+            self.assertEqual(
+                _without_run_id(pq.read_table(staged_paths["frames_parquet_path"]).to_pylist()),
+                _without_run_id(pq.read_table(direct_paths["frames_parquet_path"]).to_pylist()),
+            )
+
+            staged_root = zarr.open_group(str(staged_dir / "landmarks.zarr"), mode="r")
+            direct_root = zarr.open_group(str(direct_dir / "landmarks.zarr"), mode="r")
+            self.assertEqual(
+                float(staged_root["samples"]["sample_direct"]["pp"]["left_xyz"][1, 0, 0]),
+                float(direct_root["samples"]["sample_direct"]["pp"]["left_xyz"][1, 0, 0]),
+            )
+            self.assertEqual(
+                staged_root["samples"]["sample_direct"]["raw"]["left_xyz"].shape,
+                direct_root["samples"]["sample_direct"]["raw"]["left_xyz"].shape,
+            )
 
     def test_finalize_writes_empty_parquet_tables_when_no_samples_committed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

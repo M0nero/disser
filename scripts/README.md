@@ -183,7 +183,9 @@ Notes:
 
 - `scripts/runpod_entrypoint.sh` is the default pod entrypoint used by `Dockerfile.runpod`.
 - `requirements.runpod.txt` is a minimal extractor-only runtime environment for Ubuntu pods.
-- For GPU delegate mode on Ubuntu pods, extractor now forces `--jobs 1` by default unless you override it explicitly.
+- For GPU delegate mode on Ubuntu pods, extractor now defaults to `--execution-mode auto`, which resolves to `gpu_single`.
+- In `gpu_single`, local multiprocessing is disabled by design: `--jobs` is ignored and forced to `1`.
+- Throughput scaling for GPU runs should come from more shard pods, not `--jobs > 1` on one GPU.
 
 ## Prepare PHOENIX-2014T Annotations
 

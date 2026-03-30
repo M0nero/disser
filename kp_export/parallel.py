@@ -105,6 +105,7 @@ def process_worker(payload: dict) -> Dict[str, Any]:
             sample_payload = process_task(worker_task)
             staged_path = write_staged_payload(stage_dir, str(sample_id), sample_payload)
             video_row = dict(sample_payload.video_row)
+            runtime_metrics = dict(sample_payload.runtime_metrics or {})
 
         log_metrics(logger, "process_worker.result", {
             "video": vpath.name,
@@ -122,6 +123,7 @@ def process_worker(payload: dict) -> Dict[str, Any]:
             "num_frames": int(video_row.get("num_frames", 0) or 0),
             "hands_coverage": float(video_row.get("hands_coverage", 0.0) or 0.0),
             "quality_score": float(video_row.get("quality_score", 0.0) or 0.0),
+            "runtime_metrics": runtime_metrics,
         }
 
     except Exception as exc:
