@@ -1,9 +1,10 @@
 from __future__ import annotations
+import os
 from pathlib import Path
 from typing import Dict, Any, Optional
 
 from .config import ExtractorConfig
-from .core.logging_utils import configure_logging, log_metrics, track_runtime
+from .core.logging_utils import configure_logging, log_metrics, redirect_native_stderr, track_runtime
 from .output.staging import write_staged_payload
 from .process import process_task
 from .tasks import TaskSpec
@@ -59,6 +60,8 @@ def process_worker(payload: dict) -> Dict[str, Any]:
         config.logging.log_level,
         console=bool(config.logging.worker_console),
     )
+    native_stderr_dir = Path(config.output.stage_dir) / "native_stderr"
+    native_stderr_path = native_stderr_dir / f"worker_{os.getpid()}.stderr.log"
 
     in_dir = Path(config.video.in_dir) if config.video.in_dir else None
     out_dir = Path(config.video.out_dir)
@@ -90,22 +93,23 @@ def process_worker(payload: dict) -> Dict[str, Any]:
     })
 
     try:
-        with track_runtime(logger, "process_worker", video=vpath.name, slug=slug):
-            worker_task = TaskSpec(
-                sample_id=str(sample_id),
-                slug=str(slug),
-                source_video=str(vpath),
-                config_dict=config.to_dict(),
-                frame_start=frame_start,
-                frame_end=frame_end,
-                segment_meta=dict(segment),
-                debug_video_path=str(debug_video_path) if debug_video_path else "",
-                ndjson_path=str(ndjson_path) if ndjson_path else "",
-            )
-            sample_payload = process_task(worker_task)
-            staged_path = write_staged_payload(stage_dir, str(sample_id), sample_payload)
-            video_row = dict(sample_payload.video_row)
-            runtime_metrics = dict(sample_payload.runtime_metrics or {})
+        with redirect_native_stderr(native_stderr_path):
+            with track_runtime(logger, "process_worker", video=vpath.name, slug=slug):
+                worker_task = TaskSpec(
+                    sample_id=str(sample_id),
+                    slug=str(slug),
+                    source_video=str(vpath),
+                    config_dict=config.to_dict(),
+                    frame_start=frame_start,
+                    frame_end=frame_end,
+                    segment_meta=dict(segment),
+                    debug_video_path=str(debug_video_path) if debug_video_path else "",
+                    ndjson_path=str(ndjson_path) if ndjson_path else "",
+                )
+                sample_payload = process_task(worker_task)
+                staged_path = write_staged_payload(stage_dir, str(sample_id), sample_payload)
+                video_row = dict(sample_payload.video_row)
+                runtime_metrics = dict(sample_payload.runtime_metrics or {})
 
         log_metrics(logger, "process_worker.result", {
             "video": vpath.name,

@@ -18,6 +18,7 @@ $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $LocalSubsetPath = (Resolve-Path (Join-Path $RepoRoot "test_out\runpod_phoenix_100")).Path
 
 $RemoteRepoPath = "/workspace/disser"
+$RemoteVenvPath = "/workspace/disser/.venv"
 $RemoteDataRoot = "/workspace/data"
 $RemoteSubsetPath = "/workspace/data/phoenix_100"
 $RemoteOutputRoot = "/workspace/out"
@@ -57,7 +58,7 @@ function Invoke-ScpCopyDir {
         [string]$RemotePath
     )
 
-    & scp "-P" $Port "-i" $SshKeyPath "-r" $LocalPath "root@$IpAddress`:$RemotePath"
+    & scp "-q" "-P" $Port "-i" $SshKeyPath "-r" $LocalPath "root@$IpAddress`:$RemotePath"
     if ($LASTEXITCODE -ne 0) {
         throw "SCP copy failed: $LocalPath -> $RemotePath"
     }
@@ -72,7 +73,7 @@ function Invoke-ScpCopyFile {
         [string]$RemotePath
     )
 
-    & scp "-P" $Port "-i" $SshKeyPath $LocalPath "root@$IpAddress`:$RemotePath"
+    & scp "-q" "-P" $Port "-i" $SshKeyPath $LocalPath "root@$IpAddress`:$RemotePath"
     if ($LASTEXITCODE -ne 0) {
         throw "SCP copy failed: $LocalPath -> $RemotePath"
     }
@@ -108,10 +109,11 @@ else
 fi
 
 cd "$RemoteRepoPath"
-python3 -m pip install --upgrade pip setuptools wheel
-python3 -m pip install -r requirements.runpod.txt
-python3 -m pip install opencv-contrib-python
-python3 -c "import cv2, mediapipe, pyarrow, zarr; print('runtime ok')"
+python3 -m venv "$RemoteVenvPath"
+"$RemoteVenvPath/bin/python" -m pip install --upgrade pip setuptools wheel
+"$RemoteVenvPath/bin/python" -m pip install -r requirements.runpod.txt
+"$RemoteVenvPath/bin/python" -m pip install opencv-contrib-python
+"$RemoteVenvPath/bin/python" -c "import cv2, mediapipe, pyarrow, zarr; print('runtime ok')"
 "@
 
 $bootstrapScript = [System.IO.Path]::GetTempFileName() + ".sh"
@@ -132,7 +134,7 @@ if ($hasSubset -ne "yes") {
     Write-Host "Video subset already exists on pod, skipping copy" -ForegroundColor Yellow
 }
 
-$remoteRun = @"
+$remoteRunTemplate = @'
 set -euo pipefail
 
 if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
@@ -141,18 +143,18 @@ else
   DELEGATE=cpu
 fi
 
-RUN_TS=\$(date +%Y%m%d_%H%M%S)
-OUT_DIR="$RemoteOutputRoot/phoenix_100_\${DELEGATE}_\${RUN_TS}"
+RUN_TS=$(date +%Y%m%d_%H%M%S)
+OUT_DIR="__REMOTE_OUTPUT_ROOT__/phoenix_100_${DELEGATE}_${RUN_TS}"
 
-echo "delegate=\$DELEGATE"
-echo "jobs=$Jobs"
-echo "out_dir=\$OUT_DIR"
+echo "delegate=$DELEGATE"
+echo "jobs=__JOBS__"
+echo "out_dir=$OUT_DIR"
 
-cd "$RemoteRepoPath"
-python3 scripts/extract_keypoints.py \
-  --in-dir "$RemoteSubsetPath" \
+cd "__REMOTE_REPO_PATH__"
+"__REMOTE_VENV_PATH__/bin/python" scripts/extract_keypoints.py \
+  --in-dir "__REMOTE_SUBSET_PATH__" \
   --pattern "**/*.mp4" \
-  --out-dir "\$OUT_DIR" \
+  --out-dir "$OUT_DIR" \
   --seed 0 \
   --image-coords \
   --stride 1 \
@@ -194,11 +196,17 @@ python3 scripts/extract_keypoints.py \
   --pp-max-gap 20 \
   --pp-smoother ema \
   --mp-backend tasks \
-  --mp-tasks-delegate "\$DELEGATE" \
+  --mp-tasks-delegate "$DELEGATE" \
   --execution-mode auto \
   --gpu-prefetch-frames 32 \
-  --jobs $Jobs
-"@
+  --jobs __JOBS__
+'@
+
+$remoteRun = $remoteRunTemplate.Replace("__REMOTE_OUTPUT_ROOT__", $RemoteOutputRoot).
+    Replace("__REMOTE_REPO_PATH__", $RemoteRepoPath).
+    Replace("__REMOTE_VENV_PATH__", $RemoteVenvPath).
+    Replace("__REMOTE_SUBSET_PATH__", $RemoteSubsetPath).
+    Replace("__JOBS__", [string]$Jobs)
 
 Write-Host "Starting extraction on pod" -ForegroundColor Cyan
 $runScript = [System.IO.Path]::GetTempFileName() + ".sh"

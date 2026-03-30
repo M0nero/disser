@@ -12,7 +12,13 @@ import os
 
 PathLike = Union[str, Path]
 
-__all__ = ["configure_logging", "get_logger", "log_metrics", "track_runtime"]
+__all__ = [
+    "configure_logging",
+    "get_logger",
+    "log_metrics",
+    "track_runtime",
+    "redirect_native_stderr",
+]
 
 _LOGGER_NAME = "kp_export"
 _DEFAULT_FILE_NAME = "kp_export.log"
@@ -140,6 +146,36 @@ def log_metrics(logger: Optional[logging.Logger], label: str, metrics: Dict[str,
     target = logger or get_logger()
     payload = _json_ready(metrics)
     target.info("%s | %s", label, json.dumps(payload, ensure_ascii=False, sort_keys=True))
+
+
+@contextmanager
+def redirect_native_stderr(path: Optional[PathLike]):
+    if not path:
+        yield
+        return
+    target_path = Path(path)
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        import sys
+
+        sys.stderr.flush()
+    except Exception:
+        pass
+    saved_fd = os.dup(2)
+    target = open(target_path, "ab", buffering=0)
+    try:
+        os.dup2(target.fileno(), 2)
+        yield
+    finally:
+        try:
+            import sys
+
+            sys.stderr.flush()
+        except Exception:
+            pass
+        os.dup2(saved_fd, 2)
+        os.close(saved_fd)
+        target.close()
 
 
 @contextmanager

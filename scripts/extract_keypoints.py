@@ -2,6 +2,7 @@ from __future__ import annotations
 import argparse, csv, json, os, sys, traceback, uuid
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
+import re
 from typing import Callable, List, Dict, Any, Optional, Tuple
 from time import perf_counter
 import subprocess
@@ -32,7 +33,7 @@ from kp_export.parallel import normalize_sample_id, process_worker, slug_for
 from kp_export.process import process_video
 from kp_export.process.adapters import MediaPipeGpuSession
 from kp_export.mp.mp_utils import resolve_task_model_path, try_import_mediapipe
-from kp_export.core.logging_utils import configure_logging, log_metrics, track_runtime
+from kp_export.core.logging_utils import configure_logging, log_metrics, redirect_native_stderr, track_runtime
 from kp_export.runpod.status import ShardStatusReporter
 from kp_export.task_manifest import filter_tasks_for_shard, load_task_manifest, write_task_manifest
 from kp_export.tasks import TaskSpec
@@ -496,28 +497,6 @@ def _resolve_execution_mode(
     return requested
 
 
-@contextmanager
-def _redirect_native_stderr(path: Optional[Path]):
-    if path is None:
-        yield
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    sys.stderr.flush()
-    saved_fd = os.dup(2)
-    target = open(path, "ab", buffering=0)
-    try:
-        os.dup2(target.fileno(), 2)
-        yield
-    finally:
-        try:
-            sys.stderr.flush()
-        except Exception:
-            pass
-        os.dup2(saved_fd, 2)
-        os.close(saved_fd)
-        target.close()
-
-
 def _accumulate_runtime_metrics(target: Dict[str, float], runtime_metrics: Optional[Dict[str, Any]]) -> None:
     if not runtime_metrics:
         return
@@ -539,20 +518,46 @@ def _accumulate_runtime_metrics(target: Dict[str, float], runtime_metrics: Optio
             continue
 
 
-def _summarize_native_stderr(path: Optional[Path]) -> List[Dict[str, Any]]:
-    if path is None or not path.exists():
+_NATIVE_PREFIX_RE = re.compile(r"^[IWEF]\d{4}\s+\d{2}:\d{2}:\d+\.\d+\s+\d+\s+")
+
+
+def _classify_native_stderr_line(line: str) -> str:
+    text = _NATIVE_PREFIX_RE.sub("", str(line or "").strip())
+    if not text:
+        return ""
+    lowered = text.lower()
+    if "all log messages before absl::initializelog() is called are written to stderr" in lowered:
+        return "absl_preinit_stderr_notice"
+    if "created tensorflow lite xnnpack delegate for cpu" in lowered:
+        return "tflite_xnnpack_delegate_created"
+    if "created tensorflow lite delegate for gpu" in lowered:
+        return "tflite_gpu_delegate_created"
+    if "feedback manager requires a model with a single signature inference" in lowered:
+        return "tflite_feedback_tensors_disabled"
+    if "using norm_rect without image_dimensions" in lowered:
+        return "mediapipe_norm_rect_without_image_dimensions"
+    if "gpu suport is not available" in lowered or "gpu support is not available" in lowered:
+        return "mediapipe_gpu_probe_unavailable"
+    return text
+
+
+def _summarize_native_stderr(paths: List[Path]) -> List[Dict[str, Any]]:
+    if not paths:
         return []
     counts: Dict[str, int] = {}
-    try:
-        for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-            line = raw_line.strip()
-            if not line:
-                continue
-            counts[line] = counts.get(line, 0) + 1
-    except Exception:
-        return []
+    for path in paths:
+        if path is None or not path.exists():
+            continue
+        try:
+            for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                kind = _classify_native_stderr_line(raw_line)
+                if not kind:
+                    continue
+                counts[kind] = counts.get(kind, 0) + 1
+        except Exception:
+            continue
     return [
-        {"message": message, "count": count}
+        {"kind": message, "count": count}
         for message, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:5]
     ]
 
@@ -564,7 +569,10 @@ def _emit_runtime_summary(
     processed_rows: List[Dict[str, Any]],
     runtime_totals: Dict[str, float],
     started_at: float,
+    failed_count: int,
+    skipped_existing: int,
     native_warnings: Optional[List[Dict[str, Any]]] = None,
+    native_stderr_label: str = "",
 ) -> None:
     elapsed = max(0.0, perf_counter() - started_at)
     videos = len(processed_rows)
@@ -585,6 +593,9 @@ def _emit_runtime_summary(
     }
     payload = {
         "execution_mode": str(execution_mode),
+        "ok": int(videos),
+        "failed": int(failed_count),
+        "skipped_existing": int(skipped_existing),
         "videos": int(videos),
         "frames": int(frames),
         "elapsed_sec": round(elapsed, 3),
@@ -596,21 +607,33 @@ def _emit_runtime_summary(
     if native_warnings:
         payload["native_warning_count"] = int(sum(int(item.get("count", 0) or 0) for item in native_warnings))
         payload["native_warnings_top"] = native_warnings
+        if native_stderr_label:
+            payload["native_stderr_path"] = str(native_stderr_label)
     log_metrics(logger, "extract_keypoints.runtime_summary", payload)
     print(
         "[SUMMARY] "
-        f"mode={execution_mode} videos={videos} frames={frames} "
+        f"mode={execution_mode} ok={videos} failed={failed_count} skipped={skipped_existing} frames={frames} "
         f"elapsed={_format_duration_hms(elapsed)} "
         f"videos/s={videos_per_sec:.3f} frames/s={frames_per_sec:.2f}"
         if videos_per_sec is not None and frames_per_sec is not None
-        else f"[SUMMARY] mode={execution_mode} videos={videos} frames={frames} elapsed={_format_duration_hms(elapsed)}"
+        else f"[SUMMARY] mode={execution_mode} ok={videos} failed={failed_count} skipped={skipped_existing} frames={frames} elapsed={_format_duration_hms(elapsed)}"
+    )
+    print(
+        "[SUMMARY] "
+        f"stages decode={runtime_totals.get('decode_runtime', 0.0):.1f}s "
+        f"init={runtime_totals.get('detector_init_runtime', 0.0):.1f}s "
+        f"hand={runtime_totals.get('hand_runtime', 0.0):.1f}s "
+        f"pose={runtime_totals.get('pose_runtime', 0.0):.1f}s "
+        f"pass2={runtime_totals.get('second_pass_runtime', 0.0):.1f}s "
+        f"writer={runtime_totals.get('writer_runtime', 0.0):.1f}s"
     )
     if native_warnings:
-        top = native_warnings[0]
+        compact = ", ".join(f"{item['kind']}={item['count']}" for item in native_warnings[:3])
         print(
             "[SUMMARY] "
-            f"native_stderr={sum(int(item.get('count', 0) or 0) for item in native_warnings)} lines "
-            f"top={top['count']}x {top['message'][:120]}"
+            f"suppressed_native_stderr={sum(int(item.get('count', 0) or 0) for item in native_warnings)} "
+            f"top=[{compact}]"
+            + (f" path={native_stderr_label}" if native_stderr_label else "")
         )
 
 
@@ -936,7 +959,7 @@ def main(argv: Optional[List[str]] = None, *, _print_errors: bool = True) -> Dic
     try:
         args = ap.parse_args(argv)
         log_level = (args.log_level or "INFO").upper()
-        logger = configure_logging(args.log_dir or "outputs/logs", log_level)
+        logger = configure_logging(args.log_dir or "outputs/logs", log_level, console=False)
 
         if args.task_manifest:
             task_manifest_path = Path(args.task_manifest)
@@ -1273,8 +1296,9 @@ def main(argv: Optional[List[str]] = None, *, _print_errors: bool = True) -> Dic
             "writer_runtime": 0.0,
         }
         native_stderr_path = writer.current_run_dir / "gpu_native_stderr.log" if execution_mode == "gpu_single" else None
+        native_stderr_dir = writer.current_run_dir / "native_stderr"
         with track_runtime(logger, "extract_keypoints.processing", videos=len(tasks), jobs=jobs):
-            stderr_context = _redirect_native_stderr(native_stderr_path) if execution_mode == "gpu_single" else nullcontext()
+            stderr_context = redirect_native_stderr(native_stderr_path) if execution_mode == "gpu_single" else nullcontext()
             with stderr_context:
                 if execution_mode == "gpu_single" and tasks:
                     gpu_session: Optional[MediaPipeGpuSession] = None
@@ -1580,7 +1604,13 @@ def main(argv: Optional[List[str]] = None, *, _print_errors: bool = True) -> Dic
             processed_rows=processed_rows,
             runtime_totals=runtime_totals,
             started_at=progress_started_at,
-            native_warnings=_summarize_native_stderr(native_stderr_path),
+            failed_count=int(failed_count),
+            skipped_existing=int(skipped_existing),
+            native_warnings=_summarize_native_stderr(
+                ([native_stderr_path] if native_stderr_path is not None else [])
+                + sorted(native_stderr_dir.glob("*.stderr.log"))
+            ),
+            native_stderr_label=str(native_stderr_path if native_stderr_path is not None else native_stderr_dir),
         )
 
         log_metrics(logger, "extract_keypoints.completed", {
