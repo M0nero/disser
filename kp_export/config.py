@@ -109,6 +109,7 @@ class DebugConfig:
 @dataclass(frozen=True)
 class OutputConfig:
     stage_dir: str = ""
+    scratch_dir: str = ""
 
 
 @dataclass(frozen=True)
@@ -122,6 +123,7 @@ class RuntimeConfig:
 class LoggingConfig:
     log_dir: str = "outputs/logs"
     log_level: str = "INFO"
+    worker_console: bool = False
 
 
 @dataclass(frozen=True)
@@ -161,7 +163,7 @@ class ExtractorConfig:
             logging=LoggingConfig(**dict(data.get("logging", {}))),
         )
 
-    def with_stage_dir(self, stage_dir: str) -> "ExtractorConfig":
+    def with_stage_dir(self, stage_dir: str, *, scratch_dir: Optional[str] = None) -> "ExtractorConfig":
         return ExtractorConfig(
             video=self.video,
             pose=self.pose,
@@ -173,7 +175,10 @@ class ExtractorConfig:
             postprocess=self.postprocess,
             mediapipe=self.mediapipe,
             debug=self.debug,
-            output=OutputConfig(stage_dir=stage_dir),
+            output=OutputConfig(
+                stage_dir=stage_dir,
+                scratch_dir=str(self.output.scratch_dir if scratch_dir is None else scratch_dir),
+            ),
             runtime=self.runtime,
             logging=self.logging,
         )

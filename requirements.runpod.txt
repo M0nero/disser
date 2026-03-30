@@ -1,0 +1,10 @@
+# Minimal runtime for kp_export extraction on Ubuntu/Runpod.
+# System packages like ffmpeg/rsync/zstd are installed in Dockerfile.runpod.
+numpy==1.26.4
+opencv-contrib-python==4.11.0.86
+mediapipe==0.10.21
+absl-py==2.3.1
+protobuf==4.25.8
+pyarrow==18.1.0
+zarr==2.18.3
+numcodecs==0.13.1

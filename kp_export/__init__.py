@@ -8,5 +8,5 @@ os.environ.setdefault("GLOG_minloglevel", "2")
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 os.environ.setdefault("ABSL_MIN_LOG_LEVEL", "2")
 
-__all__ = ["process", "parallel", "core", "algos", "mp", "annotations"]
+__all__ = ["process", "parallel", "core", "algos", "mp", "annotations", "runpod"]
 __version__ = "0.1.0"

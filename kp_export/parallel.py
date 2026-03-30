@@ -57,6 +57,7 @@ def process_worker(payload: dict) -> Dict[str, Any]:
     logger = configure_logging(
         config.logging.log_dir,
         config.logging.log_level,
+        console=bool(config.logging.worker_console),
     )
 
     in_dir = Path(config.video.in_dir) if config.video.in_dir else None

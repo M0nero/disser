@@ -25,13 +25,16 @@ class ExtractorOutputWriter:
         self,
         *,
         out_dir: str | Path,
+        scratch_dir: str | Path | None = None,
         run_id: str,
         args_snapshot: Dict[str, Any],
         versions: Dict[str, Any],
     ) -> None:
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
-        self.stage_dir = self.out_dir / ".staging"
+        scratch_root = Path(scratch_dir) if scratch_dir else (self.out_dir / ".staging")
+        self.scratch_root = scratch_root
+        self.stage_dir = scratch_root
         self.stage_dir.mkdir(parents=True, exist_ok=True)
         self.current_run_dir = self.stage_dir / run_id
         if self.current_run_dir.exists():

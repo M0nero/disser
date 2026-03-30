@@ -70,6 +70,121 @@ Notes:
 - Full landmarks now live only in Zarr; Parquet contains metadata and scalar diagnostics.
 - For refactors, compare two extractor artifact roots with `python scripts/check_kp_parity.py --baseline <old_out_dir> --candidate <new_out_dir>`.
 
+## Runpod Scale-Out Workflow
+
+For large Secure Cloud Runpod extraction runs, use shard manifests and per-pod shard outputs instead of writing all pods into one artifact root.
+
+### 1. Prepare manifests and run spec
+
+`prepare` enumerates tasks once using the normal extractor discovery logic, writes `all_tasks.jsonl`, splits it into deterministic shard manifests, and writes `run_spec.json`.
+
+```bash
+python scripts/runpod_extract.py prepare \
+  --run-id phoenix_4090_v1 \
+  --output-root /workspace/kp_export_runs \
+  --scratch-root /tmp/kp_export \
+  --pod-count 4 \
+  --gpu-type "NVIDIA RTX 4090" \
+  --container-image your-repo/kp-export:latest \
+  --network-volume-id <volume_id> \
+  -- \
+  --in-dir datasets/phoenix/videos_phoenix/videos \
+  --pattern "*/*.mp4" \
+  --image-coords \
+  --pose-every 1 \
+  --postprocess
+```
+
+### 2. Launch pods through Runpod API
+
+`launch` reads the generated `run_spec.json` and creates one pod per shard.
+
+```bash
+python scripts/runpod_extract.py launch \
+  --run-spec /workspace/kp_export_runs/phoenix_4090_v1/run_spec.json
+```
+
+Set `RUNPOD_API_KEY` in the environment or pass `--api-key`.
+
+### 3. Watch shard progress
+
+Each pod writes:
+
+- `status/shard-xxxxx.json`
+- `logs/shard-xxxxx.events.jsonl`
+- `logs/shard-xxxxx.failed_samples.txt`
+
+Aggregate them with:
+
+```bash
+python scripts/runpod_extract.py watch \
+  --run-spec /workspace/kp_export_runs/phoenix_4090_v1/run_spec.json
+```
+
+Live follow mode:
+
+```bash
+python scripts/runpod_extract.py watch \
+  --run-spec /workspace/kp_export_runs/phoenix_4090_v1/run_spec.json \
+  --follow \
+  --compact
+```
+
+### 4. Merge shard artifacts
+
+```bash
+python scripts/runpod_extract.py merge \
+  --run-root /workspace/kp_export_runs/phoenix_4090_v1
+```
+
+This writes the merged final artifact under:
+
+- `/workspace/kp_export_runs/<run_id>/merged/landmarks.zarr`
+- `/workspace/kp_export_runs/<run_id>/merged/videos.parquet`
+- `/workspace/kp_export_runs/<run_id>/merged/frames.parquet`
+- `/workspace/kp_export_runs/<run_id>/merged/runs.parquet`
+
+### 5. Validate shard or merged outputs
+
+```bash
+python scripts/runpod_extract.py validate \
+  --run-root /workspace/kp_export_runs/phoenix_4090_v1 \
+  --include-shards \
+  --include-merged
+```
+
+### 6. Build retry manifests from failures
+
+```bash
+python scripts/runpod_extract.py retry \
+  --all-tasks /workspace/kp_export_runs/phoenix_4090_v1/manifests/all_tasks.jsonl \
+  --failure-file /workspace/kp_export_runs/phoenix_4090_v1/logs/shard-00000.failed_samples.txt \
+  --out-manifest /workspace/kp_export_runs/phoenix_4090_v1/manifests/retry_failed.jsonl
+```
+
+### 7. Stop or terminate pods
+
+Terminate the whole run after merge/validate:
+
+```bash
+python scripts/runpod_extract.py terminate \
+  --run-spec /workspace/kp_export_runs/phoenix_4090_v1/run_spec.json
+```
+
+Or stop without deleting:
+
+```bash
+python scripts/runpod_extract.py terminate \
+  --run-spec /workspace/kp_export_runs/phoenix_4090_v1/run_spec.json \
+  --stop-only
+```
+
+Notes:
+
+- `scripts/runpod_entrypoint.sh` is the default pod entrypoint used by `Dockerfile.runpod`.
+- `requirements.runpod.txt` is a minimal extractor-only runtime environment for Ubuntu pods.
+- For GPU delegate mode on Ubuntu pods, extractor now forces `--jobs 1` by default unless you override it explicitly.
+
 ## Prepare PHOENIX-2014T Annotations
 
 Before extraction, unpack PHOENIX annotation gzip files into TSV / JSONL:
