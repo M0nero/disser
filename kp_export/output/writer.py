@@ -257,16 +257,28 @@ class ExtractorOutputWriter:
             rows.append(out)
         return normalize_rows(rows, FRAME_PARQUET_COLUMNS)
 
+    @staticmethod
+    def _normalize_payload(payload: Any) -> Dict[str, Any]:
+        if isinstance(payload, dict):
+            return dict(payload)
+        to_dict = getattr(payload, "to_dict", None)
+        if callable(to_dict):
+            normalized = to_dict()
+            if isinstance(normalized, dict):
+                return normalized
+        raise TypeError(f"Unsupported payload type for commit_payload: {type(payload).__name__}")
+
     def commit_staged_sample(self, staged_path: str | Path) -> Dict[str, Any]:
         payload = load_staged_payload(staged_path)
         return self.commit_payload(payload, remove_stage_path=staged_path)
 
     def commit_payload(
         self,
-        payload: Dict[str, Any],
+        payload: Any,
         *,
         remove_stage_path: str | Path | None = None,
     ) -> Dict[str, Any]:
+        payload = self._normalize_payload(payload)
         sample_id = str(payload["sample_id"])
         zarr_group, info = self._write_sample_group(payload)
         has_pp = bool(info.get("has_pp"))

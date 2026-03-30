@@ -10,6 +10,7 @@ import zarr
 
 from kp_export.output.staging import write_staged_payload
 from kp_export.output.writer import ExtractorOutputWriter
+from kp_export.process.contracts import SamplePayload
 
 
 def _sample_payload(sample_id: str, *, with_pp: bool) -> dict:
@@ -260,6 +261,33 @@ class ExtractorOutputWriterTests(unittest.TestCase):
                 staged_root["samples"]["sample_direct"]["raw"]["left_xyz"].shape,
                 direct_root["samples"]["sample_direct"]["raw"]["left_xyz"].shape,
             )
+
+    def test_commit_payload_accepts_sample_payload_object(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp)
+            payload = SamplePayload(**_sample_payload("sample_obj", with_pp=False))
+            writer = ExtractorOutputWriter(
+                out_dir=out_dir,
+                run_id="run_obj",
+                args_snapshot={"jobs": 1},
+                versions={"python": "test"},
+            )
+            video_row = writer.commit_payload(payload)
+            writer.finalize(
+                scheduled_count=1,
+                skipped_count=0,
+                failed_count=0,
+                processed_count=1,
+                segments_mode=False,
+                jobs=1,
+                seed=0,
+                mp_backend="tasks",
+                aggregate={"quality_score": 0.75},
+            )
+
+            self.assertEqual(video_row["sample_id"], "sample_obj")
+            root = zarr.open_group(str(out_dir / "landmarks.zarr"), mode="r")
+            self.assertIn("sample_obj", root["samples"])
 
     def test_finalize_writes_empty_parquet_tables_when_no_samples_committed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
