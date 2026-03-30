@@ -49,31 +49,23 @@ function Invoke-SshCapture {
     return ($output | Out-String).Trim()
 }
 
-function Invoke-ScpCopyDir {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$LocalPath,
-
-        [Parameter(Mandatory = $true)]
-        [string]$RemotePath
-    )
-
-    & scp "-q" "-P" $Port "-i" $SshKeyPath "-r" $LocalPath "root@$IpAddress`:$RemotePath"
-    if ($LASTEXITCODE -ne 0) {
-        throw "SCP copy failed: $LocalPath -> $RemotePath"
-    }
-}
-
 function Invoke-ScpCopyFile {
     param(
         [Parameter(Mandatory = $true)]
         [string]$LocalPath,
 
         [Parameter(Mandatory = $true)]
-        [string]$RemotePath
+        [string]$RemotePath,
+
+        [switch]$Quiet
     )
 
-    & scp "-q" "-P" $Port "-i" $SshKeyPath $LocalPath "root@$IpAddress`:$RemotePath"
+    $scpArgs = @()
+    if ($Quiet) {
+        $scpArgs += "-q"
+    }
+    $scpArgs += @("-P", $Port, "-i", $SshKeyPath, $LocalPath, "root@$IpAddress`:$RemotePath")
+    & scp @scpArgs
     if ($LASTEXITCODE -ne 0) {
         throw "SCP copy failed: $LocalPath -> $RemotePath"
     }
@@ -107,7 +99,6 @@ else
   rm -rf "$RemoteRepoPath"
   git clone "$RepoUrl" "$RemoteRepoPath"
 fi
-
 cd "$RemoteRepoPath"
 python3 -m venv "$RemoteVenvPath"
 "$RemoteVenvPath/bin/python" -m pip install --upgrade pip setuptools wheel
@@ -118,7 +109,7 @@ python3 -m venv "$RemoteVenvPath"
 
 $bootstrapScript = [System.IO.Path]::GetTempFileName() + ".sh"
 Set-Content -Path $bootstrapScript -Value $remoteBootstrap -NoNewline
-Invoke-ScpCopyFile -LocalPath $bootstrapScript -RemotePath "/tmp/runpod_bootstrap_extract_bootstrap.sh"
+Invoke-ScpCopyFile -LocalPath $bootstrapScript -RemotePath "/tmp/runpod_bootstrap_extract_bootstrap.sh" -Quiet
 Invoke-Ssh "bash /tmp/runpod_bootstrap_extract_bootstrap.sh"
 Remove-Item -Path $bootstrapScript -Force
 if ($LASTEXITCODE -ne 0) {
@@ -127,9 +118,20 @@ if ($LASTEXITCODE -ne 0) {
 
 $hasSubset = Invoke-SshCapture "bash -lc 'test -f $RemoteSubsetManifest && echo yes || echo no'"
 if ($hasSubset -ne "yes") {
-    Write-Host "Copying video subset to pod" -ForegroundColor Cyan
-    Invoke-ScpCopyDir -LocalPath $LocalSubsetPath -RemotePath $RemoteDataRoot
-    Invoke-Ssh "bash -lc 'if [ -d $RemoteDataRoot/runpod_phoenix_100 ] && [ ! -e $RemoteSubsetPath ]; then mv $RemoteDataRoot/runpod_phoenix_100 $RemoteSubsetPath; fi'"
+    Write-Host "Packing local video subset into a single tar archive" -ForegroundColor Cyan
+    $subsetArchive = Join-Path ([System.IO.Path]::GetTempPath()) "runpod_phoenix_100_subset.tar"
+    if (Test-Path $subsetArchive) {
+        Remove-Item -Path $subsetArchive -Force
+    }
+    & tar.exe "-C" $LocalSubsetPath "-cf" $subsetArchive "."
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to create local subset archive: $subsetArchive"
+    }
+    Write-Host "Uploading subset archive to pod" -ForegroundColor Cyan
+    Invoke-ScpCopyFile -LocalPath $subsetArchive -RemotePath "/tmp/runpod_phoenix_100_subset.tar"
+    Write-Host "Extracting subset archive on pod" -ForegroundColor Cyan
+    Invoke-Ssh "bash -lc 'rm -rf $RemoteSubsetPath && mkdir -p $RemoteSubsetPath && tar -xf /tmp/runpod_phoenix_100_subset.tar -C $RemoteSubsetPath && rm -f /tmp/runpod_phoenix_100_subset.tar'"
+    Remove-Item -Path $subsetArchive -Force
 } else {
     Write-Host "Video subset already exists on pod, skipping copy" -ForegroundColor Yellow
 }
@@ -151,7 +153,7 @@ echo "jobs=__JOBS__"
 echo "out_dir=$OUT_DIR"
 
 cd "__REMOTE_REPO_PATH__"
-"__REMOTE_VENV_PATH__/bin/python" scripts/extract_keypoints.py \
+"__REMOTE_VENV_PATH__/bin/python" -u scripts/extract_keypoints.py \
   --in-dir "__REMOTE_SUBSET_PATH__" \
   --pattern "**/*.mp4" \
   --out-dir "$OUT_DIR" \
@@ -211,7 +213,7 @@ $remoteRun = $remoteRunTemplate.Replace("__REMOTE_OUTPUT_ROOT__", $RemoteOutputR
 Write-Host "Starting extraction on pod" -ForegroundColor Cyan
 $runScript = [System.IO.Path]::GetTempFileName() + ".sh"
 Set-Content -Path $runScript -Value $remoteRun -NoNewline
-Invoke-ScpCopyFile -LocalPath $runScript -RemotePath "/tmp/runpod_bootstrap_extract_run.sh"
+Invoke-ScpCopyFile -LocalPath $runScript -RemotePath "/tmp/runpod_bootstrap_extract_run.sh" -Quiet
 Invoke-Ssh "bash /tmp/runpod_bootstrap_extract_run.sh"
 Remove-Item -Path $runScript -Force
 if ($LASTEXITCODE -ne 0) {

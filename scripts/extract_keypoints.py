@@ -1,5 +1,6 @@
 from __future__ import annotations
 import argparse, csv, json, os, sys, traceback, uuid
+import multiprocessing
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 import re
@@ -29,7 +30,14 @@ from kp_export.config import (
     TrackingConfig,
     VideoConfig,
 )
-from kp_export.parallel import normalize_sample_id, process_worker, slug_for
+from kp_export.parallel import (
+    detect_available_cpu_ids,
+    init_process_worker,
+    normalize_sample_id,
+    plan_cpu_affinity_assignments,
+    process_worker,
+    slug_for,
+)
 from kp_export.process import process_video
 from kp_export.process.adapters import MediaPipeGpuSession
 from kp_export.mp.mp_utils import resolve_task_model_path, try_import_mediapipe
@@ -411,7 +419,7 @@ def _maybe_report_progress(
         end = "\n" if force or done_count == total else "\r"
         print(line.ljust(120), end=end, flush=True)
     else:
-        print(line)
+        print(line, flush=True)
     if reporter is not None:
         reporter.update(
             state="running",
@@ -617,7 +625,7 @@ def _emit_runtime_summary(
         f"videos/s={videos_per_sec:.3f} frames/s={frames_per_sec:.2f}"
         if videos_per_sec is not None and frames_per_sec is not None
         else f"[SUMMARY] mode={execution_mode} ok={videos} failed={failed_count} skipped={skipped_existing} frames={frames} elapsed={_format_duration_hms(elapsed)}"
-    )
+    , flush=True)
     print(
         "[SUMMARY] "
         f"stages decode={runtime_totals.get('decode_runtime', 0.0):.1f}s "
@@ -626,7 +634,7 @@ def _emit_runtime_summary(
         f"pose={runtime_totals.get('pose_runtime', 0.0):.1f}s "
         f"pass2={runtime_totals.get('second_pass_runtime', 0.0):.1f}s "
         f"writer={runtime_totals.get('writer_runtime', 0.0):.1f}s"
-    )
+    , flush=True)
     if native_warnings:
         compact = ", ".join(f"{item['kind']}={item['count']}" for item in native_warnings[:3])
         print(
@@ -634,7 +642,7 @@ def _emit_runtime_summary(
             f"suppressed_native_stderr={sum(int(item.get('count', 0) or 0) for item in native_warnings)} "
             f"top=[{compact}]"
             + (f" path={native_stderr_label}" if native_stderr_label else "")
-        )
+        , flush=True)
 
 
 def _ensure_writable_dir(path: Path, label: str) -> None:
@@ -1015,12 +1023,12 @@ def main(argv: Optional[List[str]] = None, *, _print_errors: bool = True) -> Dic
         )
         jobs = int(args.jobs)
         if execution_mode == "gpu_single" and jobs != 1:
-            print("[WARN] gpu_single mode ignores --jobs and forces one extractor worker per GPU.")
+            print("[WARN] gpu_single mode ignores --jobs and forces one extractor worker per GPU.", flush=True)
             jobs = 1
         if execution_mode == "gpu_single":
-            print("[WARN] gpu_single uses one in-process GPU worker; utilization may remain bursty by design.")
+            print("[WARN] gpu_single uses one in-process GPU worker; utilization may remain bursty by design.", flush=True)
         if execution_mode == "gpu_single" and bool(args.second_pass):
-            print("[WARN] gpu_single keeps second-pass parity enabled; GPU utilization may still be bursty by design.")
+            print("[WARN] gpu_single keeps second-pass parity enabled; GPU utilization may still be bursty by design.", flush=True)
         args.jobs = jobs
         args.execution_mode = execution_mode
         args.gpu_prefetch_frames = max(1, int(args.gpu_prefetch_frames))
@@ -1190,7 +1198,7 @@ def main(argv: Optional[List[str]] = None, *, _print_errors: bool = True) -> Dic
                 "path": str(args.write_task_manifest),
                 "tasks": len(tasks),
             })
-            print(f"[OK] Task manifest written to {args.write_task_manifest}")
+            print(f"[OK] Task manifest written to {args.write_task_manifest}", flush=True)
             if args.prepare_only:
                 return {
                     "ok": True,
@@ -1234,7 +1242,7 @@ def main(argv: Optional[List[str]] = None, *, _print_errors: bool = True) -> Dic
             "[INFO] "
             f"selected={total_items} scheduled={len(tasks)} "
             f"skipped_existing={int(skipped_existing)}"
-        )
+        , flush=True)
 
         failures_path = Path(args.failures_path) if args.failures_path else None
         reporter = ShardStatusReporter(
@@ -1262,22 +1270,41 @@ def main(argv: Optional[List[str]] = None, *, _print_errors: bool = True) -> Dic
             remaining=len(tasks),
         )
         visible_gpu_count = _detect_visible_gpu_count() if execution_mode == "gpu_single" else None
+        visible_cpu_ids = detect_available_cpu_ids() if execution_mode == "cpu_pool" else []
+        cpu_affinity_assignments = (
+            plan_cpu_affinity_assignments(visible_cpu_ids, jobs)
+            if execution_mode == "cpu_pool" and mp_backend == "tasks" and mp_tasks_delegate == "cpu" and jobs > 1
+            else []
+        )
+        cpu_affinity_min = min((len(item) for item in cpu_affinity_assignments), default=0)
+        cpu_affinity_max = max((len(item) for item in cpu_affinity_assignments), default=0)
         capability_payload = {
             "mp_backend": str(mp_backend),
             "mp_tasks_delegate": str(mp_tasks_delegate),
             "execution_mode": str(execution_mode),
             "visible_gpus": int(visible_gpu_count) if visible_gpu_count is not None else None,
+            "visible_cpus": int(len(visible_cpu_ids)) if visible_cpu_ids else None,
             "worker_count": int(jobs),
             "gpu_prefetch_frames": int(config.runtime.gpu_prefetch_frames) if execution_mode == "gpu_single" else 0,
+            "cpu_affinity_enabled": bool(cpu_affinity_assignments),
+            "cpu_affinity_cores_min": int(cpu_affinity_min) if cpu_affinity_assignments else 0,
+            "cpu_affinity_cores_max": int(cpu_affinity_max) if cpu_affinity_assignments else 0,
         }
         log_metrics(logger, "extract_keypoints.capabilities", capability_payload)
         reporter.emit_event("run_capabilities", **capability_payload)
+        cpu_affinity_suffix = ""
+        if capability_payload["cpu_affinity_enabled"]:
+            cpu_affinity_suffix = (
+                " "
+                f"cpu_affinity=on quota={capability_payload['cpu_affinity_cores_min']}-{capability_payload['cpu_affinity_cores_max']}"
+            )
         print(
             "[INFO] "
             f"backend={mp_backend} delegate={mp_tasks_delegate} mode={execution_mode} "
             f"visible_gpus={visible_gpu_count if visible_gpu_count is not None else '?'} "
             f"workers={jobs} prefetch={capability_payload['gpu_prefetch_frames']}"
-        )
+            f"{cpu_affinity_suffix}"
+        , flush=True)
 
         processed_rows: List[Dict[str, Any]] = []
         failed_count = 0
@@ -1361,9 +1388,9 @@ def main(argv: Optional[List[str]] = None, *, _print_errors: bool = True) -> Dic
                                 _write_failures_line(failures_path, t.sample_id)
                                 reporter.note_failure(t.sample_id, key)
                                 if error_counts[key] == 1:
-                                    print(f"[ERROR] {t.sample_id}: {e}")
+                                    print(f"[ERROR] {t.sample_id}: {e}", flush=True)
                                 elif error_counts[key] in {10, 50, 100}:
-                                    print(f"[ERROR] repeated {error_counts[key]}x: {e}")
+                                    print(f"[ERROR] repeated {error_counts[key]}x: {e}", flush=True)
                                 log_metrics(logger, "extract_keypoints.worker_error", {
                                     "error": str(e),
                                     "sample_id": str(t.sample_id),
@@ -1385,7 +1412,7 @@ def main(argv: Optional[List[str]] = None, *, _print_errors: bool = True) -> Dic
                                     last_sample_id=last_sample_id,
                                 )
                     except KeyboardInterrupt:
-                        print("\n[INTERRUPTED] Stopping GPU extraction...")
+                        print("\n[INTERRUPTED] Stopping GPU extraction...", flush=True)
                         log_metrics(logger, "extract_keypoints.interrupted", {
                             "jobs": 1,
                             "processed_so_far": len(processed_rows),
@@ -1406,10 +1433,21 @@ def main(argv: Optional[List[str]] = None, *, _print_errors: bool = True) -> Dic
                             gpu_session.close()
                 elif jobs > 1 and tasks:
                     ex: Optional[ProcessPoolExecutor] = None
+                    manager: Optional[multiprocessing.managers.SyncManager] = None
+                    affinity_queue = None
                     interrupted = False
                     broken_pool = False
                     try:
-                        ex = ProcessPoolExecutor(max_workers=jobs)
+                        if cpu_affinity_assignments:
+                            manager = multiprocessing.Manager()
+                            affinity_queue = manager.Queue()
+                            for assignment in cpu_affinity_assignments:
+                                affinity_queue.put(list(assignment))
+                        ex = ProcessPoolExecutor(
+                            max_workers=jobs,
+                            initializer=init_process_worker if affinity_queue is not None else None,
+                            initargs=(affinity_queue,) if affinity_queue is not None else (),
+                        )
                         fut_to_task = {ex.submit(process_worker, t.to_payload()): t for t in tasks}
                         for fut in as_completed(fut_to_task):
                             task = fut_to_task[fut]
@@ -1437,7 +1475,7 @@ def main(argv: Optional[List[str]] = None, *, _print_errors: bool = True) -> Dic
                                 error_counts[key] = error_counts.get(key, 0) + 1
                                 _write_failures_line(failures_path, task.sample_id)
                                 reporter.note_failure(task.sample_id, key)
-                                print(f"[ERROR] Worker pool crashed: {e}")
+                                print(f"[ERROR] Worker pool crashed: {e}", flush=True)
                                 log_metrics(logger, "extract_keypoints.worker_pool_broken", {
                                     "error": str(e),
                                     "sample_id": str(task.sample_id),
@@ -1453,9 +1491,9 @@ def main(argv: Optional[List[str]] = None, *, _print_errors: bool = True) -> Dic
                                 _write_failures_line(failures_path, task.sample_id)
                                 reporter.note_failure(task.sample_id, key)
                                 if error_counts[key] == 1:
-                                    print(f"[ERROR] {task.sample_id}: {e}")
+                                    print(f"[ERROR] {task.sample_id}: {e}", flush=True)
                                 elif error_counts[key] in {10, 50, 100}:
-                                    print(f"[ERROR] repeated {error_counts[key]}x: {e}")
+                                    print(f"[ERROR] repeated {error_counts[key]}x: {e}", flush=True)
                                 log_metrics(logger, "extract_keypoints.worker_error", {
                                     "error": str(e),
                                     "sample_id": str(task.sample_id),
@@ -1485,7 +1523,7 @@ def main(argv: Optional[List[str]] = None, *, _print_errors: bool = True) -> Dic
                             )
                     except KeyboardInterrupt:
                         interrupted = True
-                        print("\n[INTERRUPTED] Stopping workers...")
+                        print("\n[INTERRUPTED] Stopping workers...", flush=True)
                         log_metrics(logger, "extract_keypoints.interrupted", {
                             "jobs": int(jobs),
                             "processed_so_far": len(processed_rows),
@@ -1505,6 +1543,8 @@ def main(argv: Optional[List[str]] = None, *, _print_errors: bool = True) -> Dic
                     finally:
                         if ex is not None and not interrupted:
                             ex.shutdown(wait=True, cancel_futures=False)
+                        if manager is not None:
+                            manager.shutdown()
                 else:
                     try:
                         for t in tasks:
@@ -1532,9 +1572,9 @@ def main(argv: Optional[List[str]] = None, *, _print_errors: bool = True) -> Dic
                                 _write_failures_line(failures_path, t.sample_id)
                                 reporter.note_failure(t.sample_id, key)
                                 if error_counts[key] == 1:
-                                    print(f"[ERROR] {t.sample_id}: {e}")
+                                    print(f"[ERROR] {t.sample_id}: {e}", flush=True)
                                 elif error_counts[key] in {10, 50, 100}:
-                                    print(f"[ERROR] repeated {error_counts[key]}x: {e}")
+                                    print(f"[ERROR] repeated {error_counts[key]}x: {e}", flush=True)
                                 log_metrics(logger, "extract_keypoints.worker_error", {
                                     "error": str(e),
                                     "sample_id": str(t.sample_id),
@@ -1555,7 +1595,7 @@ def main(argv: Optional[List[str]] = None, *, _print_errors: bool = True) -> Dic
                                     last_sample_id=last_sample_id,
                                 )
                     except KeyboardInterrupt:
-                        print("\n[INTERRUPTED] Stopping...")
+                        print("\n[INTERRUPTED] Stopping...", flush=True)
                         log_metrics(logger, "extract_keypoints.interrupted", {
                             "jobs": 1,
                             "processed_so_far": len(processed_rows),
@@ -1640,10 +1680,10 @@ def main(argv: Optional[List[str]] = None, *, _print_errors: bool = True) -> Dic
             remaining=0,
             last_sample_id=last_sample_id,
         )
-        print(f"[OK] Zarr written to {output_paths['zarr_path']}")
-        print(f"[OK] Videos parquet written to {output_paths['videos_parquet_path']}")
-        print(f"[OK] Frames parquet written to {output_paths['frames_parquet_path']}")
-        print(f"[OK] Runs parquet written to {output_paths['runs_parquet_path']}")
+        print(f"[OK] Zarr written to {output_paths['zarr_path']}", flush=True)
+        print(f"[OK] Videos parquet written to {output_paths['videos_parquet_path']}", flush=True)
+        print(f"[OK] Frames parquet written to {output_paths['frames_parquet_path']}", flush=True)
+        print(f"[OK] Runs parquet written to {output_paths['runs_parquet_path']}", flush=True)
         return {
             "ok": True,
             "out_dir": str(out_dir),

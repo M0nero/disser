@@ -9,6 +9,8 @@ from .output.staging import write_staged_payload
 from .process import process_task
 from .tasks import TaskSpec
 
+_WORKER_CPU_AFFINITY: tuple[int, ...] = ()
+
 
 def normalize_sample_id(value: str) -> str:
     sample_id = str(value or "").strip().replace("\\", "__").replace("/", "__")
@@ -49,6 +51,63 @@ def _resolve_debug_video_path(config: ExtractorConfig, slug: str) -> Optional[Pa
     return target / f"{slug}.mp4"
 
 
+def detect_available_cpu_ids() -> list[int]:
+    get_affinity = getattr(os, "sched_getaffinity", None)
+    if callable(get_affinity):
+        try:
+            return sorted(int(cpu) for cpu in get_affinity(0))
+        except Exception:
+            pass
+    cpu_count = int(os.cpu_count() or 1)
+    return list(range(max(1, cpu_count)))
+
+
+def plan_cpu_affinity_assignments(available_cpus: list[int], workers: int) -> list[tuple[int, ...]]:
+    cpus = [int(cpu) for cpu in available_cpus]
+    if not cpus:
+        return []
+    worker_count = max(1, min(int(workers), len(cpus)))
+    base = len(cpus) // worker_count
+    remainder = len(cpus) % worker_count
+    assignments: list[tuple[int, ...]] = []
+    start = 0
+    for idx in range(worker_count):
+        size = base + (1 if idx < remainder else 0)
+        stop = start + size
+        chunk = tuple(cpus[start:stop])
+        if not chunk:
+            chunk = (cpus[idx % len(cpus)],)
+        assignments.append(chunk)
+        start = stop
+    return assignments
+
+
+def _apply_cpu_affinity(cpu_ids: list[int] | tuple[int, ...]) -> tuple[int, ...]:
+    assigned = tuple(sorted({int(cpu) for cpu in cpu_ids}))
+    if not assigned:
+        return ()
+    set_affinity = getattr(os, "sched_setaffinity", None)
+    if not callable(set_affinity):
+        return ()
+    try:
+        set_affinity(0, set(assigned))
+    except Exception:
+        return ()
+    return assigned
+
+
+def init_process_worker(affinity_queue: Any = None) -> None:
+    global _WORKER_CPU_AFFINITY
+    _WORKER_CPU_AFFINITY = ()
+    if affinity_queue is None:
+        return
+    try:
+        cpu_ids = affinity_queue.get_nowait()
+    except Exception:
+        return
+    _WORKER_CPU_AFFINITY = _apply_cpu_affinity(tuple(int(cpu) for cpu in cpu_ids))
+
+
 def process_worker(payload: dict) -> Dict[str, Any]:
     task_spec = TaskSpec.from_payload(payload)
     config = ExtractorConfig.from_dict(task_spec.config_dict)
@@ -66,7 +125,7 @@ def process_worker(payload: dict) -> Dict[str, Any]:
     in_dir = Path(config.video.in_dir) if config.video.in_dir else None
     out_dir = Path(config.video.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    stage_dir = Path(config.output.stage_dir)
+    stage_dir = Path(config.output.stage_dir) / f"worker_{os.getpid()}"
     stage_dir.mkdir(parents=True, exist_ok=True)
 
     slug = str(task_spec.slug or segment.get("seg_uid") or slug_for(vpath, in_dir))
@@ -90,6 +149,7 @@ def process_worker(payload: dict) -> Dict[str, Any]:
         "frame_start": frame_start,
         "frame_end": frame_end,
         "seg_uid": segment.get("seg_uid") if segment else None,
+        "cpu_affinity": list(_WORKER_CPU_AFFINITY),
     })
 
     try:
