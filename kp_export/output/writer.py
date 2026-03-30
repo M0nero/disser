@@ -310,10 +310,11 @@ class ExtractorOutputWriter:
             new = self._empty_table(columns)
         if len(new) == 0:
             if len(existing) == 0:
-                pq.write_table(self._empty_table(columns), final_path)
-                return
+                empty = self._empty_table(columns)
+                pq.write_table(empty, final_path)
+                return empty
             pq.write_table(existing, final_path)
-            return
+            return existing
         if "sample_id" in existing.column_names and len(existing) > 0:
             sample_ids = [str(x) for x in new["sample_id"].to_pylist() if x is not None]
             if sample_ids:
@@ -321,6 +322,64 @@ class ExtractorOutputWriter:
                 existing = existing.filter(pc.invert(mask))
         merged = pa.concat_tables([existing, new], promote_options="default")
         pq.write_table(merged, final_path)
+        return merged
+
+    @staticmethod
+    def _aggregate_video_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+        frames_total = 0.0
+        quality_sum = 0.0
+        quality_frames = 0.0
+        swap_total = 0.0
+        missing_total = 0.0
+        outlier_total = 0.0
+        sanity_total = 0.0
+        pp_filled_total = 0.0
+        pp_filled_seen = False
+        pp_delta_weighted_sum = 0.0
+        pp_delta_weighted_frames = 0.0
+
+        for row in rows:
+            num_frames = float(int(row.get("num_frames", 0) or 0))
+            if num_frames <= 0:
+                continue
+            frames_total += num_frames
+            quality = row.get("quality_score")
+            if quality is not None:
+                quality_sum += float(quality) * num_frames
+                quality_frames += num_frames
+            swap_total += float(row.get("swap_frames", 0) or 0)
+            missing_total += float(row.get("missing_frames_1", 0) or 0) + float(row.get("missing_frames_2", 0) or 0)
+            outlier_total += float(row.get("outlier_frames_1", 0) or 0) + float(row.get("outlier_frames_2", 0) or 0)
+            sanity_total += float(row.get("sanity_reject_frames_1", 0) or 0) + float(row.get("sanity_reject_frames_2", 0) or 0)
+            if row.get("pp_filled_left") is not None or row.get("pp_filled_right") is not None:
+                pp_filled_seen = True
+                pp_filled_total += float(row.get("pp_filled_left", 0) or 0) + float(row.get("pp_filled_right", 0) or 0)
+            pp_delta_vals = []
+            if row.get("pp_smoothing_delta_left") is not None:
+                pp_delta_vals.append(float(row.get("pp_smoothing_delta_left")))
+            if row.get("pp_smoothing_delta_right") is not None:
+                pp_delta_vals.append(float(row.get("pp_smoothing_delta_right")))
+            if pp_delta_vals:
+                pp_delta_weighted_sum += (sum(pp_delta_vals) / len(pp_delta_vals)) * num_frames
+                pp_delta_weighted_frames += num_frames
+
+        return {
+            "quality_score": (quality_sum / quality_frames) if quality_frames > 0.0 else None,
+            "swap_rate": (swap_total / frames_total) if frames_total > 0.0 else None,
+            "missing_rate": (missing_total / (2.0 * frames_total)) if frames_total > 0.0 else None,
+            "outlier_rate": (outlier_total / (2.0 * frames_total)) if frames_total > 0.0 else None,
+            "sanity_reject_rate": (sanity_total / (2.0 * frames_total)) if frames_total > 0.0 else None,
+            "pp_filled_frac": (pp_filled_total / (2.0 * frames_total)) if pp_filled_seen and frames_total > 0.0 else None,
+            "pp_smoothing_delta": (pp_delta_weighted_sum / pp_delta_weighted_frames) if pp_delta_weighted_frames > 0.0 else None,
+        }
+
+    @classmethod
+    def _snapshot_from_video_table(cls, table: Any) -> tuple[int, Dict[str, Any]]:
+        try:
+            rows = table.to_pylist()
+        except Exception:
+            rows = []
+        return len(rows), cls._aggregate_video_rows(rows)
 
     def finalize(
         self,
@@ -345,8 +404,21 @@ class ExtractorOutputWriter:
             self._frame_writer.close()
             self._frame_writer = None
 
-        self._merge_table(self.videos_parquet_path, self._video_stage_path, self.videos_parquet_path, VIDEO_PARQUET_COLUMNS)
-        self._merge_table(self.frames_parquet_path, self._frame_stage_path, self.frames_parquet_path, FRAME_PARQUET_COLUMNS)
+        merged_videos = self._merge_table(
+            self.videos_parquet_path,
+            self._video_stage_path,
+            self.videos_parquet_path,
+            VIDEO_PARQUET_COLUMNS,
+        )
+        self._merge_table(
+            self.frames_parquet_path,
+            self._frame_stage_path,
+            self.frames_parquet_path,
+            FRAME_PARQUET_COLUMNS,
+        )
+
+        snapshot_processed_count, snapshot_aggregate = self._snapshot_from_video_table(merged_videos)
+        snapshot_scheduled_count = int(snapshot_processed_count + max(0, int(failed_count)))
 
         run_row = {
             "run_id": self.run_id,
@@ -361,21 +433,21 @@ class ExtractorOutputWriter:
             "args_json": json.dumps(self.args_snapshot, ensure_ascii=False, sort_keys=True, default=str),
             "versions_json": json.dumps(self.versions, ensure_ascii=False, sort_keys=True, default=str),
             "sample_count_existing": int(len(self._existing_ids)),
-            "sample_count_scheduled": int(scheduled_count),
-            "sample_count_processed": int(processed_count),
+            "sample_count_scheduled": int(snapshot_scheduled_count),
+            "sample_count_processed": int(snapshot_processed_count),
             "sample_count_skipped": int(skipped_count),
             "sample_count_failed": int(failed_count),
             "segments_mode": bool(segments_mode),
             "jobs": int(jobs),
             "seed": int(seed),
             "mp_backend": str(mp_backend),
-            "quality_score": aggregate.get("quality_score"),
-            "swap_rate": aggregate.get("swap_rate"),
-            "missing_rate": aggregate.get("missing_rate"),
-            "outlier_rate": aggregate.get("outlier_rate"),
-            "sanity_reject_rate": aggregate.get("sanity_reject_rate"),
-            "pp_filled_frac": aggregate.get("pp_filled_frac"),
-            "pp_smoothing_delta": aggregate.get("pp_smoothing_delta"),
+            "quality_score": snapshot_aggregate.get("quality_score"),
+            "swap_rate": snapshot_aggregate.get("swap_rate"),
+            "missing_rate": snapshot_aggregate.get("missing_rate"),
+            "outlier_rate": snapshot_aggregate.get("outlier_rate"),
+            "sanity_reject_rate": snapshot_aggregate.get("sanity_reject_rate"),
+            "pp_filled_frac": snapshot_aggregate.get("pp_filled_frac"),
+            "pp_smoothing_delta": snapshot_aggregate.get("pp_smoothing_delta"),
         }
         run_schema = pa.schema([self._field_to_arrow(name, kind) for name, kind in RUN_PARQUET_COLUMNS])
         run_table = pa.Table.from_pylist([normalize_row(run_row, RUN_PARQUET_COLUMNS)], schema=run_schema)
@@ -390,15 +462,15 @@ class ExtractorOutputWriter:
                 "latest_run_id": self.run_id,
                 "latest_run_created_at": self.created_at,
                 "latest_run_summary": {
-                    "scheduled_count": int(scheduled_count),
+                    "scheduled_count": int(snapshot_scheduled_count),
                     "skipped_count": int(skipped_count),
                     "failed_count": int(failed_count),
-                    "processed_count": int(processed_count),
+                    "processed_count": int(snapshot_processed_count),
                     "segments_mode": bool(segments_mode),
                     "jobs": int(jobs),
                     "seed": int(seed),
                     "mp_backend": str(mp_backend),
-                    "aggregate": dict(aggregate),
+                    "aggregate": dict(snapshot_aggregate),
                 },
             }
         )

@@ -2,6 +2,7 @@ from __future__ import annotations
 import argparse, csv, json, sys, traceback, uuid
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
+from time import perf_counter
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -324,6 +325,70 @@ def _aggregate_video_rows(rows: List[Dict[str, Any]]) -> Dict[str, Optional[floa
         "pp_filled_frac": (pp_filled_total / (2.0 * frames_total)) if pp_filled_seen and frames_total > 0.0 else None,
         "pp_smoothing_delta": (pp_delta_weighted_sum / pp_delta_weighted_frames) if pp_delta_weighted_frames > 0.0 else None,
     }
+
+
+def _format_duration_hms(seconds: Optional[float]) -> str:
+    if seconds is None:
+        return "?"
+    try:
+        total = max(0, int(round(float(seconds))))
+    except Exception:
+        return "?"
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours > 0:
+        return f"{hours:d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def _maybe_report_progress(
+    logger,
+    *,
+    started_at: float,
+    total: int,
+    ok_count: int,
+    failed_count: int,
+    state: Dict[str, Any],
+    force: bool = False,
+) -> None:
+    done_count = int(ok_count) + int(failed_count)
+    if total <= 0 or done_count <= 0:
+        return
+
+    now = perf_counter()
+    last_log_at = float(state.get("last_log_at", started_at))
+    last_done = int(state.get("last_done", 0))
+    done_delta = done_count - last_done
+    should_log = force or done_count == 1 or done_count == total or done_delta >= 25 or (now - last_log_at) >= 15.0
+    if not should_log:
+        return
+
+    elapsed = max(0.0, now - started_at)
+    rate = (done_count / elapsed) if elapsed > 0.0 else None
+    remaining = max(0, total - done_count)
+    eta_sec = (remaining / rate) if rate and rate > 0.0 else None
+    avg_sec = (elapsed / done_count) if done_count > 0 else None
+
+    payload = {
+        "done": int(done_count),
+        "total": int(total),
+        "ok": int(ok_count),
+        "failed": int(failed_count),
+        "remaining": int(remaining),
+        "elapsed_sec": round(elapsed, 3),
+        "avg_sec_per_video": round(avg_sec, 3) if avg_sec is not None else None,
+        "videos_per_sec": round(rate, 4) if rate is not None else None,
+        "eta_sec": round(eta_sec, 3) if eta_sec is not None else None,
+    }
+    log_metrics(logger, "extract_keypoints.progress", payload)
+    print(
+        "[PROGRESS] "
+        f"{done_count}/{total} "
+        f"| ok={ok_count} failed={failed_count} remaining={remaining} "
+        f"| elapsed={_format_duration_hms(elapsed)} eta={_format_duration_hms(eta_sec)}"
+    )
+    state["last_log_at"] = now
+    state["last_done"] = done_count
 
 
 def run_pipeline(argv: list[str]) -> dict:
@@ -788,9 +853,16 @@ def main(argv: Optional[List[str]] = None, *, _print_errors: bool = True) -> Dic
             "skip_existing": bool(args.skip_existing),
             "segments_mode": bool(segments_manifest),
         })
+        print(
+            "[INFO] "
+            f"selected={total_items} scheduled={len(tasks)} "
+            f"skipped_existing={int(skipped_existing)}"
+        )
 
         processed_rows: List[Dict[str, Any]] = []
         failed_count = 0
+        progress_started_at = perf_counter()
+        progress_state: Dict[str, Any] = {"last_log_at": progress_started_at, "last_done": 0}
         with track_runtime(logger, "extract_keypoints.processing", videos=len(tasks), jobs=args.jobs):
             if args.jobs > 1 and tasks:
                 ex: Optional[ProcessPoolExecutor] = None
@@ -807,6 +879,15 @@ def main(argv: Optional[List[str]] = None, *, _print_errors: bool = True) -> Dic
                             failed_count += 1
                             print(f"[ERROR] {e}")
                             log_metrics(logger, "extract_keypoints.worker_error", {"error": str(e)})
+                        finally:
+                            _maybe_report_progress(
+                                logger,
+                                started_at=progress_started_at,
+                                total=len(tasks),
+                                ok_count=len(processed_rows),
+                                failed_count=failed_count,
+                                state=progress_state,
+                            )
                 except KeyboardInterrupt:
                     interrupted = True
                     print("\n[INTERRUPTED] Stopping workers...")
@@ -832,6 +913,15 @@ def main(argv: Optional[List[str]] = None, *, _print_errors: bool = True) -> Dic
                             failed_count += 1
                             print(f"[ERROR] {e}")
                             log_metrics(logger, "extract_keypoints.worker_error", {"error": str(e)})
+                        finally:
+                            _maybe_report_progress(
+                                logger,
+                                started_at=progress_started_at,
+                                total=len(tasks),
+                                ok_count=len(processed_rows),
+                                failed_count=failed_count,
+                                state=progress_state,
+                            )
                 except KeyboardInterrupt:
                     print("\n[INTERRUPTED] Stopping...")
                     log_metrics(logger, "extract_keypoints.interrupted", {
@@ -840,6 +930,16 @@ def main(argv: Optional[List[str]] = None, *, _print_errors: bool = True) -> Dic
                         "failed_so_far": int(failed_count),
                     })
                     raise SystemExit(130)
+
+        _maybe_report_progress(
+            logger,
+            started_at=progress_started_at,
+            total=len(tasks),
+            ok_count=len(processed_rows),
+            failed_count=failed_count,
+            state=progress_state,
+            force=True,
+        )
 
         aggregate = _aggregate_video_rows(processed_rows)
         output_paths = writer.finalize(

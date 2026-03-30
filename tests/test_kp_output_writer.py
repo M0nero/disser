@@ -212,6 +212,57 @@ class ExtractorOutputWriterTests(unittest.TestCase):
             self.assertEqual(len(runs), 1)
             self.assertEqual(runs[0]["sample_count_failed"], 1)
 
+    def test_latest_run_row_reflects_merged_artifact_after_repair_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp)
+
+            writer1 = ExtractorOutputWriter(
+                out_dir=out_dir,
+                run_id="run_1",
+                args_snapshot={"jobs": 1},
+                versions={"python": "test"},
+            )
+            staged1 = write_staged_payload(writer1.current_run_dir, "sample_a", _sample_payload("sample_a", with_pp=False))
+            writer1.commit_staged_sample(staged1)
+            writer1.finalize(
+                scheduled_count=1,
+                skipped_count=0,
+                failed_count=0,
+                processed_count=1,
+                segments_mode=False,
+                jobs=1,
+                seed=0,
+                mp_backend="tasks",
+                aggregate={"quality_score": 0.75},
+            )
+
+            writer2 = ExtractorOutputWriter(
+                out_dir=out_dir,
+                run_id="run_2",
+                args_snapshot={"jobs": 1},
+                versions={"python": "test"},
+            )
+            staged2 = write_staged_payload(writer2.current_run_dir, "sample_b", _sample_payload("sample_b", with_pp=True))
+            writer2.commit_staged_sample(staged2)
+            writer2.finalize(
+                scheduled_count=1,
+                skipped_count=0,
+                failed_count=0,
+                processed_count=1,
+                segments_mode=False,
+                jobs=1,
+                seed=0,
+                mp_backend="tasks",
+                aggregate={"quality_score": 0.75},
+            )
+
+            runs = pq.read_table(out_dir / "runs.parquet").to_pylist()
+            self.assertEqual(len(runs), 2)
+            self.assertEqual(runs[-1]["sample_count_existing"], 1)
+            self.assertEqual(runs[-1]["sample_count_scheduled"], 2)
+            self.assertEqual(runs[-1]["sample_count_processed"], 2)
+            self.assertIsNotNone(runs[-1]["quality_score"])
+
 
 if __name__ == "__main__":
     unittest.main()

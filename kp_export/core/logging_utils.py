@@ -18,6 +18,7 @@ _LOGGER_NAME = "kp_export"
 _DEFAULT_FILE_NAME = "kp_export.log"
 _LOGGER_LOCK = Lock()
 _LOGGER_CONFIG: Dict[str, Any] = {}
+_NOISY_LOGGERS = ("absl", "mediapipe", "tensorflow", "tensorflow_hub", "matplotlib")
 
 
 def _normalize_level(level: Union[int, str]) -> int:
@@ -98,6 +99,11 @@ def configure_logging(
             stream_fmt = logging.Formatter("%(levelname)s | %(name)s | %(message)s")
             stream_handler.setFormatter(stream_fmt)
             logger.addHandler(stream_handler)
+
+        for noisy_name in _NOISY_LOGGERS:
+            noisy = logging.getLogger(noisy_name)
+            noisy.setLevel(logging.ERROR)
+            noisy.propagate = False
 
         _LOGGER_CONFIG.clear()
         _LOGGER_CONFIG.update(config_key)

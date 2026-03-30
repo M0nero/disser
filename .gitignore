@@ -62,3 +62,5 @@ datasets/
 outputs/
 runs/
 *.tfevents*
+
+test_out/
